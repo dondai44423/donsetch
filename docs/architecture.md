@@ -1,90 +1,72 @@
 # Architecture
 
-How the four tools share a local process, and where each part lives. [Back to the README](../README.md).
+How DonSeTch's four tools share one local Rust process. [Back to the README](../README.md).
 
-## Product and fetch layer
+## Workspace & components
 
-The Rust workspace has two crates: the product at the root and its fetching foundation in `crates/fetch/`. CLI and MCP are adapters over the same product engine. The tool spec in [src/spec.rs](../src/spec.rs) generates schemas and CLI arguments.
+The workspace has two crates: the product at the root (`src/`) and its fetching foundation in `crates/fetch/`. CLI commands and MCP tools run the same engine; [src/spec.rs](../src/spec.rs) generates both MCP schemas and CLI flags.
 
 | Component | Owns | Source |
 |---|---|---|
-| Fetch layer | Client identities, carried state, cache, classification, interfaces, V8, mined requests | [crates/fetch](../crates/fetch/README.md) |
-| DonSift | HTML extraction, typed blocks, reading views, headings, links, text quality | [src/extract](../src/extract/) |
-| DonSeek | Query planning, keyless retrieval, merging, ranking, source health | [src/search](../src/search/) |
-| DonTread | Site model (map), planner (plan, topic recall, family members), executor (run), digest (pN), delta/change memory, pacing, budgets, job resume | [src/crawl](../src/crawl/) |
-| DonSheet | PDFium FFI, reading order, glyph/pixel fusion, tables, OCR, forms | [src/pdf](../src/pdf/) |
-| Browser | Throwaway screenshots and diagnostic captures | [src/browser](../src/browser/) |
-| MCP | Stdio and HTTP transport, compatibility output, supervisor | [src/mcp](../src/mcp/) |
+| Fetch layer | Coherent client identities, carried state, strict page cache, wall classification, site interfaces, embedded V8, mined HTTP replay | [crates/fetch](../crates/fetch/README.md) |
+| DonSift | HTML extraction, typed content blocks, section breadcrumbs, reading views, link handles | [src/extract](../src/extract/) |
+| DonSeek | Query compilation, keyless source planning, family RRF, BM25+/RM3/LTR ranking, source ledger | [src/search](../src/search/) |
+| DonTread | Site model (`map`), topic-first planner (`plan`), v5 executor & durable jobs (`run`/`resume`), digest & `pN` handles (`get`), dossier delta (`diff`) | [src/crawl](../src/crawl/) |
+| DonSheet | PDFium glyph + pixel fusion, reading order, tables, AcroForms, optional PP-OCR | [src/pdf](../src/pdf/) |
+| Browser | Throwaway Chromium screenshots and `doctor --stealth --parity` captures | [src/browser](../src/browser/) |
+| MCP | Stdio (with crash supervisor) and Streamable HTTP transports, client compatibility folding | [src/mcp](../src/mcp/) |
 
 ## Fetch: carry the client, classify the answer
 
 ![Simplified fetch routes and separate screenshot path](../assets/readme/fetch-route.svg)
 
-An encounter checks the page cache, sends a paced request with the selected identity and its own cookies, then classifies the response. A real document can return immediately. Otherwise, the class determines what to try: another identity, a native challenge hand-off, the site's own public interface, a stored request contract, or the page's own program.
-
-These are available routes, not an unconditional chain. A native feed must answer the URL asked for; a front-page listing cannot substitute for a specific article. A successful status code alone is not content.
+An encounter checks the page cache, sends one paced request using a coherent identity and its isolated cookie jar, and classifies the response before trusting HTTP 200. When a document is walled or an empty shell, the verdict selects the cheapest honest route: another client profile, a native challenge hand-off, the site's public data interface (only when it answers the requested URL), a replayed HTTP request contract, or embedded V8.
 
 ### Eight coherent clients
 
-| Identity | Client |
-|---|---|
-| `plain` | Plain HTTP client |
-| `chrome-local` | Captured Chrome 156 / Linux identity and script-visible facts |
-| `chrome` | Chrome 156 / Linux |
-| `chrome-win` | Measured Chrome 156 / Windows |
-| `chrome-android` | Measured Chrome 149 / Android |
-| `firefox` | Firefox 151 |
-| `safari` | Safari 26.4 / macOS |
-| `okhttp` | OkHttp 5 / Android app |
+`plain`, `chrome-local` (captured Chrome 156 / Linux + script-visible surfaces), `chrome` (156 / Linux), `chrome-win` (156 / Windows), `chrome-android` (149 / Android), `firefox` (151), `safari` (26.4 / macOS), and `okhttp` (5 / Android).
 
-A profile carries TLS, HTTP/2, header values/order, and client hints together. Versions are the measured profiles, not a claim to match the newest installed browser. An origin's winner is reused until it fails; vendor and global priors guide new encounters. Cookies and clearance stay bound to the client that earned them.
+Each profile bundles TLS, HTTP/2 settings, header set/order, and client hints. Winners stay sticky per origin until failure; cookies and minted clearances never cross hosts or identities.
 
-### The same V8 engine, two jobs
+### Embedded V8: challenge mint & content lane
 
-| Mode | Runs | Produces |
+| Mode | Job | Output |
 |---|---|---|
-| Challenge | The challenge page's scripts, on the same network identity | A credential or navigation to spend and re-classify |
-| Content | The application's scripts against a data-only DOM | A document that must pass the content contract |
+| Challenge | Runs a challenge page's scripts on the same wire identity | Minted credential or form navigation to spend and re-classify |
+| Content | Runs an app shell's scripts against a data-plane DOM (skipped if the HTML already passes) | Assembled HTML verified against the content contract |
 
-There is no browser process, CSS layout, or raster in this path. Script-visible facts come from measured captures or the document's declared data. A content run is skipped when the served document already passes.
+No browser process, CSS cascade, layout, or raster runs here. When a content run passes, `mine.rs` extracts the underlying JSON request whose records appear in the assembled page and saves a URL-templated contract per `(host, identity, URL shape)`. Subsequent visits replay that HTTP request before touching V8, dropping and re-mining on schema drift or refusal.
 
-After a successful content run, request mining can find the JSON request whose records appear in the assembled document. It stores method, URL template, headers, body, and the expected item structure, bound to host, identity, and URL shape. Later encounters replay it before JS. A refusal or structural break drops the contract and allows re-mining.
+Outside page code, `envelope.rs` enforces hard limits: 256 MB JS heap, 128 MB typed-array store, 128 MB WebAssembly memory, 96 ops, one active V8 isolate per process, 10 s mint / 5 s content wall ceilings, and full URL/DNS/redirect/size guards.
 
-The engine is bounded outside page code: 256 MB JS heap, 128 MB live typed-array backing store, 128 MB WebAssembly memory, 96 ops, and one engine at a time per process. Default wall ceilings are 10 seconds for a mint and 5 seconds for content, within the remaining encounter deadline. URL, DNS, redirect, and response-size guards apply to engine requests too.
+### State & caching
 
-### State and freshness
+- **Fetch state (`<cache>/donsetch/v5/state.json`):** up to 4,096 LRU origins holding identity scores, vendor priors, sticky routes, pacing timestamps, cookies, credentials, mined contracts, and cache trust, merged under a file lock (`DONSEEK_NO_DISK_STATE=1` keeps state in memory; [setup guide](setup.md#configuration)).
+- **Page cache (`pages/`):** verified HTTP 200 responses keyed by `(identity, egress, URL)`. Repeat reads revalidate conditionally; unvalidated `max-age` reuse must be earned via unchanged checks, caps at 60 s, and distrusts lying origins for 7 days.
+- **Product history:** tracks page fingerprints separately for `since_last` diffs. No login credentials or imported browser sessions are ever stored.
 
-Learned fetch state is local under `<cache>/v5/state.json`: per-origin identity scores, vendor priors, routes, pacing, cookie jars, minted credentials, mined requests, and cache trust. It is bounded to 4,096 origin records and merges writes under a file lock.
+## Search: rank verified source answers
 
-Verified pages live beside it in an identity/egress/URL-keyed cache. Repeat reads normally revalidate with the origin. Freshness without a request must be earned through unchanged checks and is capped at 60 seconds. Validator audits can distrust a lying origin for seven days. `no-store`, `Vary: *`, and cookie variation constrain reuse.
+1. **Understand:** compile identifiers, query shape, operators, date windows, and explicit BCP-47 `lang`.
+2. **Plan:** spend a 6-request budget across package registries, first-party APIs, dated feeds, and general indexes.
+3. **Admit:** veto excluded `-term` hits, off-scope URLs, redirect wrappers, SERPs, and near-duplicates.
+4. **Merge:** fuse across measured independent index families (`bing`/`ddg`/`yahoo` count as one family).
+5. **Rank:** score with field BM25+, anchored RM3 expansion, and an offline-gated 22-feature linear ranker (active on `code`, `howto`, and `shopping`; fusion elsewhere). Search loads no ONNX runtime and downloads no model.
+6. **Report:** attach source census, evidence snippets, completeness, and retrieval confidence; cache merged sets only at `high` confidence.
 
-Product page history is separate: it records fingerprints and previous content for change reports and `since_last`.
+Google's default adapter (`google-cse`) uses the public search-element bootstrap + JSONP contract over native HTTP (1-hour version/OS/route-keyed token cache; 2 requests cold, 1 warm; quota responses rest the lane without rotating identity or egress; `google_wml.rs` stays offline for historical fixtures).
 
-The fetcher stores no login credentials, imports no browser clearance, and never signs in. `DONSEEK_NO_DISK_STATE=1` keeps learned state in memory. [Setup and cache location →](setup.md#configuration)
+## Crawl: model, plan, execute, digest
 
-## Search: rank what the sources actually returned
+1. **Model (`map`):** builds a deterministic site model (`llms.txt` APIs/links → sitemaps → feeds → seed/hub links) with structural templates, hub-depth sections, `(section, template)` families, site-supplied link labels, and a cached host dossier (`<cache>/crawl/dossier/<host>.json`, v4) — without fetching content pages.
+2. **Plan (`plan`):** allocates `max_pages` across named `focus` topics first, then section/family breadth, then family members plus reserves, recording each row's reason and token estimate.
+3. **Execute (`run` / `full`):** fetches one page at a time per host through the shared v5 `Fetcher` and `Governor`, persisting every completed page to `<cache>/crawl/jobs/<id>.json` for idempotent `resume`, and tripping a host circuit breaker on the first classified wall instead of retrying queued pages.
+4. **Digest & delta (`get`, `diff`):** returns a site brief, boilerplate-stripped cards, and `pN` handles expandable offline via `crawl get pN` (or JSONL `donsetch.crawl.page` v3 via `--dataset`). `crawl diff` combines the dossier's `ChangeContract` and per-URL fingerprints to fetch only changed/new pages and report removed URLs.
 
-1. **Understand.** Parse identifiers, query shape, entities, operators, dates, and explicit language.
-2. **Plan.** Select registries, first-party records, news, or general indexes within a request budget.
-3. **Admit.** Reject hard violations such as excluded terms, off-scope URLs, wrappers, and duplicates.
-4. **Merge.** Count agreement across measured index families; sibling indexes do not become independent votes.
-5. **Rank.** Use BM25+, RM3 feedback, and a compiled 22-feature linear ranker for code, how-to, and shopping queries. Other shapes keep fusion ordering.
-6. **Report.** Return source status, evidence snippets, completeness, and retrieval confidence.
+## Extraction, PDF & screenshots
 
-The ranker is trained offline and gated on held-out queries. Search opens no ONNX session and downloads no model. High-confidence merged answers may be cached with their age. Source pacing and refusals survive process restarts. A 403/429 is a wait, not a reason to evade the source's refusal.
+- **DonSift** converts HTML into typed blocks with section breadcrumbs, strips navigation furniture, and projects `must_contain`, `focus`, `toc`, `section`, or `since_last` views.
+- **DonSheet** fuses PDFium glyphs with rendered page pixels to recover reading order, bordered tables, and forms, invoking lazy PP-OCR (`ocr` feature) only on scanned or corrupt regions.
+- **Screenshots** launch an isolated Chromium browser to return PNGs and never share state with fetch, search, or crawl.
 
-Google's default source uses the native search-element request contract, not a rendered browser page. [Google source notes →](google-wml.md)
-
-## Extraction, PDF, and crawl
-
-DonSift builds typed content blocks with section breadcrumbs, removes page furniture, and applies the requested view. Focus uses multilingual lexical scoring; presence checks preserve uncertainty when a source is incomplete.
-
-DonSheet gets glyphs and rendered pixels from PDFium. Pixel structure supplies borders and table rules; glyphs supply text. Region-level audits decide where OCR is needed. OCR is optional and lazy; ONNX belongs to that path only.
-
-DonTread's `map` builds the v6 site model from the site's own inventory (`llms.txt`, sitemaps, feeds, seed links) — templates, families, sections and a dossier — without reading a content page. `plan` spends that model on a page budget: it answers every focus topic first (one page per named term the inventory can answer), then covers sections and families, then deepens into a family's own members, with reserves, a reason and cost per row, no fetch. The inventory carries the site's own labels (seed link text, `llms.txt` titles), so a page is found by the name the site uses, not only its slug. `run` spends the plan through v5: one page at a time per host, host request budget, durable job, resume, and a host circuit breaker that declares a classified wall instead of retrying page by page. Its response is a digest — brief, page cards whose size follows the page budget, stable `pN` handles, headings and focus passages, repeated boilerplate removed — and `crawl get pN` reads the full stored page from the job with no network. Dataset v3 carries the same card fields plus full markdown. The dossier (v4) stores the change contract, bounded inventory with the site's own labels, and per-URL fingerprint/lastmod memory; `crawl diff` uses it to fetch only changed/new pages and report removed URLs, while `crawl sites`/`forget` list or remove a host's memory. `full` is the v6 plan + executor path, on the same v5 fetch and extraction pipeline; per-host pacing and shared host state prevent parallel crawls from doubling the rate. `map`, `plan`, `full`, `diff`, `get` and job `resume` are the crawl contract.
-
-Screenshots use a separate installed browser and return PNGs. They never supply cookies, tokens, or content to fetch.
-
-## Boundaries
-
-Fetch is for agentic research. Login and human-interaction walls remain explicit outcomes. Content that requires layout or pixels is not fabricated. [Tool contracts](tools.md) describe what callers receive; the [fetch crate README](../crates/fetch/README.md) owns the detailed mechanism and limits.
+See [tools.md](tools.md) for caller contracts and [crates/fetch/README.md](../crates/fetch/README.md) for fetch internals.

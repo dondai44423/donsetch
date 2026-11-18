@@ -1,486 +1,147 @@
-# fetch layer
+# `donsetch-fetch` — the fetch layer
 
-One Rust binary that fetches the web: carried client identity, carried state, a page cache, the
-site's own interface in front of its walled document, and an in-process V8 engine that runs a
-challenge page's own scripts when a wall demands it, or an application page's own program when
-its document is a shell (the content lane). No browser, no layout, no rasteriser.
+Workspace crate (`crates/fetch/`) owning wire identity, per-origin state, strict page caching, native challenge contracts, public site interfaces, embedded V8 (challenge minting + data-plane content execution), and mined HTTP request replay. No browser, CSS cascade, layout, or rasteriser enters this path.
 
-The crate lives in `crates/fetch/`, a workspace member: build and test it from the repo root
-with `-p donsetch-fetch` (`cargo nextest run --cargo-profile fast -p donsetch-fetch`), so it shares the lockfile and target
-cache with the product. `hard-corpus.json`, `fixtures/` and `runs/` are private working
-material (git-ignored); this README is tracked.
+## CLI & verification
+
+Build and test from the repository root so artifacts share `./target` and `Cargo.lock`:
 
 ```sh
-# build (vendored wreq/btls; V8 arrives as a prebuilt static library via deno_core)
-# from the repo root; the artifacts land in the shared ./target
 cargo build -p donsetch-fetch --release
 
-# one fetch: portfolio selection, pacing, state spent and earned
-V5_PERSONA=~/Projects/donsetch-evidence/research/persona/chrome-local.json \
-  ./target/release/donsetch-fetch fetch https://example.com/
-
-# identity matrix: every portfolio identity against every target, one request each
-./target/release/donsetch-fetch probe \
-  --targets ~/Projects/donsetch-evidence/research/corpus.json --out matrix.json
-
-# interface equivalence: the ids the page links to must be the ids we return
-python3 crates/fetch/runs/verify_datapaths.py
-
-# cold measurement paired with curl on the same window
-./target/release/donsetch-fetch bench \
-  --targets ~/Projects/donsetch-evidence/research/corpus.json --runs 3 --curl --out bench.json
-
-# the same corpus through one egress lane: the egress class is the variable
-source ~/.config/secrets.env
-./target/release/donsetch-fetch bench --targets crates/fetch/hard-corpus.json --runs 2 --curl \
-  --proxy "http://$V5_PROXY_USER:$V5_PROXY_PASS@198.23.243.226:6361" --out crates/fetch/runs/a6-dc.json
-
-# steady state: discovery allowed, state carried between rounds (--no-cache measures learning
-# alone; without it the page cache answers too)
-V5_STATE=/tmp/donsetch-fetch/state.json ./target/release/donsetch-fetch bench \
-  --targets ~/Projects/donsetch-evidence/research/corpus.json --runs 3 --persist --discover --curl
-
-# a repeat fetch is answered by the page cache: fresh, revalidated (304) or changed
-./target/release/donsetch-fetch fetch https://pypi.org/ [--revalidate] [--no-cache]
-
-# the content lane (measurement): run the final document's own program and report
-# the stop reason, the text it assembled and every request it made
-./target/release/donsetch-fetch fetch https://example.com/ --render
-
-# a recognised challenge (AWS WAF's goku shape) mints in-process on its own;
-# V5_ENGINE_LOG=1 prints the host surfaces and cookies the mint needed
+# Single fetch (optional --revalidate, --no-cache, --render, --identity <name>)
+./target/release/donsetch-fetch fetch https://example.com/
 V5_ENGINE_LOG=1 ./target/release/donsetch-fetch fetch https://www.imdb.com/ --identity chrome-local
 
-./target/release/donsetch-fetch identities [--headers]   # the portfolio and what each sends
+# Identity × target probe matrix & cold benchmark paired with curl
+./target/release/donsetch-fetch probe --targets targets.json --out matrix.json
+./target/release/donsetch-fetch bench --targets targets.json --runs 2 --curl --out bench.json
 
-# identity scorecard: every browser identity's live wire (JA4, peetprint, Akamai H2, UA)
-# against the committed baseline; --record rewrites it deliberately
+# Portfolio inspection, wire scorecard, learned state & page cache
+./target/release/donsetch-fetch identities [--headers]
 ./target/release/donsetch-fetch scorecard [--record] [--json]
-./target/release/donsetch-fetch state [show|reset]       # scores, priors, jars (reset clears pages)
-./target/release/donsetch-fetch cache clear              # forget cached pages, keep what was learned
+./target/release/donsetch-fetch state [show|reset]
+./target/release/donsetch-fetch cache clear
+
+# Offline unit & contract suite (CI runs this on Linux x86_64)
+sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch --offline
 ```
 
-## What is in here
+## Module map
 
-| File | Role |
+| File | Owns |
 |---|---|
-| `src/lib.rs` | The library: `Session::fetch(&Request) -> Outcome`, `Send + Sync`, blocking (async callers use `spawn_blocking`); pooled workers fold into one learned state |
-| `src/identity.rs` | The portfolio: coherent clients, one profile each; the built-in local identity (`personas/chrome-local.json`) |
-| `src/http.rs` | One request on the wire, with the identity's headers and cookies |
-| `src/classify.rs` | Nine outcome classes, vendor-and-ask driven |
-| `src/contract.rs` | Content contracts (the frozen corpus's own predicates) |
-| `src/state.rs` | Scores, vendor priors, routes, cache trust, pacing clocks, cookie jars with bindings, mined request contracts; bounded, merged into the file under a lock; the per-OS cache path |
-| `src/cache.rs` | The page cache: what may be stored, served fresh, revalidated or audited |
-| `src/fetch.rs` | The encounter (`Worker`): pace, spend, classify, follow the vendor, replay a mined contract, run the engine, ask the interface, remember |
-| `src/challenge.rs` | Native challenge contracts: Akamai's `bm-verify` hand-off, SiteGround's and NCBI's proof of work; hands page programs to the engine |
-| `src/datapath.rs` | Interface contracts: which host, which request, which items count |
-| `src/mine.rs` | Mined request contracts: the app's own content request templated by the document URL's components, its structural replay check, and the records it renders |
-| `src/engine.rs` | The challenge engine: V8 in-process, one HTTP op on the fetcher's identity, the mint, the watchdog |
-| `src/engine_host.js` | The challenge host layer (small DOM, forms, script loader, browser surfaces, WebAssembly budget) plus the content lane's data-plane DOM: real tree, host-side selector engine, firing observers, `matchMedia`, events, timers and frames. No rendering |
-| `src/webcrypto.rs` | WebCrypto on BoringSSL: digests, HMAC, AES, PBKDF2, HKDF; anything else is refused |
-| `src/envelope.rs` | The engine's limits: wall clock, heap, typed-array and WebAssembly memory, op count, URL/redirect/size guard, one engine at a time, resident-memory backstop on Linux, Windows and macOS |
-| `src/testkit.rs` | A local HTTP server for offline tests, including hostile replies (endless, trickled, silent, redirecting) |
-| `src/engine_tests.rs`, `src/lifecycle_tests.rs` | Offline tests: hostile pages against the envelope and host fidelity; a fake AWS WAF origin with a controllable clock against the token lifecycle |
-| `src/fixture_tests.rs`, `fixtures/aws-waf/` | The three AWS WAF shapes (goku, legacy inline, interstitial) run from captured bundles against a local verifier |
-| `src/session_tests.rs` | The library seam: threads, `spawn_blocking`, proxy, body capture, vendor escalation, route memory, state location |
-| `src/replay_tests.rs` | The mined contract through the encounter: first run mines, the next replays; a 403 breaks it and the lane re-mines |
-| `src/surface_tests.rs`, `src/surface_probe.html`, `src/surface_reference.json` | The content host's JS-visible surface held to a real browser: the probe page read by this box's Chromium 157 (the reference) and by the lane, compared surface by surface |
-| `src/cache_tests.rs`, `src/redirect_tests.rs`, `src/revalidation_tests.rs` | The page cache against a local site that changes, lies, walls and redirects under it |
-| `src/main.rs` | CLI: `fetch`, `probe`, `bench`, `identities`, `scorecard`, `state`, `cache` |
+| `src/lib.rs`, `src/main.rs` | `Session::fetch(&Request) -> Outcome` (`Send + Sync`, blocking; async callers use `spawn_blocking`) and CLI subcommands |
+| `src/identity.rs` | Eight coherent client profiles + built-in `personas/chrome-local.json` |
+| `src/http.rs`, `src/ca_blocklist.rs` | Wire transport (`wreq`/BoringSSL), header order, cookies, compromised-CA blocklist |
+| `src/classify.rs`, `src/contract.rs` | Vendor-first classification into nine outcome classes; content predicates |
+| `src/state.rs` | Origin scores, vendor priors, sticky routes, pacing clocks, `(host, identity)` cookie jars, credentials, mined contracts (`<= 4,096` origins LRU, file-locked atomic merge) |
+| `src/cache.rs` | Strict RFC 9111 private cache (`<= 8 MiB`/entry, `256 MiB` LRU, validator audits) |
+| `src/fetch.rs` | `Worker` encounter state machine (steps 0–9 below) |
+| `src/challenge.rs` | Native non-JS challenges: Akamai `bm-verify`, SiteGround SHA-1 PoW, NCBI SHA-256 PoW |
+| `src/datapath.rs` | Seven public site interface contracts (Reddit, Stack Overflow, 4chan, Twitch, NYT, WSJ, crates.io) |
+| `src/mine.rs` | Request-contract mining (`{{n}}` URL templates) and structural HTTP replay |
+| `src/engine.rs`, `src/engine_host.js` | Embedded V8 isolate, watchdog, worker-thread asset preloader, challenge host, and data-plane content DOM |
+| `src/webcrypto.rs`, `src/envelope.rs` | BoringSSL WebCrypto ops; hard wall-clock, heap, Wasm, RSS, op-count, and network guards |
+| `src/surface_probe.html`, `src/surface_reference.json` | Real Chromium 157 headed surface capture enforced by `surface_tests.rs` |
+| `src/testkit.rs`, `src/*_tests.rs` | Offline hostile-origin server and unit/contract suites |
 
-## The mechanism
+## Core mechanisms
 
-**A wall is a classification problem before it is anything else.** A site decides before content
-is served on *who is asking* (TLS/HTTP shape, header order, client hints, egress class, pacing)
-and *what they already have* (cookies, clearance, session). Both are carried, never emulated. A
-fetch costs one round trip and one jar read. Five things are earned out of band and amortised:
-the identity profile, session state, request contracts, the egress class, and challenge tokens —
-cost per fetch is curl's cost (47–68 ms on a trivial origin, curl 46 ms).
+### 1 · Coherent identities & pacing
 
-### Identity
+Eight measured client profiles carry matching TLS (JA4/peetprint), HTTP/2 frames, header sets/order, and client hints: `plain`, `chrome` (156/Linux), `chrome-local` (captured 156/Linux + script surfaces), `chrome-win` (156/Windows), `chrome-android` (149/Android — kept at 149 because `wreq-util` lacks Chromium 156+ TLS extension 4832), `firefox` (151), `safari` (26.4/macOS), and `okhttp` (5/Android).
 
-Eight **coherent** clients, each carrying one real profile's TLS fingerprint, HTTP/2 settings,
-header set and order, and client hints: `plain`, `chrome` (156/Linux), `chrome-local` (the
-reference browser's own 156 identity, with its script-visible facts), `chrome-win`,
-`chrome-android` (a measured Chrome 149 Android client), `firefox` (151), `safari` (26.4/macOS),
-`okhttp` (5/Android app). Nothing is patched per field; a profile is chosen, not assembled, and
-each is diffed against the reference browser it claims (JA4, peetprint, Akamai H2, header set
-and order). A ninth identity labelled `curl` was removed: it was the native stack with a curl
-user-agent, a claim no detector would believe.
+- **Host-coherent one-shot reads:** product reads default to the host OS class (`chrome-local` Linux, `chrome-win` Windows, `safari` macOS) so UA and client hints never contradict.
+- **Per-origin selection:** sticky winner → origin score → sibling-host score → vendor prior (`state::VENDOR_SEED`) → global prior → untried → prior failures. Named vendor walls promote known passers for that vendor.
+- **Pacing:** 900 ms minimum per-origin interval, 250 ms between intra-encounter attempts, `Retry-After` above 1 h ignored, and `>= 1.2 s` remaining deadline required before starting a retry.
 
-All Chrome identities share JA4 `t13d1517h2_8daaf6152771_cb7bf5808d99` and 17 headers in the
-same order; JA3 varies per connection as Chrome's does. Android Chromium 156/157 and this box's desktop Chromium 157 send TLS extension
-4832, which no `wreq-util` profile sends — hence `chrome-android` is declared as 149 rather
-than relabelled, and replacing it is a reference-capture task, not a code change.
+### 2 · State & credential lifecycle
 
-One-shot product reads present the host's own class — `chrome-local` on Linux, `chrome-win` on
-Windows, `safari` on macOS (`src/fetch/layer.rs`): a Linux UA leaving a Windows box contradicts
-the client hints and is the incoherence this rule forbids.
+- **Isolation:** cookies, clearances, and scores bind strictly to `(host, identity)` and never cross hosts or fingerprints. Scores halve every 32 attempts; HTTP 429 preserves a sticky route while other failures drop it.
+- **Persistence:** `<cache>/donsetch/v5/state.json` (max 4,096 origins LRU), merged under a lock file via temp-file + rename, skipping disk reload when `(len, mtime, inode)` matches our last write.
+- **Minted credentials:** renew proactively at `0.9 × learned TTL` (`accepted_age` / `refused_age`), re-mint at most once per encounter on `202`/`401`/`403`, cap at 3 mints per 600 s per host, and back off 600 s → 6 h on failed mints.
 
-**Selection is per origin, measured:** stored winner → this origin's scored identities → for a
-host with no scores, a sibling host on its site → the vendor prior over `state::VENDOR_SEED` →
-the global success prior → untried identities → identities that only failed here. A wall that
-names its vendor moves that vendor's known passers to the front of what is left. Sticky: a
-proven identity keeps the origin until it fails.
+### 3 · Strict page cache (`cache.rs`)
 
-**Pacing is identity:** 900 ms minimum interval per origin, 250 ms between attempts inside one;
-every wait is cancel-aware and fits the deadline; a `Retry-After` past one hour is ignored. The
-first request always goes out, a later one only with 1.2 s left. Velocity is part of identity —
-three fast requests to one origin is what escalated a challenge in testing, not the identity.
+Stores verified HTTP 200 content (`<= 8 MiB`) under `pages/` (`256 MiB` LRU) keyed by `(identity, egress, URL)`. Repeat reads send Chrome-ordered `If-None-Match`/`If-Modified-Since` (no `Cache-Control`).
 
-### State
+- **Earned freshness:** `max-age`/`Expires` (capped at 60 s) serves without a request only after a prior read inside the window validated unchanged, alternating fresh serve and network check.
+- **Validator audits:** forces full re-fetch after 2 (`unproven`) or 4 (`proven`, or 1 h) 304s; origins that mutate body text under unchanged validators or inside `max-age` lose trust for 7 days. Honors `no-store`, `Vary: *`, and `Vary: Cookie`. Reports `fresh`, `revalidated`, or `changed`.
 
-Cookie jar per (host, identity) with expiry; scores per (origin, identity) that halve after 32
-attempts so a changed site is believed; vendor priors; the route that answered (a 429 keeps it,
-any other failure drops it); cache trust per origin. Cookies are never shared across hosts or
-identities, and clearance is never banked across fingerprints.
+### 4 · Public site interfaces (`datapath.rs`)
 
-One compact JSON file, at most 4,096 origins (LRU out with their cookies and credentials),
-written once per fetch by merging into what is on disk under a lock file; the reload is skipped
-when the file's stamp (length, mtime, inode) is the one this process wrote; write is temp file
-plus rename, retried while Windows holds the target. `DONSETCH_CACHE_DIR` / `[paths] cache_dir`
-move it.
+Requests use the app's own fetch metadata (`sec-fetch-dest: empty`, `sec-fetch-mode: cors`, `accept: application/json`, page referer, same identity) and require item equivalence with the rendered page:
 
-**Credential lifecycle:** a minted cookie set is a `Credential` bound to (host, identity) with
-its declared lifetime and a learned TTL — the age at which the origin accepted it
-(`accepted_age`) and refused one it had accepted (`refused_age`). Renewed at 0.9× the learned
-TTL before the next spend, and once more when the origin refuses it (202/401/403) — one re-mint
-per encounter, then a clean re-ask. A host may mint 3 times per 600 s; a failed mint backs the
-host off 600 s, doubling to 6 h.
-
-State acquisition with a browser is removed (`warm`, `acquire`): no browser earns state or
-content for this path, and a fetch spends only its own responses or a credential the engine
-minted from the site's own challenge.
-
-### The page cache
-
-`cache.rs`, RFC 9111 for a private client, made strict. Only verified content (a 200, at most
-8 MiB) is stored, keyed by identity, egress and URL, in `pages/` beside the state (256 MiB, LRU
-eviction). A repeat read sends Chrome's conditional request (`If-None-Match`/`If-Modified-Since`
-after `Accept-Language`, no `Cache-Control`) and the server's 304 is the proof.
-
-A declared lifetime (`max-age`, `Expires`, capped at 60 s) is served without asking only after
-the last read inside one was checked unchanged, alternating check and serve; a page that changes
-inside its lifetime makes its origin ask on every read for 7 days. Validators are audited: an
-unproven origin's copy is fetched whole after 2 revalidations, a proven one's after 4 or an hour;
-unchanged validators over changed text distrust the origin for 7 days. No heuristic freshness,
-nothing stored under `no-store` or `Vary: *`, `Vary: Cookie` honoured, a fresh copy served only
-to the cookie it was confirmed under. Outcomes say `fresh`, `revalidated` or `changed`.
-
-### The data path — ask the interface the app asks
-
-A wall protects a document; the site's own client calls an interface. Those are open, fast, and
-already tolerate the client's own request shape.
-
-| Origin | Interface | Returns | Measured |
-|---|---|---|---|
-| Reddit | the page's own Atom feed (`<path>/.rss`) | posts with permalinks and timestamps | 25 items, 1.1–1.7 s, `x-ratelimit-reset` obeyed |
-| Stack Overflow | `api.stackexchange.com/2.3/questions` | questions with score, answers, tags, links | 30 items, 0.43 s |
-| 4chan | `a.4cdn.org/boards.json`, `/<board>/1.json` | board index, threads | 77 boards, 0.60 s |
-| Twitch | `gql.twitch.tv/gql`, public web client id | live streams with viewers and channels | 20 streams, 0.71 s |
-| NYT | `rss.nytimes.com/services/xml/rss/nyt/<section>.xml` | the stories the front page leads with | 14 items, 0.70 s |
-| WSJ | `feeds.a.dj.com/rss/RSSWorldNews.xml` | world-news items | 20 items, 1.3 s |
-| crates.io | `/api/v1/summary` | totals plus new, most-downloaded and just-updated crates | paced to its published 1 req/s |
-
-The request is the app's own: `sec-fetch-dest: empty`, `sec-fetch-mode: cors`,
-`accept: application/json`, the page as referer, the same identity that would fetch the
-document. Verification is equivalence with the rendered page, never a rewritten predicate
-(`runs/datapath-equivalence.txt`: Stack Overflow 4/5 question ids, 4chan 5/5 boards, Twitch 2/5
-live channels, Reddit item ↔ its permalink's page).
-
-Seven interface contracts live in `datapath.rs`; each declares hosts, the request it makes, a
-parser that yields real items, a minimum item count and an honest URL shape. A path marked
-`preferred` is asked *before* the document because its answer is the whole of what the document
-renders partially. Published limits are state: a 429 records `x-ratelimit-reset` as a cooldown,
-so the next fetch returns in ~150 ms naming the pace owed. An interface's own answer is taken at
-its word — Stack Exchange's `error_name: not_found` is a missing item, not a wall
-(`datapath::absent`).
-
-### Native challenge contracts
-
-Some walls ask for arithmetic, not a browser. `challenge.rs` answers them as the challenged
-identity, inside the deadline, and hands anything needing a page program to the engine.
-
-- **Akamai Bot Manager**, no-JS path: the response carries `ak_bmsc` and a meta refresh to
-  `?bm-verify=<token>`; following it after the declared wait (bounded at 6 s), keeping cookies,
-  is what a browser with scripting disabled does. Measured: Amazon content in both rounds
-  (≈1.5 s first contact, then cookie-carried).
-- **SiteGround `sg-captcha`**: a meta-refresh stub leads to `/.well-known/sgcaptcha/` carrying
-  `sgchallenge` (`<bits>:<nonce>`) and `sgsubmit_url`; find a counter whose SHA-1 over
-  `challenge ‖ counter` starts with `bits` zero bits, navigate to
-  `sgsubmit_url&sol=<base64>&s=<ms>:<hashes>` once per encounter, refusing above 24 bits.
-  Witness: an istacon.org article, fresh state, 202 then 200 (74 KB) after 116,858 hashes in
-  2.9 s.
-- **NCBI `/_pow/solve`** (PubMed serves it with HTTP 203): SHA-256 over
-  `<challengeId>:<nonce>` with `bits` zero bits, posted as JSON to `/_pow/solve`; 12 bits asked,
-  at most 22 answered.
-
-### The engine — the site's own program, in-process
-
-`engine.rs` embeds V8, runs the challenge page the fetcher already fetched, fetches the scripts
-that page names with the same identity, executes them in document order with the page's own
-inline bootstrap, and returns the credential the site itself issued. No browser, no imported
-cookie, no DOM beyond the challenge's needs, no layout, no raster.
-
-- **AWS WAF, all three shapes** (measured cold, no state): IMDb (goku) content at 3.6–4.6 s,
-  Booking (legacy inline) at 2.7–3.0 s, Trustpilot (interstitial) at 1.8–2.3 s, on `chrome`,
-  `chrome-local` and `chrome-win`. The 690 KB bundle compiles in ~9 ms; the mint is
-  network-bound.
-- **Reddit's gate** — the page's own form, run and spent: the page's inline program computes one
-  field (the token it wrote, doubled) and submits a GET form; the engine parses the form's
-  fields, runs the program, and hands the fetcher the navigation it chose. Content measured on
-  front page, subreddit and thread (0.8–1.4 s cold, ~500 KB). A thread without its slug answers
-  with a `location.replace` shell that is followed once; a 429 is paced, never minted on.
-- **Cloudflare's managed challenge is run and stops at the host boundary: declared.** The engine
-  mints `__cf_bm` and executes the 616 KB orchestrator; the program then needs
-  `performance.getEntries()` of its own script load, a live DOM tree and an iframe realm for
-  Turnstile — the DOM growth that is drift, for a vendor `okhttp` already answers. No
-  `cf_clearance` is claimed; the engine gets a Cloudflare page only on the encounter's last
-  allowed attempt, so identity is spent first.
-- **A credential the server issued but the origin refuses is a failed mint.** The server's
-  verdict rides inside the token, so only the spend tells; the engine reports the wall and never
-  claims success unverified.
-- **The host never invents page configuration.** Trustpilot: a host-defined
-  `window.awsWafCookieDomainList` made the SDK report `domain: "trustpilot.com"` instead of the
-  page host, and every token was refused whatever the fingerprint. Found by relaying Chrome's
-  SDK traffic and swapping one field at a time.
-
-**The host surface grows only for a measured challenge**, and the engine logs every surface it
-needs. Measured so far: `Blob`, `FileReader`, `FormData` with a multipart boundary, WebCrypto
-(real, on the BoringSSL the TLS stack links — SHA, HMAC, AES-GCM/CBC/CTR/KW, PBKDF2, HKDF;
-anything else is `NotSupportedError`), Worker and Blob URLs, classic-script declaration
-hoisting, cookie `Domain` semantics (RFC 6265), a WHATWG `URL` with live `searchParams`,
-render-blocking stylesheets requested before the scripts after them, `crypto.getRandomValues`,
-a Chrome-resolution clock, an identity view (`navigator`, client hints, WebGL strings, screen)
-taken from the identity's own headers, and — for Reddit's gate — `document.forms` with declared
-fields, live `elements.namedItem`, and `submit()`/`requestSubmit()` producing the GET navigation
-a browser would make. A method the host does not run is logged, never guessed at.
-
-### The content lane
-
-`engine_host.js` carries a second host beside the challenge host: a data-plane DOM (real tree,
-html5ever-parsed `innerHTML`, host-side selector matching, firing observers, `matchMedia`,
-events, timers and frames; module scripts through a statement-level ESM loader with live
-export getters — named imports are snapshots, documented in the host) that runs an
-application page's own program and returns the document it assembles. The contract is
-consulted **before any program runs**; then the run ends on content (visible text at the
-target), quiescence (honestly reported, still a shell) or the lane's envelope
-(`V5_CONTENT_WALL_MS`, default 5000 ms, clamped to the encounter's remaining deadline; 96
-ops; 16 MB per response, 48 MB total; 600 pump rounds). A `shell` or `incomplete` verdict takes the lane once
-per encounter — a shell as the identity that received it, an incomplete after every identity
-has had its turn, including the one that is about to end the encounter on the site's
-identity-blind answer. A produced page that passes the contract is the answer
-(`transport: "program"`) and enters the pipeline exactly where a network document does
-(contract, caller body, page cache). A preload pass fetches the document's own script/style
-set on worker threads while V8 boots — each script waits only for its own bytes through
-`op_prefetch_wait` — under the same guard and identity as the engine's own op. Every request
-leaves through the same op and wire; the wire tap (`transcript`) records what the program
-asked for, response bodies and the request itself (method, URL, headers, body), which is the
-request-contract mining input. `fetch --render` re-runs the lane on the encounter's final
-document, for measurement.
-
-### The surface a page's program reads
-
-There is no layout, so every JS-visible fact the lane answers is either carried by the identity
-or declared from the document, never computed from a rendered box. `src/surface_probe.html`
-is one page that reads the whole family — window geometry, `screen`, the media queries, the
-observer entries, the constructors a bot check reads — and `src/surface_reference.json` is
-that same page read by this box's real Chromium 157, headed (a headless capture answers
-`hover: none`, `pointer: none` and `prefers-color-scheme: light`, which no desktop client does).
-`surface_tests` feeds the lane the same page and fails on any surface that disagrees, so the
-answers are measured and stay measured.
-
-- **Geometry** comes from the persona: `personas/chrome-local.json` carries the capture (inner
-  1911x988 inside 1927x1079 on a 1920x1080 screen, dpr 1, a 15 px scrollbar). An identity without
-  its own capture gets that reference window's measured frame over its platform screen, and a
-  touch platform answers no hover and a coarse pointer.
-- **Media queries** are answered from the same capture. `min-`/`max-` prefixes, range syntax
-  (`(width >= 1000px)`, `(400px <= width <= 2000px)`), units and comma lists parse; a feature
-  Chrome does not support makes its query false, `not` included.
-- **Observers** carry the target's declared box and the client box as `rootBounds`, in one
-  batched callback, as Chrome delivers them. Every observed element reports visible at ratio 1:
-  the lane's viewport contract, so a lazy loader loads, where a real browser reports an
-  off-screen target as not intersecting.
-- **A box is declared, not laid out.** Content, client and border come from the inline style (and
-  a replaced element's `width`/`height` attribute) in px; a size from a stylesheet, a percentage
-  or the content itself reports 0, and every position is 0. `getComputedStyle` returns declared
-  values and tag defaults. `elementFromPoint` answers null: a point's topmost element is a layout
-  question.
-
-Measured 2026-11-15: `runs/m6-surface-fidelity.txt`.
-
-### The mined request contract
-
-A first successful lane run is the witness; the next encounter should not pay for the same
-program. After a produced document passes the contract, `mine.rs` finds the JSON response
-array whose values the document itself shows (titles in its text, URLs among its links),
-chooses the item's title/URL/detail fields, and stores the request that delivered it as a
-template per `(host, identity, URL shape)`: the document URL's variable components (an
-identifier path segment, a query value) become `{{n}}` placeholders in the request URL,
-headers and body; the literal parts stay exact. The table is bounded (8 per origin) and lives
-in `state.rs` with the origin, so it is evicted with it.
-
-The next encounter replays the contract in `content_lane` before any JS: the same identity
-that mined it, its own jar, the same wire and guard, `transport: "replay"`, and the records
-enter the caller exactly as a data path's do. The check is structural, never a value diff:
-the array is still there (or elsewhere in the answer with the same item shape), every item
-still carries the mined fields, and at least `min_items` of them have a title. Values move on;
-the shape is the promise. A break — an error status, a missing array, too few items — drops
-the contract, and the lane behind it runs and mines a fresh one. A document that already
-passes its contract never reaches the lane or the replay.
-
-### The envelope
-
-Each mint and each lane run lives inside limits enforced outside the page
-(`envelope.rs`); a breach ends it with a named cause, never a hang.
-
-| Limit | Default | Mechanism |
+| Origin | Interface | Yield & rate contract |
 |---|---|---|
-| Mint wall clock | 10 s (`V5_ENGINE_WALL_MS`) | watchdog thread, `terminate_execution`; includes blocked time |
-| Content-lane wall clock | 5 s (`V5_CONTENT_WALL_MS`) | the same watchdog; clamped to the encounter's remaining deadline |
-| JS heap | 256 MB | near-heap-limit callback terminates V8 |
-| Typed arrays / `ArrayBuffer` | 128 MB live | custom allocator refuses past the cap |
-| WebAssembly memory | 128 MB total | V8 per-memory page flag plus host charges; resident-memory ceiling as backstop (`VmRSS`, working set, `task_info`) |
-| Ops | 96 per mint and per lane run (`V5_CONTENT_OPS` for the lane) | counted in Rust |
-| Lane pump rounds | 600 | the pump's own loop cap: a page that keeps scheduling work without ever changing the document ends there, reported as `budget` like the wall |
-| Network | http(s), public addresses, 5 redirects, 1 MB request, 8 MB per response (mint) / 16 MB (lane), 32 MB total (mint) / 48 MB (lane) | one guard for URL, resolver and redirect policy; even the page's own host must resolve publicly unless private egress is explicitly enabled |
-| Concurrency | one engine per process at a time | process-wide slot |
+| Reddit | `<path>/.rss` Atom feed | Posts, permalinks, timestamps; obeys `x-ratelimit-reset` |
+| Stack Overflow | `api.stackexchange.com/2.3/questions` | Questions, answers, scores, tags (`not_found` → `datapath::absent`) |
+| 4chan | `a.4cdn.org/boards.json`, `/<board>/1.json` | Board index and thread items |
+| Twitch | `gql.twitch.tv/gql` (public client ID) | Live streams, channels, viewer counts |
+| NYT / WSJ | Section & world-news RSS feeds | Front-page / world-news lead items |
+| crates.io | `/api/v1/summary` | Summary lists, paced to 1 req/s |
 
-The guards live in the Rust op bodies, not the JS wrapper, and `Deno` is deleted before any page
-script runs. Async `WebAssembly.compile/instantiate` on raw bytes never settle here (V8 delivers
-them as platform tasks and the host drains microtasks only); no measured challenge needs them.
+### 5 · Native challenges (`challenge.rs`)
 
-### Encounter lifecycle
+Answered without V8 inside the encounter deadline:
+- **Akamai Bot Manager (no-JS):** honors `ak_bmsc` + meta-refresh `?bm-verify=<token>` after the declared wait (capped at 6 s).
+- **SiteGround `sg-captcha`:** solves SHA-1 leading-zero PoW (`<= 24` bits) over `<bits>:<nonce>` and submits `sgsubmit_url`.
+- **NCBI `/_pow/solve`:** solves HTTP 203 SHA-256 PoW (`<= 22` bits) and POSTs JSON solution.
 
-0. **Cache.** A stored copy is served only as the page cache allows: earned freshness, else a
-   conditional request whose 304 is the answer.
-1. **Pace.** Wait out the origin's minimum interval.
-2. **Spend.** One request as the best identity for this origin, with its own cookies only.
-3. **Classify.** Content, or a class with its vendor and ask.
-4. **Content:** record the win, the vendor prior and the cookie state. **Otherwise follow the
-   vendor:** a named wall reorders the identities left to try. A human wall costs one identity
-   past the class that saw it and a second one ends the encounter; a second identity shown the
-   same text as the first with no wall named ends it too (the site is not reacting to the
-   client). A 2xx the contract cannot name still gets the lane's one run before that end, and
-   after every identity has had its turn. A remembered origin gets one or two attempts, not the
-   first-contact search.
-5. **Answer a native challenge.** If the page carries a hand-off we have a contract for, do
-   exactly what it asks and re-classify.
-6. **Ask the interface.** If the document is still walled, a shell or incomplete and the origin
-   has a data path for *this* URL, ask it as the same identity, obeying its published limits.
-   Items that reach the minimum are content with `transport: data`. An interface that is only
-   asking for time (paced, cooling, 429) has not answered and the encounter falls through.
-7. **Replay a mined contract.** A shell or incomplete document whose origin has a contract for
-   this URL shape is answered by the app's own request as plain HTTP, on the identity that mined
-   it: `transport: replay`. A break drops the contract, and the lane below mines a fresh one
-   after its run passes. No JS runs when a contract answers.
-8. **Run the site's program.** Which program and when: AWS WAF decides by client class, so a
-   plain client is re-asked as `chrome-local` and that page is executed; Cloudflare's page goes
-   to the engine on the last allowed attempt; Reddit's gate is run as the client that received
-   it. A shell's program runs as the identity that received it; an incomplete one as the last
-   identity, once. What the mint produces is kept and spent by the same identity, and a 429 is
-   paced.
-9. **Remember.** Scores, wall class, next identity, route, cookies, minted credentials and the
-   mined contract persist, so the next encounter starts at step 2 with better information.
+### 6 · Embedded V8: challenge mint & content lane (`engine.rs`, `engine_host.js`)
 
-### The census, by class
+One V8 isolate mode for challenge credentials, a second data-plane DOM mode for JS shell applications (`transport: "program"`). Worker threads prefetch script/style assets in parallel during V8 bootstrap (`op_prefetch_wait`) over the same identity wire.
 
-Two taxonomies: the **six wall classes** (state, state renewal, request contract, identity or
-egress, human interaction, the page's own program) and the **nine outcome classes** reported.
+- **Challenge mints:** passes all three AWS WAF shapes (`goku`, legacy inline, interstitial) and Reddit's inline token-form GET gate. Cloudflare managed challenges mint `__cf_bm` on the final allowed attempt and stop honestly at Turnstile/iframe boundaries (answered via `okhttp`/`chrome-win` identity instead; no `cf_clearance` claimed). Never invent vendor globals on `window` (e.g. `awsWafCookieDomainList`).
+- **Measured host surfaces:** BoringSSL WebCrypto (`SHA`, `HMAC`, `AES-GCM/CBC/CTR/KW`, `PBKDF2`, `HKDF`), `Blob`, `FileReader`, multipart `FormData`, Worker/Blob URLs, RFC 6265 `document.cookie`, WHATWG `URL`/`URLSearchParams`, Chrome-resolution clock, `document.forms` GET submission, html5ever `innerHTML`/`outerHTML`, host selector matching, batched observers (reporting ratio `1` so lazy loaders fire), persona `matchMedia`/screen/window geometry, inline `px` boxes with `0` positions (`elementFromPoint` = `null`), and statement-level ESM modules. Unimplemented methods log on touch and are never guessed; `surface_tests` enforces parity against `surface_reference.json`.
+- **Mined request contracts (`mine.rs`):** when a content-lane run passes the contract, `mine.rs` locates the transcript JSON array matching rendered titles/URLs and stores a `{{n}}`-templated request contract per `(host, identity, URL shape)` (`<= 8`/origin). Subsequent encounters replay it as plain HTTP before V8 (`transport: "replay"`), checking structure + `min_items`, and drop/re-mine on HTTP error or schema drift.
 
-| Outcome | Wall class | Meaning | Ours? |
+### 7 · Engine envelope (`envelope.rs`)
+
+| Resource | Mint limit | Content-lane limit | Enforcement |
 |---|---|---|---|
-| `content` | covered by state we hold | the contract passed | done |
-| `wall_state` | state renewal | clearance missing or stale, or a login gate | clearance renewal is work; login is declared, never attempted; no stored login credentials or signed-in sessions |
-| `wall_contract` | request contract | the page carries a challenge payload a native contract can answer | yes — contract |
-| `wall_identity` | another identity or egress | refused with no page of its own, or a short page titled as a refusal even when served 200 (Akamai's "Access Denied") | yes — identity/egress |
-| `wall_interaction` | human interaction | slider, press-and-hold, captcha, Turnstile widget | identity only — the vendor's known passers are tried; otherwise declared |
-| `wall_program` | the page's own program | managed JS challenge, WAF stub (`202`/`204`, `x-amzn-waf-action`), or a page whose inline program fills and submits a challenge form | yes — engine, then interface |
-| `shell` | page's program, unanswered | 2xx, program-driven application with no content in the document | yes — the content lane, once, as the identity that received it |
-| `incomplete` | — | 2xx, contract failed, no wall, no shell | yes — the content lane, once at the encounter's end, after every identity has had its turn |
-| `network` / `http_error` | — | no response, or an HTTP error with no wall markers. A failure before any client is shown ends the encounter on its first attempt; one after the client spoke earns one identity of another wire class (a silent server's on a 4 s clock), never a third | diagnose |
+| Wall clock | 10 s (`V5_ENGINE_WALL_MS`) | 5 s (`V5_CONTENT_WALL_MS`, clamped to deadline) | Watchdog `terminate_execution` |
+| Memory | 256 MB JS heap · 128 MB typed arrays · 128 MB Wasm | Same | V8 heap callback, custom allocator, Wasm page cap + OS RSS backstop |
+| Execution | 96 ops | 96 ops (`V5_CONTENT_OPS`) · 600 pump rounds | Rust op counter + pump cap |
+| Network | `http(s)` public IPs, `<= 5` redirects, 1 MB req, 8 MB/resp, 32 MB total | Same guards, 16 MB/resp, 48 MB total | Enforced in Rust ops; `Deno` global deleted before page code |
+| Concurrency | 1 active V8 engine per process | Same | Process-wide permit |
 
-Content contracts are the frozen corpus's own predicates: title, minimum text, required phrases,
-selector counts — data, nothing relaxes them. With no manifest contract the generic one is 200
-characters of visible text, and a page of at most 1,500 that asks for a human, or whose title or
-first heading is a refusal or interstitial, is not content. Vendors name themselves in headers
-(`x-amzn-waf-action`, `x-datadome`, `cf-mitigated`, `x-px`) and classification reads those before
-any body. A hard-corpus predicate is derived from what the reference browser shows and validated
-against a copy fetched by an independent plain client; targets where the browser itself receives
-a stub are left out, because a contract only the fetcher under test could satisfy would be
-fitting.
+## Encounter lifecycle & outcome classes
 
-### Targets, as they stand
+0. **Cache:** serve earned fresh copy or conditional `304`.
+1. **Pace:** honor per-origin interval.
+2. **Spend:** send request with best identity and its isolated cookie jar.
+3. **Classify:** inspect vendor headers (`x-amzn-waf-action`, `x-datadome`, `cf-mitigated`, `x-px`) before body; check content contract (`>= 200` visible chars generic floor, rejecting `<= 1,500`-char human-check/refusal stubs).
+4. **Route by verdict:** on `content`, persist win + cookies; on named wall, reorder remaining identities (2 human walls or 2 identical unlabelled bodies end identity search).
+5. **Native challenge:** execute `challenge.rs` contract if matched, then re-classify.
+6. **Public interface:** query `datapath.rs` if defined for the URL (`transport: "data"`).
+7. **Mined replay:** execute stored `mine.rs` HTTP template before JS (`transport: "replay"`).
+8. **V8 program:** run challenge mint (AWS WAF upgrades `plain` → `chrome-local`; Cloudflare runs on last attempt) or content lane once (`shell` on receiving identity; `incomplete` after last identity).
+9. **Remember:** merge scores, sticky route, cookies, credentials, and mined contracts to disk.
 
-| Target | Vendor | Ask | State |
-|---|---|---|---|
-| Etsy, Yelp | DataDome | captcha | no identity passes |
-| Bloomberg, Zillow | PerimeterX | press and hold | desktop Chrome class passes intermittently; Zillow passes all but `chrome` |
-| Glassdoor, Product Hunt, Indeed, npm, Medium | Cloudflare | managed challenge | content by identity (`okhttp`; Indeed `chrome-win`) |
-| TikTok | — (shell) | signed `item_list` API behind the edge gate | declared: the lane boots both shells (the 3-script stub quiesces in ~0.5 s; the 455 KB, 70-request one at 4.0–4.3 s) and neither assembles content, so the answer is identity work and there is no first content run to mine |
-| AliExpress, Instagram | — | stub / login shell for `plain` | the Chrome class passes |
-| crates.io | — (Ember shell) | `/api/v1/summary` | data path, paced 1 req/s |
-| PubMed (NCBI) | NCBI | `/_pow/solve`, HTTP 203 | answered natively |
-| SiteGround sites | SiteGround | `sg-captcha`, SHA-1, 20–22 bits | answered natively |
-| Stack Exchange | Cloudflare | managed challenge | questions and tags read through the public API |
-| OpenReview | Turnstile (own page) | interactive | declared |
-| Federal Register | reCAPTCHA | captcha | declared; its public API is the open route |
-| WSJ | DataDome-class 401 | interaction | declared; its RSS is frozen since Jan 2025 |
+| Outcome | Wall class | Action / ownership |
+|---|---|---|
+| `content` | Held state | Contract passed — done |
+| `wall_state` | State renewal | Re-mint stale clearance; **login gates are declared, never signed into** |
+| `wall_contract` | Request contract | Answered natively in `challenge.rs` |
+| `wall_identity` | Identity / egress | Rotate coherent client or egress (includes HTTP 200 "Access Denied" stubs) |
+| `wall_interaction` | Human interaction | Try vendor's known-passing identities once; otherwise **declare** (no captcha solvers) |
+| `wall_program` | Page program | Run V8 challenge mint, then interface |
+| `shell` | Unanswered app shell | Run V8 content lane once as receiving identity |
+| `incomplete` | Contract miss (2xx) | Run V8 content lane once after final identity |
+| `network` / `http_error` | Transport / origin | Pre-client errors stop immediately; post-client errors try at most one alternate wire class |
 
-### Measured negatives — do not rebuild these
+## Target notes, measured negatives & environment
 
-- **Interface discovery** (read the shell, ask the endpoints its scripts name). The walls we lose
-  against serve stubs: 2 KB (IMDb), 5 KB (crates), 7 KB (Booking), 12 KB (Bloomberg), 33 KB
-  (npm) — no inline state, no framework payload, no endpoint literals. Where real shells arrive
-  (TikTok 460 KB, AliExpress 477 KB) their own bundles return **zero** endpoint paths: modern
-  bundles assemble paths at runtime. Of seven shells, none carried a Next/Nuxt/Gatsby/Astro
-  build id. The walls are decided before a document exists, by who is asking and from where. A
-  discovery step may read one document and a handful of its own assets; needing the whole bundle
-  graph is a refusal, not an optimisation.
-- **Arrival realism** (warm-up of the origin, referrer, `sec-fetch-site: same-origin`): **no
-  class changed** on 16 targets, no regressions, one extra request paid. Off by default
-  (`--arrival` enables it).
+- **Current target standing:** AWS WAF (IMDb, Booking, Trustpilot), Akamai no-JS (Amazon), SiteGround, NCBI PubMed, Reddit, AliExpress/Instagram (`chrome*`), and Cloudflare via `okhttp`/`chrome-win` (Glassdoor, Indeed, npm, Medium) deliver content. DataDome captchas (Etsy, Yelp, WSJ), Turnstile/reCAPTCHA (OpenReview, Federal Register), PerimeterX press-and-hold (intermittent on Bloomberg), and TikTok's edge-gated shell API remain declared identity/interaction walls.
+- **Do not rebuild:** static bundle endpoint scraping (defended stubs carry zero endpoints; modern SPA bundles assemble URLs at runtime — use V8 content-lane mining instead) and default origin warm-up/`--arrival` (0 class wins across 16 targets for +1 request).
+- **TLS, bodies & deps:** Mozilla roots + OS trust store + `SSL_CERT_FILE`/`SSL_CERT_DIR` + `[tls]` config (never altering ClientHello); streaming reads capped at 64 MiB preserving raw non-UTF-8 bytes; crates restricted to `wreq`/`wreq-util`, `btls`, V8, `tokio`, `futures-util`, `scraper`, `serde`, `url`, `getrandom`, `webpki-root-certs`, `rustls-native-certs`. For LLD linker notes, see [setup.md](../../docs/setup.md#build-from-source).
 
-### Trust, bodies, dependencies
-
-**TLS trust:** the bundled Mozilla roots plus the OS's own store (Windows ROOT, the macOS
-keychain, the Linux bundle, `SSL_CERT_FILE`/`SSL_CERT_DIR`, and the product's
-`[tls] cert_file`/`cert_dir` through `add_trust_pem`; a bundle that does not parse is left out
-and named), read once per process, as Chrome trusts the OS. It does not touch the ClientHello.
-
-**Bodies:** every read is incremental and capped — 64 MiB for documents, the envelope's for the
-engine; non-UTF-8 bodies keep their bytes. **Rendering:** not here; a page that needs rendering
-is classified and reported.
-
-The dependency rule holds: `wreq` (HTTP/TLS), `wreq-util` (profiles), `tokio`,
-`futures-util` (capped streaming reads), `serde`, `url`, `scraper` (HTML parsing for contracts,
-not a browser), V8, `btls` (WebCrypto on the BoringSSL the TLS stack links), `getrandom`, and
-`webpki-root-certs` with `rustls-native-certs` — no browser, no layout, no raster.
-
-## Environment
-
-| Variable | Meaning |
+| Variable | Purpose |
 |---|---|
-| `V5_STATE` | state file path (default `donsetch/v5/state.json` under the OS cache directory: `%LOCALAPPDATA%`, `~/Library/Caches`, `$XDG_CACHE_HOME` or `~/.cache`; empty disables persistence); cached pages live in `pages/` beside it |
-| `RUSTY_V8_ARCHIVE` | a local prebuilt V8 static library, for offline builds |
-| `SSL_CERT_FILE`, `SSL_CERT_DIR` | extra trust roots, added to the bundled set and the OS store |
-| `V5_PERSONA` | captured identity JSON overriding the built-in `personas/chrome-local.json` |
-| `V5_ENGINE_LOG` | `1` prints the challenge engine's host surfaces, cookies and errors |
-| `V5_ENGINE_DUMP_DIR` | a directory: every request the challenge page makes, headers and body, written out so a program's failure is read instead of guessed at (inspection only) |
-| `V5_ENGINE_WALL_MS` | the engine's wall-clock cap per mint (default 10000); the other limits are `envelope::Limits` defaults |
-| `V5_CONTENT_WALL_MS` | the content lane's wall-clock cap per run (default 5000); its other limits are `envelope::Limits::content()` (96 ops, 16 MB per response, 48 MB total) |
-| `V5_CONTENT_OPS` | the content lane's op budget per run (default 96) |
-
-Tests are offline: from the repo root, run
-`sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch --offline`.
-A few tests are `#[ignore]`d by default —
-the AWS WAF fixture tests need the private captures (`--run-ignored all`) and one is a
-measurement. Engine tests take a process-wide turn, so timing assertions are not contaminated by
-parallel tests. Measured runs land in `runs/` (bench JSON, the identity matrix, datapath
-equivalence).
-
-Where the suite runs: the Linux x86_64 CI test lane runs the workspace, including this crate.
-The macOS arm64 and Windows x86_64 platform lanes compile the workspace tests and run selected
-platform scopes. Release and nightly build jobs build and gate five binaries, including
-Linux aarch64 and macOS x86_64; those build jobs are not full test-suite lanes.
-PDFium links with the toolchain's `rust-lld`; see the root README, "LLD".
+| `V5_STATE` | State JSON path (default `<os-cache>/donsetch/v5/state.json`; empty disables disk persistence) |
+| `V5_PERSONA` | Override built-in `personas/chrome-local.json` |
+| `V5_ENGINE_LOG` / `V5_ENGINE_DUMP_DIR` | Print touched V8 surfaces/cookies (`1`) or dump engine HTTP transcripts for inspection |
+| `V5_ENGINE_WALL_MS` / `V5_CONTENT_WALL_MS` / `V5_CONTENT_OPS` | Override mint timeout (`10000`), content-lane timeout (`5000`), or content op cap (`96`) |
+| `RUSTY_V8_ARCHIVE` / `SSL_CERT_FILE` / `SSL_CERT_DIR` | Offline prebuilt V8 static archive; extra PEM trust roots |

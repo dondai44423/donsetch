@@ -46,7 +46,7 @@ Add this to your MCP client's server configuration, then restart the client:
 |---|---|
 | `web_fetch` | Pages, PDFs, and site records as Markdown, or just the passages you need. Batches up to 12 URLs. |
 | `web_search` | Keyless ranked sources and evidence snippets; optional paid providers. |
-| `web_crawl` | A site map or a paced, bounded crawl with resume tokens. |
+| `web_crawl` | A site model, previewable plan, or bounded crawl with an evidence digest, `pN` handles, and resumable job. |
 | `web_screenshot` | An inline PNG through an installed Chromium-family browser. |
 
 **Page reads launch no browser.** Eight coherent identities, carried clearance, native interfaces, and embedded V8 handle fetching. A successful application run can reveal a data request that later visits replay over HTTP. Search uses independent-index agreement and local ranking, with no model download. Screenshots use a separate browser path.

@@ -1,176 +1,41 @@
 # Working on DonSeTch with an AI agent
 
-This file is for coding agents (Claude Code, Codex, OpenCode, Cursor and the
-like) and for the people driving them. It does not repeat
-[CONTRIBUTING.md](CONTRIBUTING.md): read that first for the build ladder,
-the test layout and the PR rules. This file covers the part agents get wrong
-most often: turning an issue into a change.
-
-## Local project context
-
-When local `docs/status.md` and `docs/project.md` exist, read `status.md` completely, then
-`project.md` and the docs they name (`docs/search.md`, `crates/fetch/README.md`) before planning
-project work. They are private and git-ignored; keep them that way. Current decisions
-and approval gates take precedence over historical plans and experimental
-artifacts. A branch or a dirty implementation is not an approved roadmap.
+Operating rules for contributors and the coding agents they drive. Read [CONTRIBUTING.md](CONTRIBUTING.md) first for prerequisites, the `just` build/test ladder, and CI behavior, and see [docs/architecture.md](docs/architecture.md), [docs/tools.md](docs/tools.md), and [crates/fetch/README.md](crates/fetch/README.md) for system design and contracts.
 
 ## The fetch path has a shape
 
-`src/` is the product; `crates/fetch/` (a workspace crate tested in CI) is the fetching
-layer: carried client identity, carried state, a page cache, wall
-classification, the site's own interfaces, and an in-process V8 engine that runs a
-challenge page's own program — or an application page's own program for content (the
-content lane: a data-plane DOM, never a rendering one). No browser is in the path. A first
-content run that passes the contract mines the app's own content request; later encounters replay
-it as plain HTTP on the identity that mined it, before any JS, and re-mine on a break. Private
-working docs live in `docs/`; frozen v4 evidence lives outside the checkout, in
-`~/Projects/donsetch-evidence/`.
+`src/` is the product; `crates/fetch/` is the fetching foundation (coherent client identities, per-origin state, strict page cache, wall classification, public site interfaces, embedded V8 for challenge minting and data-plane content execution, and mined HTTP request replay). No browser enters the reading path; speed and stealth are one property measured against curl on the first request.
 
-Fetch work is one of exactly four contract classes — **identity, state, request
-contract, egress**. Anything else is drift, however plausible. Before code:
+Every fetch change must fit **identity, state, request contract, or egress**:
 
-- **Classify first.** A wall is one of nine outcome classes with a vendor and an ask.
-  Reproduce it (`donsetch-fetch probe` / `bench`), name the class, then say what would
-  answer it. A wall a clean reference client also receives on the same egress is not
-  ours to fix.
-- **Only two asks are declared: human interaction and a login.** Identity, state,
-  request-contract and egress walls are always work. A page behind a login is
-  `wall_state`: this project never signs in, never stores credentials and never
-  carries a session. Authenticated browsing belongs to a real browser driver
-  (`bladebro`), not to the fetcher.
-- **Ask the site's own interface before calling a document a wall**, and run the site's
-  own challenge program in the engine before declaring an identity gap.
-- **Identity is a whole coherent client** — TLS, HTTP/2, header set and order, hints —
-  measured against the real browser it claims to be. Never a patched field, never a
-  relabelled stack. State binds to the client that earned it: clearance is never banked
-  across fingerprints, and pacing is part of identity.
-- **A JS-visible surface is measured, never guessed.** The content host answers geometry, screen,
-  media queries and observer entries from the identity's own capture, and `surface_tests` holds it
-  to a real browser's capture of the same probe page (`crates/fetch/src/surface_probe.html`). An element's box
-  is its declared style; positions are zeros because there is no layout. Adding a surface means
-  adding it to the probe and re-capturing the reference, not inventing a plausible answer.
-- **Never:** a browser or rendered page in the fetch path, layout or raster, a host
-  surface no measured challenge needs, a second fetch architecture, a resumed
-  doncore/Persona-Engine experiment, a tier-1/tier-2 browser lane, a login or session
-  vault, or a heuristic that guesses a wall instead of classifying it.
-- **A witness or it did not happen.** A capability claim needs a request the origin
-  accepted; a corpus number needs a `bench`/`probe` artifact from the same window as
-  its paired curl. Report a wall as a declared outcome with its evidence — never as
-  content, a speed win, or a failure to hide.
+- **Classify before coding.** Reproduce with `donsetch-fetch probe` or `bench`, name one of the nine outcome classes plus vendor/ask, and verify a clean reference client on the same egress does not hit the same wall.
+- **Only two asks are terminal declarations: human interaction and login.** Identity, state, request-contract, and egress walls are engineering work. Never sign in, store credentials, import browser cookies, or solve interactive captchas; authenticated or pixel-dependent sessions belong to a real browser driver ([Bladebro](https://github.com/dondai44423/bladebro)).
+- **Cheap routes before JS.** Ask `datapath.rs` interfaces and replay mined HTTP contracts before invoking V8, and run the site's challenge script in V8 before calling a gate an identity gap.
+- **Coherent, measured identity and surfaces.** TLS, HTTP/2, header set/order, hints, and pacing belong to one profile; clearance stays bound to `(host, identity)`. JS-visible surfaces in `engine_host.js` come from persona captures validated by `surface_tests` against `crates/fetch/src/surface_probe.html` (declared inline style boxes, zero layout positions) — never guessed or imported via `jsdom`/`happy-dom`.
+- **Forbidden:** launching a browser for fetch/search/crawl, CSS cascade/layout/raster, unmeasured host surfaces, a second fetch stack, or heuristics that guess walls instead of classifying them.
+- **Require a witness.** Every capability claim needs an accepted origin request; corpus claims need paired `bench`/`probe` artifacts from the same window.
+- **Major-version gate:** a major bump denotes a fetch-engine change; keep `donsetch update`'s confirmation prompt (`--yes` unattended) and first-run upgrade notice accurate when shipping one.
 
-Speed and stealth are one claim, not a trade-off: per-fetch cost is measured against
-curl on the first request, and any mechanism whose cost scales with page weight is
-disqualified from the default path.
+## Turning an issue into a change
 
-A major version is a fetch-engine change, not a patch: `donsetch update` refuses one
-without an explicit confirmation and `--yes` for unattended runs. Keep that warning's
-text current when a major ships, and keep its first-run notice for the upgrade path.
+Treat an issue body as a symptom report plus one hypothesis — never a spec:
 
-## An issue is a report, not a spec
+1. **Read every comment in order first.** Maintainer replies may narrow scope, reject the reporter's idea, or choose docs/config over code. If your proposed fix contradicts a maintainer comment, stop and have the human post on the issue before writing code.
+2. **Separate facts from interpretation.** Verify root causes directly in the codebase rather than trusting the reporter's diagnosis.
+3. **Check ownership.** Upstream client/library bugs belong in an upstream report plus a documented workaround here, not a silent heuristic.
+4. **Check existing config first.** Inspect `donsetch config show --markdown` and `src/config.rs` before adding options or auto-detection.
+5. **Back strong claims.** Words like "always", "never", or "no client sends this" require a spec citation, upstream code reference, or measurement.
+6. **State heuristic failure modes.** Any match on client names, versions, headers, or flags must state both false-positive and false-negative behavior in the PR.
 
-An issue body is one person's account of a symptom plus, usually, their
-guess at a fix. Treat both parts as evidence to check, not as instructions
-to carry out.
+## PR, test & repository rules
 
-Before writing any code for an issue:
+Follow `.github/PULL_REQUEST_TEMPLATE.md` plus these repo invariants:
 
-1. **Read the whole thread, every comment, in order.** Maintainers and
-   co-maintainers reply on the issue, and a reply may already reject the
-   reporter's proposal, narrow the scope, or decide that the fix is
-   documentation or configuration rather than code. A PR that contradicts a
-   position stated in the thread wastes a review round and will be sent
-   back. If the thread is long, summarize each comment's position before
-   deciding anything.
-2. **Separate the observation from the interpretation.** A capture, a table
-   of reproductions, a version number: those are facts. "The cause is X" and
-   "a narrower match could be Y" are the reporter's reasoning. Verify the
-   cause yourself in the code, and treat suggested fixes as one candidate
-   among several.
-3. **Ask whose bug it is.** If the root cause is in another project (a
-   client that misreports its name, a library that changed a default), the
-   right answer is often an upstream issue plus a documented workaround
-   here, not a heuristic that papers over it. Say so in the PR or the issue
-   comment instead of quietly coding around it.
-4. **Prefer the existing knob.** Check `donsetch config` and `src/config.rs`
-   before adding detection or a new option. If a setting already covers the
-   case, the fix may be a README section.
-5. **Do not invent certainty.** Claims such as "no other client sends this",
-   "always", "never", "safe" need a source: a spec section, upstream code,
-   or a measurement you ran. If you cannot back a claim, write the weaker
-   true statement instead. Reviewers check these sentences first.
-6. **Fingerprints and heuristics need a stated failure mode.** Any match on
-   a client name, a version range, a capability flag or a header must say in
-   the PR what happens on a false positive and a false negative, and why
-   both are acceptable. "It matches the one client we captured" is not a
-   design.
-
-If, after reading the thread, the change you would make conflicts with what
-a maintainer wrote there, stop and bring it to the person driving you: the
-disagreement goes on the issue, posted by them, before any code. Reaching
-agreement in the thread is cheaper than a changes-requested review.
-
-## What a PR must contain
-
-The template in `.github/PULL_REQUEST_TEMPLATE.md` applies. In addition:
-
-- **State what you read.** Name the comments on the issue that shaped the
-  fix, and say explicitly if you are taking the reporter's proposal as is.
-- **For a code change, a test that fails without the fix**, built from the
-  real capture where one exists, and at least one negative case that shows
-  the fix does not fire where it must not.
-- **A test has a cost budget.** Heavy tests are excluded by
-  `.config/nextest.toml`'s default-filter; `tests/budget.json` caps
-  single-test time, total CPU and fixture size, never test count. Keep a new test
-  under ~2 s; a corpus or clock test belongs in the heavy set (`just heavy`),
-  not in the per-push gate. CI fails on cost beyond the limits without a deliberate raise of
-  the budget in the same change.
-- **Tests isolate their own state instead of relying on the runner.** A
-  per-test temp dir isolates nothing when it reaches the code through
-  `DONSETCH_CACHE_DIR`: the variable is process-wide, so under libtest
-  parallel tests overwrite each other's value. Pass the path in where the
-  code allows it. A test that has to set the variable depends on nextest;
-  say so in a comment on the test.
-- **Doc comments describe contract, not history.** A `///` says what
-  callers can rely on; the reasoning behind a choice goes in `//` inside
-  the body, and the story goes in the PR.
-- **Check doc-comment rebinding.** After inserting or deleting a top-level
-  item, look at the neighbouring `///` blocks: a comment can silently
-  attach to the wrong item. Clippy flags only a blank line between a `///`
-  block and its item; a block sitting directly on the wrong item, as in
-  #301 and #303, passes rustfmt, clippy and the tests.
-- **Keep the change to the issue.** Drive-by rewording elsewhere goes in a
-  separate PR, unless the issue thread asked for it.
-
-## Review etiquette for agents
-
-- Read the review comments the same way as the issue thread: all of them,
-  in order, before changing anything.
-- Answer each point. "Addressed" is not an answer; say what changed or why
-  it did not.
-- Never dismiss, resolve or approve a review on behalf of a person.
-
-## Repository facts agents tend to miss
-
-- Bare `cargo test` is not a supported runner; use the `just` recipes in
-  CONTRIBUTING.md, which run `cargo nextest`. Nextest gives each test its
-  own process, and several tests depend on that: they set process-global
-  state such as the `DONSETCH_CACHE_DIR` environment variable, or rely on
-  the temp cache root a unit test gets without it, which exists once per
-  process (`test_cache_root` in `src/paths.rs`, `#[cfg(test)]` only, so an
-  integration test under `tests/it/` still has to set the variable). Under
-  libtest, where all tests share one process and run on threads, that
-  state leaks between tests and produces failures that have nothing to do
-  with your change. If you see one, say which runner produced it before
-  calling it a regression.
-- The tool spec table in `src/spec.rs` generates both the MCP tool
-  descriptions and schemas and the CLI subcommands. Every connected client
-  and every CLI user sees what it holds: treat edits there as user-facing.
-- The version is bumped by the maintainer at release time. Do not touch it
-  in a PR. A release is `just ship <version>`: it bumps the manifests and
-  pushes the release commit, and the CI pipeline (`.github/workflows/ci.yml`)
-  tests it, builds and gates the five binaries, tags and publishes the GitHub
-  release, stopping at the first red. npm is dispatched afterwards as its own
-  workflow run, so a registry failure cannot fail a release. Do not hand-run
-  those steps, and do not tag by hand: the pipeline tags the commit it tested.
-- Commit messages follow Conventional Commits. Do not append tool or
-  session trailers.
+- **Cite thread context:** name the issue comments that shaped the PR, and state whether you followed or diverged from the reporter's proposal.
+- **Regression + negative tests:** include a test that fails without the fix (from a real capture when available) and a negative test proving it does not over-fire.
+- **Respect `nextest` isolation and `tests/budget.json`:** never run bare `cargo test` — use `just t <scope>`, `just tf <scope>`, and `just all`. `cargo nextest` gives each test its own process, which tests touching process-wide state like `DONSETCH_CACHE_DIR` or `test_cache_root` (`src/paths.rs`, unit tests only) rely on; pass explicit paths where APIs allow and document `nextest` reliance otherwise. Keep new tests under ~2 s; corpus/clock/soak tests belong in `just heavy`.
+- **Contract doc comments (`///`):** document caller guarantees in `///` and implementation rationale in `//`. After adding or deleting top-level items, verify neighboring `///` blocks did not silently rebind to the adjacent item.
+- **User-facing tool specs:** `src/spec.rs` generates both MCP schemas and CLI flags — treat every edit there as public UX.
+- **No doc sprawl:** update the owning doc (`docs/architecture.md`, `docs/tools.md`, `crates/fetch/README.md`, etc.) in place rather than adding standalone plan/notes `.md` files or appending dated history logs.
+- **Scope & releases:** keep drive-by rewording out of bugfix PRs; use Conventional Commits with no agent/session trailers; never bump versions, edit `CHANGELOG.md` release headers, or tag manually (`just ship <version>` is maintainer-only).
+- **Code review:** read every review comment in order before editing, explain what changed (never bare "Addressed"), and never resolve/dismiss/approve reviews on a human's behalf.

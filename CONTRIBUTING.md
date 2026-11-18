@@ -1,268 +1,79 @@
 # Contributing to DonSeTch
 
-Thanks for your interest in contributing. DonSeTch is AGPL v3 — all contributions must be under the same license.
+DonSeTch is licensed under AGPL-3.0-only; all contributions are accepted under that license. Coding agents and their operators should also read [AGENTS.md](AGENTS.md).
 
-## Build from source
+## Prerequisites & build shapes
+
+Requires **Rust 1.98+** (pinned in `rust-toolchain.toml`), **Go 1.22+**, **NASM**, **LLVM/Clang (`libclang`)**, and **CMake** — see [setup.md](docs/setup.md#build-from-source) for per-OS install commands.
 
 ```bash
-git clone https://github.com/dondai44423/donsetch.git
-cd donsetch
-just bin                      # edit-loop binary: target/fast/donsetch (seconds)
-just bin-dist                 # the SHIPPED shape: target/dist-thin/donsetch (what CI releases)
-cargo build --release         # local release: thin LTO, parallel codegen
+just bin              # edit-loop binary: target/fast/donsetch (seconds warm)
+just bin-dist         # shipped binary shape: target/dist-thin/donsetch (opt-level 3, panic=abort)
+cargo build --release # local thin-LTO release build
 ```
 
-**Prerequisites**: Rust 1.98+ (pinned via `rust-toolchain.toml`), Go 1.22+, NASM, LLVM/Clang, CMake. See the [setup guide](docs/setup.md#build-from-source) for platform-specific install commands.
+Two Cargo profiles power the workflow: `fast` (workspace opt-level 0, deps opt-level 1, no debuginfo, 16 codegen units — shared by local loops and CI test lanes) and `dist-thin` (what CI ships and nightly heavy tests run against). Avoid bare `cargo test` or repeated `cargo build --release` during iteration: they compile separate target graphs and break process-per-test isolation.
 
 ## Development workflow
 
-The ladder: climb only as far as the question needs.
+Climb only as far up the ladder as your change needs:
 
 ```bash
-just check              # types + cfg, no optional features      ~1 s warm
-just t crawl::frontier  # the touched scope, no features         ~2 s warm
-just test               # the default suite (full features)      ~36 s warm
-just check-all          # every target, full features (the old check)
-just tf crawl::frontier # the touched scope, full features
-just all                # pre-push: guard + fmt + check + lockgate + lint + budget-static
+just check              # type-check workspace, no optional features (~1 s warm)
+just t crawl::frontier  # scoped nextest run, no optional features (~2 s warm)
+just check-all          # type-check all targets with ocr,http
+just tf crawl::frontier # scoped nextest run with ocr,http
+just test               # full default suite with ocr,http (~35 s warm)
+just all                # pre-push gate: guard + fmt-check + check + lockgate + lint + budget-static
 ```
 
-`just check` and `just t` leave `ocr,http` off on purpose: the featureless
-graph is 386 crates against 572, and OCR/HTTP code is not what a fetch or
-search edit is about. `just check-all` and `just tf` are their full-feature
-twins; `just all` checks the full set, so nothing feature-gated reaches a
-push unchecked.
+- **Feature split:** `just check` and `just t` omit `ocr,http` (386 vs 572 crates) for fast fetch/search/crawl iteration; `just all` compiles and lints both feature sets before push.
+- **Scoped fetch-crate tests:** `sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch`.
+- **Resource wrapper & caching:** `Justfile` routes builds through `scripts/budget.sh` (sizing parallel jobs to `MemAvailable`, forwarding job caps to CMake/Make/NASM, and auto-enabling `sccache` / `rust-sccache` when installed) and `scripts/guard.sh` (keeping `target/` under 55 GB). Override with `BG_JOBS=<n>` or `BG_CORES=<set>`.
+- **Test budgets (`tests/budget.json`):** `.config/nextest.toml` excludes heavy PDF, soak, and clock tests from `just test` (run them via `just th <name>` or `just heavy`; test release-opt behavior via `just tdist <expr>`). `tests/budget.json` caps single-test duration, total CPU, and fixture size — keep new tests specific and under ~2 s, or place corpus/clock tests in the heavy set. Inspect with `just budget`; tighten ceilings with `just ratchet`.
 
-`just check` and `just t` run the **`fast` profile** (this crate at opt-level 0,
-deps at opt-level 1, no debuginfo, codegen-units 16), and so does every CI test
-lane: what you run is what CI runs. `dist-thin` is the shipped shape (opt-level
-3, no LTO, `panic = "abort"`); the release pipeline builds it and the nightly
-heavy suite runs on it, because those tests measure time and memory. These are
-the two workflow profiles. A plain `cargo build --release` is thin LTO on purpose: a
-local release binary should not cost ten minutes.
+### CI & releases (`.github/workflows/ci.yml`)
 
-**Tests are budgeted.** The default filter in `.config/nextest.toml` excludes
-the heavy PDF, soak and timing tests. They still run in `just heavy` and in nightly CI.
-`tests/budget.json` caps single-test time, total CPU and fixture size, never
-test count; CI fails when a change exceeds those cost limits without a
-deliberate raise. A new test should be cheap and specific: prefer a unit test or
-one integration test for the contract, keep it under ~2 s, and put anything that
-needs a real corpus or a real clock in the heavy set.
+Branch protection requires one check: **`gate`**.
 
-Use `just th <name>` to run a heavy test on purpose, `just tdist <expr>` for
-release-profile behavior, `just budget` to see the suite exactly as the guard
-does, and `just ratchet` after a clean run to pull the ceilings in to what the
-suite really uses (raising one stays a reviewed edit to `tests/budget.json`). Do **not** make a bare `cargo test` or `cargo build --release` your
-edit loop: those compile another artifact graph, and recompiling it is the
-slowest thing in this repository. `just all` is the only local gate you need
-before pushing.
-
-### What CI runs, and when
-
-One workflow, `.github/workflows/ci.yml`, with one required check, `gate`:
-
-| Event | What runs |
+| Trigger | Pipeline work |
 |---|---|
-| Docs-only push or PR | nothing (the gate passes) |
-| Any other push or PR | `lint` (fmt, deny, budget, clippy on both feature sets) and the full suite on Linux, about 5 minutes warm |
-| That push touches platform code (processes, paths, profile, PDF, ONNX, the updater, `crates/fetch/`, build files, workflows) | the same, plus the platform suite on Windows and macOS |
-| A release commit, and the nightly | everything: all three test lanes, and the five shipped binaries built and gated |
+| Docs-only push or PR | Skips compile/test; `gate` passes immediately |
+| Code push or PR | `lint` (fmt, cargo-deny, static budget, clippy with and without `ocr,http`) + Linux x86_64 test suite (~5 min warm) |
+| Platform-touching push or PR (`mcp`, `profile`, `pdf`, `browser`, `cli`, `paths`, `onnx`, `crates/fetch/`, `build.rs`, `Cargo.*`, `npm/`, `.github/`) | Above + macOS arm64 and Windows x86_64 platform suites |
+| Release commit or nightly | All three OS suites + all five release binaries built and checked by `scripts/gates.sh` |
 
-A newer push to master cancels the unfinished run of an older one; a release
-run is never cancelled. To run the Windows and macOS lanes on a branch, or to
-build and gate the five binaries without publishing, dispatch the workflow
-(`gh workflow run ci.yml --ref <branch> -f platforms=true -f build=true`).
+Newer `master` pushes cancel unfinished non-release runs. Trigger platform/binary checks manually on a branch with `gh workflow run ci.yml --ref <branch> -f platforms=true -f build=true`. Keep GitHub Actions cache usage within the 10 GB pool (`gh cache list`).
 
-Caches hold dependencies only, one entry per lane, replaced when the
-dependency hash changes (`.github/actions/`). The repository's cache pool is
-10 GB; do not add a lane without checking `gh cache list` and the budget table
-at the top of `ci.yml`.
+- **Windows & cross-checking:** native Windows CI (`msvc`) is authoritative because embedded V8 prevents a full Linux→Windows cross-check; `Justfile` retains `just win-check-core` / `just win-check` (`mingw-w64`) for partial `#[cfg(windows)]` checks. On Windows, run `just` inside Git Bash or wrap `just` in PowerShell `$PROFILE` (`function just { just.exe --shell "C:\Program Files\Git\bin\sh.exe" @args }`) — never add Git's `usr\bin` to global `PATH`.
+- **Shipping (maintainer):** `just ship <version>` verifies `CHANGELOG.md`, bumps `Cargo.toml`, `Cargo.lock`, and `npm/package.json`, and pushes `chore(release): <version>`. CI gates all platforms and binaries before tagging, publishing the GitHub Release, and dispatching `npm-publish.yml` (`just runs` checks status; `gh run rerun <id> --failed` or `gh workflow run npm-publish.yml -f tag=v<version>` retries).
 
-[`sccache`](https://github.com/mozilla/sccache) is picked up automatically when
-installed (`rust-sccache` on Void, `sccache` elsewhere): recompiles across
-profiles, feature sets and branches become cache hits, and it wraps the C/C++
-compilers too, which is where BoringSSL's build cost actually lives.
+## What belongs in DonSeTch
 
-The recipes go through `scripts/budget.sh`, which uses all cores by default
-(`BG_CORES` narrows the set) and passes the job cap into nested build systems
-(cmake, make, nasm). It also sizes the job count from `MemAvailable` right now (~700 MB per
-rustc at codegen-units 16, 1 GB reserved): three to four jobs with a browser
-open, eight on an idle box. `BG_JOBS=<n>` overrides it.
+**Welcome:**
+- Reproducible bug fixes paired with a regression test.
+- Keyless search sources and fixes to existing optional BYOK providers (without weakening keyless search).
+- Measured fetch improvements inside **identity, state, request contract, or egress** backed by a live witness ([AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape)).
+- PDF edge cases (corrupt encodings, complex tables, forms) and measured performance wins.
 
-Releasing is one command: `just ship <version>`. It bumps the manifests and
-pushes the release commit. A push to master whose version has no tag yet *is* a
-release to the pipeline: it runs the suite on Linux, Windows and macOS, builds
-the five binaries and runs `scripts/gates.sh` on each (size, ONNX payload,
-version, glibc 2.35 baseline, non-AVX CPU) while that happens, and only when
-everything is green creates the tag and the GitHub release from those exact
-binaries. A red run publishes nothing and leaves nothing to undo: fix forward and
-push, and the same version is tried again. One failed job re-runs alone with
-`gh run rerun <id> --failed`. Progress: `just runs`.
+**Out of scope:**
+- New built-in BYOK search providers (use the [executable search plugin interface](docs/tools.md#search-plugins) instead).
+- Features requiring API keys/accounts on the default path, Python/Node runtime dependencies, interactive captcha solvers, login/session vaults, or bulk-scraping features.
 
-npm is dispatched as its own workflow run once the release exists, so a registry
-or credential failure there never reddens the release; retry it with
-`gh workflow run npm-publish.yml -f tag=v<version>`.
+## Pull requests & issues
 
-### Verifying Windows compilation from Linux
+1. Branch from `master` (`feat/…`, `fix/…`, `docs/…`) and use Conventional Commits (`feat(search): …`, `fix: …`, `docs: …`, `!` for breaking changes).
+2. Place unit tests in inline `#[cfg(test)]` modules and integration tests under `tests/it/` (registered in `tests/it/main.rs` so they share one test binary — never add new top-level `tests/*.rs` binaries).
+3. Run scoped tests + `just all` for code changes (docs-only PRs need no build/test run) and ensure CI `gate` is green.
 
-Linux-only changes can break Windows CI in `cfg`-gated code that never
-compiles locally. `just win-check` attempts to type-check the workspace for
-`x86_64-pc-windows-gnu` without linking — both ends of the feature matrix
-(full `ocr,http` and `--no-default-features`), all targets,
-`-Dwarnings`. **The embedded V8 dependency currently prevents a complete Windows
-cross-check from Linux; native Windows CI is authoritative.** It is not part of
-`just all` because it needs a cross toolchain on top of the normal build
-prerequisites (NASM, CMake and libclang are already required above). On
-Debian/Ubuntu:
+When filing issues, include `donsetch --version`, the target URL or query, and the `[meta]` JSON receipt (`verdict` for walls; `engines` and `weak` for search).
 
-```bash
-sudo apt install mingw-w64 pkg-config
-rustup target add x86_64-pc-windows-gnu
-```
+## Maintainers & CODEOWNERS
 
-On other distros install the equivalents: the x86_64 mingw-w64 cross
-toolchain (gcc and g++) and pkg-config. If you skipped the normal
-prerequisites, add NASM, CMake and libclang (`nasm cmake libclang-dev` on
-Debian/Ubuntu).
-
-Per recipe:
-
-- **`win-check-core`** (`--no-default-features`): `mingw-w64` (cross
-  gcc/g++), `nasm` + `cmake` (BoringSSL build), `libclang-dev`
-  (bindgen for boring-sys), and the `x86_64-pc-windows-gnu` rustup
-  target. Run this one first; it is the cheaper half.
-- **`win-check-full`** (`ocr,http`): all of the above plus
-  `pkg-config` — the ort binary downloader builds a host-side
-  `openssl-sys`, which needs pkg-config to find the system OpenSSL
-  headers (`libssl-dev`, usually already present).
-- **`win-check`** runs both.
-
-The cross toolchain setup above is retained for checks that the dependencies
-support. The recipe's comments in the Justfile explain the three environment
-workarounds it applies. Windows CI builds the msvc target and links.
-Even when dependencies permit a cross-check, type-checking is the ceiling: an actual `cargo build` for
-`x86_64-pc-windows-gnu` fails to link even with `--no-default-features`
-(BoringSSL), so do not expect a runnable binary out of the cross setup. The
-common case is code under `#[cfg(windows)]` or `#[cfg(unix)]` that no longer compiles
-on the other side. Note that rustc reports the first error it hits, so the
-message can differ from the Windows CI log for the same break (a missing
-import surfaces before a type mismatch on the same line, for instance).
-
-### Windows
-
-The recipes are POSIX shell (`2>/dev/null`, `head -c`, `cd fuzz && …`) and `just` runs them with `sh`,
-which PowerShell does not have on `PATH`. Either:
-
-- **Run `just` from a Git Bash prompt.** Works with no setup, wherever Git is installed.
-- **Stay in PowerShell** and point `just` at Git's `sh` with a wrapper in your profile.
-  `$PROFILE` holds the path — open it with the editor of your choice (`code $PROFILE`, `notepad $PROFILE`),
-  creating the file if it does not exist:
-
-  ```powershell
-  function just { just.exe --shell "C:\Program Files\Git\bin\sh.exe" @args }
-  ```
-
-  Adjust that path if Git is not at the installer default: scoop, winget per-user, and portable installs put `sh.exe` elsewhere.
-
-Do not put Git's `usr\bin` on the global `PATH` as a shortcut — it holds GNU tools whose names collide with Windows ones (`find`, `sort`, `link`), which can confuse toolchains outside this repo. Git Bash exposes them only inside its own session, which is why running `just` there is safe.
-
-## Commit conventions
-
-Conventional Commits:
-
-```
-feat: add proxy rotation
-fix: handle 429 retry-after
-docs: update README
-chore: bump deps
-feat!: breaking change (the ! marks breaking)
-```
-
-Scope optional: `feat(search): add scholar vertical`.
-
-## What we're looking for
-
-- **Bug fixes** with a test that would have caught the bug.
-- **New search engines** that are keyless and don't require API keys.
-- **Fixes to existing BYOK search providers.** These remain optional and must never weaken the keyless experience.
-- **Fetch improvements inside the four classes** — identity, state, request contract,
-  egress: a new coherent client profile, a wall classified with a witness, a site's own
-  interface as a contract. A new heuristic that guesses at a wall instead of classifying
-  it is not a contribution.
-- **PDF extraction** edge cases: corrupt files, weird encodings, exotic tables.
-- **Performance**: measured improvements, not micro-optimizations.
-
-## What we're not looking for
-
-- **New native BYOK search providers are paused.** We are keeping the current featured provider list for now; please do not open PRs adding providers to it. Additional services can use the existing [search plugin interface](docs/tools.md#search-plugins), without a DonSeTch release.
-- **Core features that hard-require API keys.** The default toolset must work with zero keys, zero accounts. Existing BYOK integrations remain optional: the user opts in by providing their own key. They must never degrade the keyless experience.
-- Adding Python or Node.js dependencies. DonSeTch is Rust, built from scratch. That's the point.
-- Solving interactive captchas (hCaptcha, reCAPTCHA). That's a hard line, not a TODO.
-- Mass-scraping features. DonSeTch is for agentic research, not bulk extraction.
-
-## Architecture overview
-
-The fetch layer is `crates/fetch/` (a workspace crate): carried client
-identity, carried state, a page cache, wall classification, the site's own interfaces,
-and an in-process V8 engine that runs challenge programs or application programs for content. No browser is in
-the fetch path — Chromium serves `web_screenshot` and doctor's parity capture only. The
-[architecture guide](docs/architecture.md) is the public description of
-the whole product.
-
-Fetch work is measured, not argued. The crate has `fetch`, `probe` (identity × target
-matrix), `bench` (cold, paired with curl in the same window) and `state`, and the rules
-for improving it — classify the wall first, then identity, state, request contract or
-egress, with a witness — are in
-[AGENTS.md](AGENTS.md#the-fetch-path-has-a-shape). Its suite runs with the
-workspace on Linux in CI. From the repo root, a scoped fetch-crate run is
-`sh scripts/budget.sh cargo nextest run --cargo-profile fast --locked -p donsetch-fetch`.
-
-Experimental branches may have a different source layout; do not treat their
-implementation as a released feature or an approved plan. For local planning context,
-follow [AGENTS.md](AGENTS.md#local-project-context).
-
-## Pull requests
-
-1. Fork the repo, create a branch (`feat/...`, `fix/...`, `docs/...`).
-2. Write tests for your change: unit tests in a `#[cfg(test)]` module next to the code, integration tests as a module under `tests/it/` (registered in `tests/it/main.rs`, so they share one binary). Do not add a new top-level `tests/*.rs` file: each one becomes a separate test binary that links the whole crate again.
-3. For code changes, run relevant scoped tests and `just all`; documentation-only changes need no build or test run.
-4. Open a PR with a conventional commit title.
-5. The required CI `gate` must be green before merge; the workflow selects the applicable test and build lanes.
-
-## Reporting issues
-
-- **Bugs**: include the URL you tried to fetch/search/crawl, the DonSeTch version (`donsetch --version`), and the leading `[meta]` JSON plus relevant response text (or `structuredContent` if split output is enabled).
-- **Anti-bot failures**: include the site URL and the `verdict` field from the response.
-- **Search issues**: include the query, the `engines` report from response metadata, and whether `weak=true`.
-
-## Reviewers & maintainers
-
-DonSeTch reviewers earn their paths through sustained high-quality
-contributions. The two tiers:
-
-- **Co-maintainer** (collaborator): merges once CI is green, keeps the
-  project moving outside maintainer hours.
-- **Subsystem reviewers**: CODEOWNERS auto-requests their review on
-  their owned paths. No merge power, no access grants, just the
-  strongest review signal the repo can give.
-
-| Role | Person | Owns |
+| Role | GitHub | Scope |
 |---|---|---|
-| Maintainer | @dondai44423 | everything |
-| Co-maintainer | @Mart-Bogdan | search, ghost, fetch, GitHub config |
-| Co-maintainer | @mnaza | PDF, h2 transport, cookies, search BYOK |
-| Subsystem reviewer | @adaaaaaaaaaaaaaaaaaaaaaa | MCP surface, tool specs, tests |
-| Subsystem reviewer | @imonlinux | Docker image, compose, HTTP transport |
-
-(A personal-account repository has only two access levels: owner and
-collaborator. There is no triage tier on this repo type, so reviewer
-recognition lives in CODEOWNERS.)
-
-Authors of exceptional one-shot contributions (CloakBrowser,
-SerpBase, BYOK adapters, and others) are credited in the changelog
-and release notes and are welcome back for a second wave, at which
-point subsystem ownership opens up.
-
-## License
-
-By contributing, you agree that your contributions will be licensed under the AGPL v3.
+| Maintainer | `@dondai44423` | Repository-wide |
+| Co-maintainer | `@Mart-Bogdan` | Search, fetch, GitHub workflows |
+| Co-maintainer | `@mnaza` | Search/BYOK, PDF, transport, cookies |
+| Subsystem reviewer | `@adaaaaaaaaaaaaaaaaaaaaaa` | MCP surface, `src/spec.rs`, `tests/` |
+| Subsystem reviewer | `@imonlinux` | `Dockerfile`, `docker-compose.yml`, HTTP MCP |
