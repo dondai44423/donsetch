@@ -138,6 +138,8 @@ section!(BypassSection {
 });
 
 section!(SearchSection {
+    /// Explicitly select Parallel's anonymous MCP source for searches without a language override.
+    parallel_mcp: bool = false,
     /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
@@ -1710,6 +1712,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Int,
             "0 (auto)",
             "deprecated no-op (search carries no model)",
+        ),
+        (
+            "search",
+            "parallel_mcp",
+            FieldKind::Bool,
+            "false",
+            "send searches without a language override to Parallel's anonymous MCP source",
         ),
         (
             "search",

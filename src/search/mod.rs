@@ -31,6 +31,7 @@ mod lang;
 pub(crate) mod ledger;
 pub use lang::{Lang, native_script};
 mod news;
+pub(crate) mod parallel_mcp;
 mod persist;
 pub mod quality;
 mod render;
@@ -632,7 +633,7 @@ pub struct SearchOutcome {
     pub quality: quality::Assessment,
     pub cache_age: Option<Duration>,
     pub elapsed: Duration,
-    /// BYOK provider name (None = local search).
+    /// Selected provider name (None = local search).
     pub provider: Option<String>,
     /// Deprecated and always false: search has no cross-encoder, no ONNX and no
     /// model in its path (§8). The field stays in the envelope for one release

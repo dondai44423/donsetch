@@ -56,7 +56,26 @@ Supports `site:`, `filetype:`, `intitle:`, `"…"`, `-term`, exact identifiers, 
 - **Answer metadata:** `confidence` (`high` | `medium` | `low` — retrieval agreement/coverage, not fact verification), `degraded`, `requested_results` / `returned_results` / `underfilled`, `source_type`, and `cache_age_ms` (only `high`-confidence merged sets are cached).
 - **Diagnostics:** `donsetch search --sources`, `donsetch search doctor`, `donsetch search --explain "query"`.
 
-### Optional search providers
+### Parallel MCP (keyless, opt-in)
+
+Set this in `donsetch.toml` and restart an existing MCP process. Then use the same
+`donsetch search "rust async cancellation"` command or the `web_search` tool.
+
+```toml
+[search]
+parallel_mcp = true
+```
+
+You can also set `DONSETCH_SEARCH__PARALLEL_MCP=true`. When enabled, CLI and
+agent searches without an explicit `lang` send their queries and intent-derived
+objectives to `https://mcp.parallel.ai/mcp`. No account or API key is needed.
+This source is rate limited and uses either a direct connection or the
+configured HTTP proxy. It reports its own errors. An explicit `lang` uses the
+existing language-aware search path, and `read` and follow-up `web_fetch` use
+DonSeTch's fetch path. Set `parallel_mcp = false` to restore the usual provider
+order, including any configured API keys.
+
+### Optional search providers with API keys
 
 | Provider | Key name | Provider | Key name |
 |---|---|---|---|

@@ -107,6 +107,7 @@ pub(super) fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> 
 pub(super) struct SearchFailure {
     pub(super) cause: String,
     pub(super) byok_tried: bool,
+    parallel_mcp: bool,
     /// "permanent" for bad input that no retry or fallback fixes
     /// (validate_query rejected it before any engine was contacted);
     /// "transient" for exhausted engines/providers.
@@ -126,6 +127,11 @@ pub(super) async fn search_inner(
 ) -> Value {
     match search_read(daemon, query, max, intent, read, lang).await {
         Ok(out) => render_search_outcome(daemon, &out, max).await,
+        Err(failure) if failure.parallel_mcp => tool_error_structured(
+            format!("search: {}", failure.cause),
+            failure.kind,
+            Some(json!({"query": query, "provider": search::parallel_mcp::SOURCE})),
+        ),
         Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
     }
 }
@@ -392,7 +398,8 @@ async fn search_read(
     read: usize,
     lang: Option<&crate::search::Lang>,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
-    let mut out = search_outcome(daemon, query, max, intent, read, lang).await?;
+    let parallel_mcp = crate::config::cfg().search.parallel_mcp && lang.is_none();
+    let mut out = search_outcome(daemon, query, max, intent, read, lang, parallel_mcp).await?;
     if out.provider.is_none() {
         return Ok(out);
     }
@@ -404,10 +411,12 @@ async fn search_read(
     }
     // A stub snippet in the top three is read from its page, inside what
     // `read` left of the same budget.
-    daemon
-        .searcher
-        .repair_snippets(&mut out.results, query, read)
-        .await;
+    if !parallel_mcp {
+        daemon
+            .searcher
+            .repair_snippets(&mut out.results, query, read)
+            .await;
+    }
     Ok(out)
 }
 
@@ -420,6 +429,7 @@ pub(super) async fn search_outcome(
     intent: Option<Intent>,
     read: usize,
     lang: Option<&crate::search::Lang>,
+    parallel_mcp: bool,
 ) -> Result<crate::search::SearchOutcome, SearchFailure> {
     // Input hygiene first: a bad query is a permanent-shaped failure
     // whether the fanout would have been BYOK or local.
@@ -427,8 +437,22 @@ pub(super) async fn search_outcome(
         return Err(SearchFailure {
             cause: problem,
             byok_tried: false,
+            parallel_mcp: false,
             kind: "permanent",
         });
+    }
+
+    // This is an explicit source choice. Keep language-specific requests on
+    // the existing route and never enter a different provider chain on failure.
+    if parallel_mcp {
+        return search::parallel_mcp::search(query, max, intent)
+            .await
+            .map_err(|error| SearchFailure {
+                cause: format!("Parallel MCP: {error}"),
+                byok_tried: false,
+                parallel_mcp: true,
+                kind: error.kind(),
+            });
     }
     // Reload from disk first : picks up keys added/removed
     // via CLI while the daemon was running.
@@ -495,6 +519,7 @@ pub(super) async fn search_outcome(
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
                         byok_tried: true,
+                        parallel_mcp: false,
                         kind: "transient",
                     }),
                 }
@@ -502,6 +527,7 @@ pub(super) async fn search_outcome(
                 Err(SearchFailure {
                     cause: e.to_string(),
                     byok_tried: false,
+                    parallel_mcp: false,
                     kind: "transient",
                 })
             }
