@@ -33,7 +33,7 @@ pub mod view;
 /// table (a WAF quota reply), not a document. A page of records carries names,
 /// sentences or repeated prose; this does not.
 pub(crate) fn metric_table(markdown: &str) -> bool {
-    let mut prose = 0usize;
+    let mut prose_chars = 0usize;
     let mut keys = 0usize;
     for line in markdown.lines() {
         let line = line.trim();
@@ -52,11 +52,15 @@ pub(crate) fn metric_table(markdown: &str) -> bool {
             {
                 keys += 1;
             }
-        } else if !line.starts_with('-') && !line.starts_with('>') {
-            prose += 1;
+        } else if line.starts_with('>') {
+            prose_chars += line.chars().count();
+        } else if !line.starts_with('-') {
+            prose_chars += line.chars().count();
         }
     }
-    keys >= 4 && prose <= 3 && markdown.chars().count() < 1_200
+    // A page may carry a metrics table beside its prose (a profile's stats next
+    // to a WAF quota blob); only a table that is the document is refused.
+    keys >= 4 && prose_chars < 120 && markdown.chars().count() < 1_200
 }
 
 #[cfg(test)]

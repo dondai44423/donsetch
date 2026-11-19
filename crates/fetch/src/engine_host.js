@@ -389,17 +389,22 @@
       this.onmessage = null;
       this._listeners = [];
       this._source = blobUrls.get(this._url) || null;
+      this._worker = null;
+      this._workerListeners = [];
     }
     addEventListener(kind, handler) { if (kind === "message") this._listeners.push(handler); }
-    postMessage(data) {
+    _start() {
+      if (this._worker) return true;
       let source = this._source;
       if (source == null) {
         try {
           const response = netFetch(this._url, { method: "GET", __dest: "worker", mode: "same-origin" });
           source = response.textSync || "";
-        } catch (e) { note("log", "worker load: " + (e && e.message)); return; }
+        } catch (e) { note("log", "worker load: " + (e && e.message)); return false; }
       }
-      const workerSelf = {
+      const selfUrl = this._url.startsWith("blob:") ? this._url : new URL(this._url, M.page.url).href;
+      const workerListeners = [];
+      const worker = {
         onmessage: null,
         postMessage: (message) => {
           const event = { data: message };
@@ -407,25 +412,50 @@
           for (const listener of this._listeners) { try { listener(event); } catch (e) {} }
         },
         close() {},
-        addEventListener(kind, handler) { if (kind === "message") workerSelf.onmessage = handler; },
+        location: { href: selfUrl, toString: () => selfUrl },
+        importScripts: (...urls) => {
+          const previousSelf = globalThis.self;
+          const previousPost = globalThis.postMessage;
+          globalThis.self = worker;
+          globalThis.postMessage = worker.postMessage;
+          try {
+            for (const url of urls) {
+              const absolute = new URL(String(url), selfUrl).href;
+              const response = netFetch(absolute, { method: "GET", __dest: "worker", mode: "same-origin" });
+              const outcome = core.evalContext(String(response.textSync || ""), absolute);
+              if (outcome && outcome[1]) throw outcome[1].thrown;
+            }
+          } catch (e) { note("log", "importScripts: " + (e && e.message)); }
+          finally { globalThis.self = previousSelf; globalThis.postMessage = previousPost; }
+        },
+        addEventListener(kind, handler) { if (kind === "message") workerListeners.push(handler); },
       };
+      this._worker = worker;
+      this._workerListeners = workerListeners;
       const previousSelf = globalThis.self;
       const previousPost = globalThis.postMessage;
-      globalThis.self = workerSelf;
-      globalThis.postMessage = workerSelf.postMessage;
+      globalThis.self = worker;
+      globalThis.postMessage = worker.postMessage;
       try {
-        const outcome = core.evalContext(String(source), this._url.startsWith("blob:") ? this._url : new URL(this._url, M.page.url).href);
+        const outcome = core.evalContext(String(source), selfUrl);
         if (outcome && outcome[1]) throw outcome[1].thrown;
-        const deliver = { data };
-        if (workerSelf.onmessage) workerSelf.onmessage(deliver);
       } catch (e) {
         note("log", "worker: " + (e && e.message));
       } finally {
         globalThis.self = previousSelf;
         globalThis.postMessage = previousPost;
       }
+      return true;
     }
-    terminate() {}
+    postMessage(data) {
+      if (!this._start()) return;
+      const event = { data };
+      try {
+        if (this._worker.onmessage) this._worker.onmessage(event);
+      } catch (e) { note("log", "worker message: " + (e && e.message)); }
+      for (const listener of this._workerListeners) { try { listener(event); } catch (e) {} }
+    }
+    terminate() { this._worker = null; this._workerListeners = []; this.onmessage = null; this._listeners = []; }
   }
   globalThis.Worker = WorkerShim;
 
@@ -1152,6 +1182,44 @@
     const navigationMs = Math.max(0, Number(page.navigationMs) || 0);
     const now = () => Math.floor((ops.op_now() + navigationMs) * 10) / 10;
     const timeOrigin = Math.floor((Date.now() - (ops.op_now() + navigationMs)) * 10) / 10;
+    // The navigation timing entry a browser exposes. Signature SDKs read it
+    // (webmssdk reads connectEnd) and fail the whole boot when it is missing.
+    const navigationEntry = () => {
+      const end = navigatorShimMs(navigationMs);
+      const connectStart = Math.min(end, Math.max(0, Math.round(end * 0.06)));
+      const connectEnd = Math.min(end, connectStart + Math.max(1, Math.round(end * 0.12)));
+      const requestStart = connectEnd;
+      const responseStart = Math.min(end, requestStart + Math.max(1, Math.round(end * 0.35)));
+      return {
+        name: page.url, entryType: "navigation", startTime: 0, duration: end, type: "navigate",
+        redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+        domainLookupStart: 0, domainLookupEnd: connectStart,
+        connectStart, connectEnd, secureConnectionStart: connectStart,
+        requestStart, responseStart, responseEnd: end,
+        domLoading: responseStart, domInteractive: responseStart,
+        domContentLoadedEventStart: responseStart, domContentLoadedEventEnd: end,
+        domComplete: end, loadEventStart: end, loadEventEnd: end,
+        unloadEventStart: 0, unloadEventEnd: 0,
+        nextHopProtocol: "h2", transferSize: 0, encodedBodySize: 0, decodedBodySize: 0,
+        serverTiming: [], workerStart: 0,
+      };
+    };
+    const navigatorShimMs = (value) => Math.max(1, Math.round(value));
+    const legacyTiming = () => {
+      const entry = navigationEntry();
+      return {
+        navigationStart: 0, unloadEventStart: 0, unloadEventEnd: 0,
+        redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+        domainLookupStart: 0, domainLookupEnd: entry.domainLookupEnd,
+        connectStart: entry.connectStart, connectEnd: entry.connectEnd,
+        secureConnectionStart: entry.secureConnectionStart,
+        requestStart: entry.requestStart, responseStart: entry.responseStart, responseEnd: entry.responseEnd,
+        domLoading: entry.domLoading, domInteractive: entry.domInteractive,
+        domContentLoadedEventStart: entry.domContentLoadedEventStart,
+        domContentLoadedEventEnd: entry.domContentLoadedEventEnd,
+        domComplete: entry.domComplete, loadEventStart: entry.loadEventStart, loadEventEnd: entry.loadEventEnd,
+      };
+    };
 
     class El {
       constructor(tag) {
@@ -1437,7 +1505,7 @@
         },
         subtle: SUBTLE,
       },
-      performance: { now: () => now(), timeOrigin, getEntriesByType: (t) => (t === "navigation" ? [{ type: "navigate", name: page.url, entryType: "navigation", startTime: 0, duration: 0, responseEnd: navigationMs }] : []), getEntriesByName: () => [], mark() {}, measure() {}, clearMarks() {}, clearMeasures() {} },
+      performance: { now: () => now(), timeOrigin, timing: legacyTiming(), getEntriesByType: (t) => (t === "navigation" ? [navigationEntry()] : []), getEntries: () => [navigationEntry()], getEntriesByName: () => [], mark() {}, measure() {}, clearMarks() {}, clearMeasures() {} },
       setTimeout: (fn, ms) => { const id = timerId++; timers.push({ id, at: ops.op_now() + (ms || 0), fn, args: Array.prototype.slice.call(arguments, 2) }); return id; },
       clearTimeout: (id) => { const t = timers.find((x) => x.id === id); if (t) t.cancelled = true; },
       setInterval: (fn, ms) => { const id = timerId++; timers.push({ id, every: Math.max(ms || 0, 1), at: ops.op_now() + (ms || 0), fn, args: [], repeat: true }); return id; },
@@ -1530,7 +1598,14 @@
         }
       },
       structuredClone: (value) => { try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; } },
-      PerformanceObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
+      PerformanceObserver: class {
+        observe() {}
+        disconnect() {}
+        takeRecords() { return []; }
+        // Chromium lists the entry types it can observe; an SDK tests the list
+        // before constructing an observer (webapp-desktop reads it directly).
+        static supportedEntryTypes = ["element", "event", "first-input", "largest-contentful-paint", "layout-shift", "longtask", "navigation", "paint", "resource", "visibility-state"];
+      },
       // Constructors a collector may use for `instanceof` or to build a probe.
       CanvasRenderingContext2D: class {}, WebGLRenderingContext: class {}, WebGL2RenderingContext: class {},
       Path2D: class { addPath() {} moveTo() {} lineTo() {} arc() {} rect() {} },
@@ -3118,6 +3193,44 @@
     let rafId = 1;
     const navigationMs = Math.max(0, Number(page.navigationMs) || 0);
     const now = () => Math.floor((ops.op_now() + navigationMs) * 10) / 10;
+    // The navigation timing entry a browser exposes. Signature SDKs read it
+    // (webmssdk reads connectEnd) and fail the whole boot when it is missing.
+    const navigationEntry = () => {
+      const end = navigatorShimMs(navigationMs);
+      const connectStart = Math.min(end, Math.max(0, Math.round(end * 0.06)));
+      const connectEnd = Math.min(end, connectStart + Math.max(1, Math.round(end * 0.12)));
+      const requestStart = connectEnd;
+      const responseStart = Math.min(end, requestStart + Math.max(1, Math.round(end * 0.35)));
+      return {
+        name: page.url, entryType: "navigation", startTime: 0, duration: end, type: "navigate",
+        redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+        domainLookupStart: 0, domainLookupEnd: connectStart,
+        connectStart, connectEnd, secureConnectionStart: connectStart,
+        requestStart, responseStart, responseEnd: end,
+        domLoading: responseStart, domInteractive: responseStart,
+        domContentLoadedEventStart: responseStart, domContentLoadedEventEnd: end,
+        domComplete: end, loadEventStart: end, loadEventEnd: end,
+        unloadEventStart: 0, unloadEventEnd: 0,
+        nextHopProtocol: "h2", transferSize: 0, encodedBodySize: 0, decodedBodySize: 0,
+        serverTiming: [], workerStart: 0,
+      };
+    };
+    const navigatorShimMs = (value) => Math.max(1, Math.round(value));
+    const legacyTiming = () => {
+      const entry = navigationEntry();
+      return {
+        navigationStart: 0, unloadEventStart: 0, unloadEventEnd: 0,
+        redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+        domainLookupStart: 0, domainLookupEnd: entry.domainLookupEnd,
+        connectStart: entry.connectStart, connectEnd: entry.connectEnd,
+        secureConnectionStart: entry.secureConnectionStart,
+        requestStart: entry.requestStart, responseStart: entry.responseStart, responseEnd: entry.responseEnd,
+        domLoading: entry.domLoading, domInteractive: entry.domInteractive,
+        domContentLoadedEventStart: entry.domContentLoadedEventStart,
+        domContentLoadedEventEnd: entry.domContentLoadedEventEnd,
+        domComplete: entry.domComplete, loadEventStart: entry.loadEventStart, loadEventEnd: entry.loadEventEnd,
+      };
+    };
     const timeOrigin = Math.floor((Date.now() - (ops.op_now() + navigationMs)) * 10) / 10;
     // ----- the window the identity presents -----
     // Measured against a real client and carried by the identity: the persona's
@@ -4990,9 +5103,10 @@
       performance: {
         now: () => now(),
         timeOrigin,
-        getEntriesByType: (type) => (type === "navigation" ? [{ type: "navigate", name: page.url, entryType: "navigation", startTime: 0, duration: 0, responseEnd: navigationMs }] : []),
+        timing: legacyTiming(),
+        getEntriesByType: (type) => (type === "navigation" ? [navigationEntry()] : []),
         getEntriesByName: () => [],
-        getEntries: () => [],
+        getEntries: () => [navigationEntry()],
         mark() {}, measure() {}, clearMarks() {}, clearMeasures() {},
       },
       crypto: {
@@ -5291,7 +5405,14 @@
       Notification: { permission: "default", requestPermission: () => Promise.resolve("default") },
       WebSocket: class { constructor() { note("surface", "WebSocket"); } send() {} close() {} addEventListener() {} },
       EventSource: class { constructor() { note("surface", "EventSource"); } close() {} addEventListener() {} },
-      PerformanceObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
+      PerformanceObserver: class {
+        observe() {}
+        disconnect() {}
+        takeRecords() { return []; }
+        // Chromium lists the entry types it can observe; an SDK tests the list
+        // before constructing an observer (webapp-desktop reads it directly).
+        static supportedEntryTypes = ["element", "event", "first-input", "largest-contentful-paint", "layout-shift", "longtask", "navigation", "paint", "resource", "visibility-state"];
+      },
       CanvasRenderingContext2D: class {}, WebGLRenderingContext: class {}, WebGL2RenderingContext: class {},
       Path2D: class { addPath() {} moveTo() {} lineTo() {} arc() {} rect() {} },
       ImageBitmap: class { constructor() { this.width = 1; this.height = 1; } close() {} },
@@ -5490,6 +5611,9 @@
       geolocation: { getCurrentPosition() {}, watchPosition() { return 1; }, clearWatch() {} },
       sendBeacon: (url, data) => { try { netFetch(url, { method: "POST", body: data, mode: "no-cors", credentials: "include" }); } catch (error) {} return true; },
       onLine: true, webdriver: false, doNotTrack: null,
+      // NetworkInformation is part of Chromium's navigator; signature SDKs read
+      // connection.effectiveType while fingerprinting the client.
+      connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false, type: "wifi", onchange: null },
       plugins: pdfPlugins(ident.pdfViewer).plugins,
       mimeTypes: pdfPlugins(ident.pdfViewer).mimeTypes,
       userAgentData: {
@@ -5962,7 +6086,12 @@
       globalThis.Event = env.win.Event;
       globalThis.CustomEvent = env.win.CustomEvent;
       globalThis.MessageChannel = env.win.MessageChannel;
-      globalThis.Worker = env.win.Worker;
+      // A page's Worker is real behaviour in a browser: signature SDKs
+      // (TikTok's webmssdk) build one from a Blob URL and wait for its answer.
+      // The challenge lane already runs workers; the content lane used to throw
+      // a SecurityError here, which left those apps booting forever.
+      env.win.Worker = WorkerShim;
+      globalThis.Worker = WorkerShim;
       globalThis.console = env.win.console;
       globalThis.chrome = env.win.chrome;
       try {

@@ -16,7 +16,7 @@ Standing counts each target once, by its last round; the content column counts e
 
 The cold and learned rows use different protocols. Their medians are not a controlled measure of learning's speedup. The learned run has no paired curl measurement.
 
-The runs used the identity/interface/challenge routes. The content lane ran on the app-shell rows (TikTok, Instagram) and returned no content there; these numbers are not a claim about the content lane's success rate.
+The runs used the identity/interface/challenge routes. The content lane ran on the app-shell rows (TikTok, Instagram) and returned no content there; these numbers are not a claim about the content lane's success rate. The 5.5.7 lane surfaces (worker, navigation timing, the reload cookie jar) postdate this corpus; the five-site witness below records what those two rows now do.
 
 ### What failed
 
@@ -38,6 +38,20 @@ These outcomes stay in the denominator. A wall or shell is not scored as content
 - `m7-hard-learned.json`
 
 The full run files and private corpus are not distributed with the repository. The receipts are summaries of those saved measurements, not a new run or a public reproduction package. Egress, site changes, prior state, timeouts, and corpus composition all affect results.
+
+## Five-site wall witness (5.5.7)
+
+Recorded 18 November 2026 from the same home IP with the cold product binary (`dist-thin`), two rounds per site, a fresh state directory per round. These are the five sites a 5.5.6 reader reproduced as unchanged; the run records what the caller now gets.
+
+| Site | Rounds | Result | Content | Wall clock |
+|---|---|---|---|---|
+| TikTok profile | 2 | content 2/2 | 213 chars (`97M Followers`, `469.2M Likes`) | 11.1–11.4 s |
+| LinkedIn company | 5 | content 5/5 | 6,251 chars (`34,759,394 followers`) | 1.4–1.9 s |
+| Google SERP | 2 | incomplete 2/2 | — | 0.5 s |
+| Instagram profile | 2 | incomplete 2/2 | — | 1.0 s |
+| Best Buy search | 2 | incomplete 2/2 | — | 1.4–2.1 s |
+
+The incomplete sites are honest refusals: Google serves a JS-required notice and Best Buy a country chooser, both of which 5.5.6 returned as `content_ok` with the notice's own text. Instagram returns the real profile on the runs where its app renders it (506 chars, `686M Followers`) and the locale picker otherwise; the picker is now refused instead of served. Captures: `~/Projects/donsetch-evidence/five-2026-11-18/`. Conditions: no browser, no proxy, cold state per round, `--deadline-ms` 20 s (60 s for TikTok); TinyFish's recorded times on the same pages were 25.4 s for TikTok and 11.3 s for LinkedIn.
 
 ## Separate live-web field test
 

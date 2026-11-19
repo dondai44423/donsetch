@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -981,15 +981,54 @@ impl Worker {
         {
             let budget = options.deadline.saturating_sub(started.elapsed());
             if budget.as_millis() >= 800 {
-                let reload_cookie = lane
-                    .cookies
+                // A reload carries the whole jar a browser would: the cookies
+                // the document's own headers set, the caller's cookies, and the
+                // ones the program wrote while it ran. Sending only the last
+                // group dropped the session cookies the app then needed.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut jar: Vec<(String, String)> = Vec::new();
+                if let Some(header) = cookie.as_deref() {
+                    for pair in header.split(';') {
+                        if let Some((name, value)) = pair.trim().split_once('=') {
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                jar.retain(|(key, _)| key != name);
+                                jar.push((name.to_string(), value.trim().to_string()));
+                            }
+                        }
+                    }
+                }
+                for set in &response.cookies {
+                    if set.expires_unix.is_some_and(|expires| expires <= now) {
+                        continue;
+                    }
+                    jar.retain(|(key, _)| key != &set.name);
+                    jar.push((set.name.clone(), set.value.clone()));
+                }
+                for stored in &lane.cookies {
+                    jar.retain(|(key, _)| key != &stored.name);
+                    jar.push((stored.name.clone(), stored.value.clone()));
+                }
+                let reload_cookie = jar
                     .iter()
-                    .map(|stored| format!("{}={}", stored.name, stored.value))
+                    .map(|(name, value)| format!("{name}={value}"))
                     .collect::<Vec<_>>()
                     .join("; ");
+                if std::env::var("V5_ENGINE_LOG").is_ok() {
+                    eprintln!("[engine] reload cookies: {} in the jar", jar.len());
+                }
                 let reloaded = match self.wire(identity) {
                     Ok(wire) => wire
-                        .get(&response.url, Some(&reload_cookie), identity, budget)
+                        .get_arriving(
+                            &response.url,
+                            Some(&reload_cookie),
+                            identity,
+                            budget,
+                            &response.url,
+                        )
                         .ok(),
                     Err(_) => None,
                 };

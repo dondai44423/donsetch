@@ -1302,6 +1302,8 @@ async fn fetch_single_inner(
             Ok(mut e) => {
                 if not_the_page(&e.markdown, o) {
                     e.thin = true;
+                } else {
+                    e.markdown = strip_metric_tables(&e.markdown);
                 }
                 final_url = o.url.clone();
                 final_ex = Some(e);
@@ -2072,6 +2074,51 @@ fn looks_like_shell_text(markdown: &str) -> bool {
 /// JSON), so a shell whose extraction is a real document stays content; a
 /// short shell or a failed contract is not the page, and neither is a
 /// country/currency picker the site served instead.
+/// Remove vertical key/value metric tables (a WAF quota blob fused beside a
+/// real page) from a document that is otherwise prose. The table is noise the
+/// page never showed a reader; the prose is what they came for.
+fn strip_metric_tables(markdown: &str) -> String {
+    if crate::extract::metric_table(markdown) {
+        return markdown.to_string();
+    }
+    fn flush<'a>(block: &mut Vec<&'a str>, out: &mut Vec<&'a str>) {
+        let metric = block
+            .iter()
+            .filter(|line| line.trim_start().starts_with('|'))
+            .filter(|line| {
+                let cells: Vec<&str> = line
+                    .trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(str::trim)
+                    .collect();
+                cells.len() == 2
+                    && cells[0]
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && cells[0].chars().any(|c| c == '_')
+            })
+            .count()
+            >= 3;
+        if !metric {
+            out.append(block);
+        }
+        block.clear();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in markdown.lines() {
+        if line.trim_start().starts_with('|') {
+            block.push(line);
+        } else {
+            flush(&mut block, &mut out);
+            out.push(line);
+        }
+    }
+    flush(&mut block, &mut out);
+    out.join("\n")
+}
+
 fn not_the_page(markdown: &str, outcome: &crate::fetch::client::FetchOutcome) -> bool {
     let chars = markdown.chars().count();
     // A shell whose extraction carries a real document (server-rendered JSON)

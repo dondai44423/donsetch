@@ -457,7 +457,7 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         };
     }
 
-    if matches!(evidence.status, 401 | 403 | 407 | 429 | 503) {
+    if matches!(evidence.status, 401 | 403 | 407 | 429 | 503 | 999) {
         if let Some(phrase) = REFUSALS.iter().find(|phrase| lower.contains(*phrase)) {
             found.push(format!("refusal:{phrase}"));
         }
@@ -832,6 +832,12 @@ async function submitSolve(nonce) { await fetch("/_pow/solve", {method: "POST"})
     #[test]
     fn refusal_without_a_page_is_identity() {
         assert_eq!(class_of(403, "Forbidden", false), Class::WallIdentity);
+        // LinkedIn answers a refused client with its own 999 rather than 403.
+        assert_eq!(
+            class_of(999, "Request Denied", false),
+            Class::WallIdentity,
+            "999 is a refusal of this client, not a server error"
+        );
         assert_eq!(
             class_of(429, "Too Many Requests", false),
             Class::WallIdentity

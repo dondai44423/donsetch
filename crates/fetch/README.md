@@ -103,7 +103,7 @@ One V8 isolate mode for challenge credentials, a second data-plane DOM mode for 
 
 | Resource | Mint limit | Content-lane limit | Enforcement |
 |---|---|---|---|
-| Wall clock | 10 s (`V5_ENGINE_WALL_MS`), clamped to the encounter deadline with a 5 s measured-mint floor | 5 s (`V5_CONTENT_WALL_MS`, clamped to deadline) | Watchdog `terminate_execution` |
+| Wall clock | 10 s (`V5_ENGINE_WALL_MS`), clamped to the encounter deadline with a 5 s measured-mint floor | 5 s default (`V5_CONTENT_WALL_MS`), raised to an 8 s ceiling when the encounter has the time; clamped to deadline | Watchdog `terminate_execution` |
 | Memory | 256 MB JS heap · 128 MB typed arrays · 128 MB Wasm | Same | V8 heap callback, custom allocator, Wasm page cap + OS RSS backstop |
 | Execution | 96 ops | 256 ops (`V5_CONTENT_OPS`) | Rust op counter + wall-clock pump bound |
 | Network | `http(s)` public IPs, `<= 5` redirects, 1 MB req, 8 MB/resp, 32 MB total | Same guards, 16 MB/resp, 64 MB total | Enforced in Rust ops; `Deno` global deleted before page code |

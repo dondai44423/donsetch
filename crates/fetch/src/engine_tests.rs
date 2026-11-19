@@ -89,6 +89,38 @@ fn unpadded_base64_decodes_to_the_bytes_a_browser_produces() {
 }
 
 #[test]
+fn performance_carries_the_navigation_timing_a_signature_sdk_reads() {
+    // webmssdk (TikTok's signature SDK) reads connectEnd from the navigation
+    // entry and fails the boot when it is undefined; Chrome exposes the full
+    // Navigation Timing entry and the legacy `performance.timing` mirror.
+    let script = r#"
+        var nav = performance.getEntriesByType("navigation")[0];
+        if (!nav || typeof nav.connectEnd !== "number" || nav.connectEnd <= 0) throw new Error("connectEnd missing");
+        if (typeof nav.responseStart !== "number" || nav.responseStart <= 0) throw new Error("responseStart missing");
+        if (!performance.timing || typeof performance.timing.connectEnd !== "number") throw new Error("timing missing");
+        if (!performance.getEntries().length) throw new Error("entries missing");
+        document.cookie = "timing=ok; Path=/";
+    "#;
+    let mint = run("https://timing.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "timing").as_deref(), Some("ok"));
+}
+
+#[test]
+fn performance_observer_lists_the_entry_types_a_page_tests() {
+    // webapp-desktop reads PerformanceObserver.supportedEntryTypes.includes
+    // before it constructs an observer; an empty surface throws and stops the
+    // app's boot.
+    let script = r#"
+        if (!Array.isArray(PerformanceObserver.supportedEntryTypes)) throw new Error("not an array");
+        if (!PerformanceObserver.supportedEntryTypes.includes("event")) throw new Error("event missing");
+        if (!PerformanceObserver.supportedEntryTypes.includes("resource")) throw new Error("resource missing");
+        document.cookie = "po=ok; Path=/";
+    "#;
+    let mint = run("https://po.test/", script, &limits()).expect("the page program should run");
+    assert_eq!(cookie(&mint, "po").as_deref(), Some("ok"));
+}
+
+#[test]
 fn a_benign_challenge_mints_inside_the_envelope() {
     let server = Server::start(|request| match request.path.as_str() {
         "/challenge.js" => Reply::ok("document.cookie = 'half=1; Path=/';"),

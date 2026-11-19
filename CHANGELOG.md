@@ -1,5 +1,48 @@
 # Changelog
 
+## [5.5.7] - 2026-11-18
+
+### Changed
+
+- **The content lane runs a page's own app, not a reduced copy of it.** Worker is real behaviour
+  inside the content lane (a signature SDK that builds one from a Blob URL and waits for its answer
+  no longer stalls the boot), `performance.getEntriesByType("navigation")` and the legacy
+  `performance.timing` carry the Navigation Timing fields apps read (`connectEnd`, `responseStart`),
+  `PerformanceObserver.supportedEntryTypes` lists the kinds a page tests before observing, and
+  `navigator.connection` exists where the identity has one. Together these let a protected,
+  client-rendered app finish its own boot and issue its data requests: TikTok now completes its WAF
+  proof, reloads into the served document, boots the React app, calls its item/user APIs, and yields
+  the profile's stated figures (469.2M Likes, 97M Followers) in about 11 s cold.
+- **A challenge reload carries the whole cookie jar.** The lane re-requests the same URL with the
+  document's `Set-Cookie` values, the caller's cookies, and the cookies the page program wrote, as an
+  arriving navigation (`Referer`, `Sec-Fetch-*`), instead of only the program's own two cookies.
+- **The content lane's wall clock is a ceiling, not a delay.** It may use up to 8 s when the
+  encounter has it (a heavy app's last request no longer dies at 5 s); a lane that settles stops at
+  once, and the encounter deadline still wins. LinkedIn's `999` is classified as an identity refusal,
+  so the encounter rotates identities and retries instead of recording a server error.
+
+### Fixed
+
+- **A gate is never content.** A page whose title or text is a script gate ("enable JavaScript",
+  "trouble accessing", "select your country") or a locale/currency picker fails the contract, and a
+  short shell, a named gate, a metrics table, or a picker makes the product's read thin/incomplete
+  rather than `content_ok`. This removes the false successes that five real sites reproduced:
+  Google's JS notice, Instagram's country list, Best Buy's country chooser, and TikTok's WAF quota
+  table.
+- **Synthesis and inline state only render pages.** A flat metrics/quota object, an array of ids, or
+  a vertical table of snake-case counters is no longer fused as the document; a wrapper array earns
+  a page through its fields, not its size. A metrics table appended beside real prose is stripped
+  from the returned text.
+- **The content host completes the standard surfaces a boot path tests.** Unpadded base64 decodes as
+  browsers decode it (a WAF payload's JSON no longer gains trailing bytes), the SVG interface names
+  exist (`SVGSVGElement` was fatal to TikTok's bundle), and `Location` is constructible.
+
+Recorded 18 November 2026, cold product binary, home IP, two rounds: TikTok content 2/2 (213 chars,
+11.1–11.4 s), LinkedIn 3/3 (6,251 chars, 1.4–1.9 s), Google and Best Buy honestly incomplete, the SPA
+set 17/17 cold. The five-site witness is in `docs/benchmarks.md`; the private captures are in
+`~/Projects/donsetch-evidence/five-2026-11-18/`. The 5.5.6 corpus was recorded before these lane
+surfaces and its TikTok/Instagram shells do not describe this build.
+
 ## [5.5.6] - 2026-11-18
 
 ### Changed
