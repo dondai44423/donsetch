@@ -433,7 +433,7 @@ pub fn synthesize_json_payload(
         let named = items
             .iter()
             .filter_map(Value::as_object)
-            .any(|item| page_like_object(item));
+            .any(page_like_object);
         let text_volume: usize = items
             .iter()
             .filter_map(Value::as_object)

@@ -52,9 +52,8 @@ pub(crate) fn metric_table(markdown: &str) -> bool {
             {
                 keys += 1;
             }
-        } else if line.starts_with('>') {
-            prose_chars += line.chars().count();
         } else if !line.starts_with('-') {
+            // A blockquote (`>`) is prose too; it just is not a list item.
             prose_chars += line.chars().count();
         }
     }

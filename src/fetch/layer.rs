@@ -741,23 +741,6 @@ fn into_outcome(
         outcome.wall.as_ref().map(|wall| wall.vendor.as_str()),
         walls::detect(outcome.status, &headers, &body),
     );
-    if std::env::var("V5_ENGINE_LOG").is_ok() {
-        eprintln!(
-            "[engine] outcome class={:?} status={} transport={} body={} text_chars={} verdict={:?}",
-            outcome.class,
-            outcome.status,
-            outcome.transport,
-            body.len(),
-            outcome.text_chars,
-            verdict
-        );
-        for attempt in &outcome.attempts {
-            eprintln!(
-                "[engine] attempt {} {} {:?} {}ms {:?}",
-                attempt.identity, attempt.transport, attempt.class, attempt.ms, attempt.note
-            );
-        }
-    }
     Ok(FetchOutcome {
         route,
         url: outcome.final_url,
