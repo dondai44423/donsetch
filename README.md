@@ -301,7 +301,7 @@ DonSeTch is free and open source. Sponsorship funds maintenance, testing, and re
 
 | Option | Price | What's included |
 |---|---:|---|
-| **Sponsor** | **$99/month** | Linked banner and short tagline near the top of the README, plus listing here. |
+| **Sponsor** | **$99/month** | Linked banner and short description near the top of the README. |
 | **Integration Partner** | **$599 upfront**, then **$99/month** *(month 4+)* | Everything in Sponsor for your first 3 months, one scoped native BYOK integration (built, tested, `doctor`-checked, and documented with you), plus 1 optional contextual CLI mention where relevant. |
 
 Prepay to lock the current rate against future price rises: **6 months for $495** (1 month free) or **12 months for $990** (2 months free).
