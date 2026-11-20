@@ -419,7 +419,6 @@ async fn cmd_list() {
     if proxies.is_empty() {
         println!("  No proxies configured.");
         println!("  Use `donsetch proxy add <url>` to add one.");
-        crate::cli::sponsor::print();
         println!();
         cli::print_footer();
         return;
@@ -459,7 +458,6 @@ async fn cmd_check() {
     if proxies.is_empty() {
         println!("  No proxies configured.");
         println!("  Use `donsetch proxy add <url>` to add one.");
-        crate::cli::sponsor::print();
         println!();
         cli::print_footer();
         return;
@@ -992,7 +990,6 @@ pub fn help() {
             "Config: cache_dir/proxies.txt  ·  Env: DONSEEK_PROXIES (comma-separated)\n  Pool use: search and crawl ride the lanes; fetch opts in (`fetch on`); `crawl off` stays on home IP."
         )
     );
-    crate::cli::sponsor::print();
     println!();
     cli::print_nav(&[
         ("donsetch proxy check", "probe latency & exit IPs"),

@@ -13,9 +13,8 @@
 //!   suggestion; `donsetch help nonsense` exited 0.
 //! - `donsetch -V` was an unknown command while `-h` worked.
 //!
-//! Plus the sponsor placement's hard lines: labelled, human-surface only,
-//! and switchable off without the config layer complaining about the
-//! switch's own name.
+//! Plus the sponsor opt-out contract: no stale Proxy-Seller line is
+//! printed, and DONSETCH_NO_SPONSOR stays reserved without warnings.
 //!
 //! Children get their own root and never inherit a DONSETCH_ variable, so
 //! nothing here can read or write the developer's real cache or config.
@@ -286,14 +285,11 @@ fn an_empty_export_explains_itself_on_stderr() {
     );
 }
 
-/// The sponsor placement: labelled, on the human `proxy` surface only,
-/// and switchable off with an env var the config layer accepts.
+/// No stale Proxy-Seller line is printed on the CLI, and `DONSETCH_NO_SPONSOR`
+/// stays reserved in the config layer without emitting warnings.
 #[test]
-fn the_sponsor_line_is_labelled_human_only_and_switchable() {
+fn no_stale_sponsor_line_and_opt_out_stays_reserved() {
     let sb = Sandbox::new("sponsor");
-    // This tests output placement, not browser/network health. An explicit
-    // missing browser and a refused loopback proxy keep doctor bounded on
-    // offline runners and prevent discovery of a developer's browser.
     std::fs::write(
         sb.root.join("donsetch.toml"),
         format!(
@@ -303,34 +299,23 @@ fn the_sponsor_line_is_labelled_human_only_and_switchable() {
     )
     .unwrap();
 
-    // Present, labelled, with the URL, in the two human surfaces.
-    for args in [vec!["proxy", "--help"], vec!["proxy", "list"]] {
+    for args in [
+        vec!["proxy", "--help"],
+        vec!["proxy", "list"],
+        vec!["proxy", "export"],
+        vec!["status", "--json"],
+        vec!["doctor", "--json"],
+        vec!["tools"],
+    ] {
         let text = stdout(&sb.run(&args));
-        assert!(text.contains("Sponsor: Proxy-Seller"), "{args:?}: {text}");
-        assert!(text.contains("https://proxy-seller.com/"), "{args:?}");
-    }
-
-    // Absent from every machine-facing output.
-    let machine: &[(&str, &[&str])] = &[
-        ("status --json", &["status", "--json"]),
-        ("doctor --json", &["doctor", "--json"]),
-        ("tools", &["tools"]),
-        ("proxy export", &["proxy", "export"]),
-        ("doctor --help", &["doctor", "--help"]),
-        ("status --help", &["status", "--help"]),
-    ];
-    for (label, args) in machine {
-        let text = stdout(&sb.run(args));
         assert!(
-            !text.contains("Proxy-Seller") && !text.contains("DON15"),
-            "{label} carries the sponsor line"
+            !text.contains("Proxy-Seller") && !text.contains("DON15") && !text.contains("Sponsor:"),
+            "{args:?} still carries a sponsor line: {text}"
         );
     }
 
-    // Switched off: no line, and no config warning about the switch's name.
+    // Opt-out env var remains reserved and silent.
     let off = sb.run_with(&["proxy", "list"], &[("DONSETCH_NO_SPONSOR", "1")]);
-    let text = stdout(&off);
-    assert!(!text.contains("Sponsor:"), "{text}");
     assert!(
         !stderr(&off).contains("ignoring DONSETCH_NO_SPONSOR"),
         "the opt-out name must be reserved, not warned about: {}",

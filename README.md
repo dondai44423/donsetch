@@ -297,33 +297,29 @@ If DonSeTch earns a place in your agent's toolkit, [give it a star](https://gith
 
 ### Sponsorship
 
-DonSeTch is free and open source. Sponsorship pays for the time spent building it, maintaining the tools, and keeping releases coming.
+DonSeTch is free and open source. Sponsorship funds maintenance, testing, and releases. Top-of-README placement is capped at 5 active slots so every sponsor stays visible.
 
-| Tier | Monthly price | Placement in this README | Product integration |
-|---|---:|---|---|
-| **Silver** | **$25/month** | A text link to your site in the sponsorship section. | — |
-| **Gold** | **$79/month** | A large banner linked to your site, with priority placement ahead of Silver links. | A native DonSeTch integration may be considered when your product fits the tool. Scope and fit must be agreed before any integration is promised. |
+| Option | Price | What's included |
+|---|---:|---|
+| **Sponsor** | **$99/month** | Linked banner and short tagline near the top of the README, plus listing here. |
+| **Integration Partner** | **$599 upfront**, then **$99/month** *(month 4+)* | Everything in Sponsor for your first 3 months, one scoped native BYOK integration (built, tested, `doctor`-checked, and documented with you), plus 1 optional contextual CLI mention where relevant. |
 
-**Gold integration depends on the product.** A proxy service, search provider, or web-data product may be a good fit if it gives DonSeTch users something useful. Email with your product and proposed use; we'll discuss whether an integration belongs in DonSeTch and what it would involve. Gold includes the banner and link; an integration is conditional on that review.
+Prepay to lock the current rate against future price rises: **6 months for $495** (1 month free) or **12 months for $990** (2 months free).
+
+#### Policy & how native integrations work
+
+1. **Free scope check first:** email your product, API docs, and proposed integration before paying anything. Scope is agreed in writing first. If the integration is not a fit, you can still take a standard **$99/month** Sponsor slot.
+2. **Product boundaries:** every native integration is opt-in BYOK only and plugs into an existing DonSeTch slot (search provider, walled-fetch fallback, or proxy setup). Default keyless behavior never degrades, no sponsor is routed to by default, and no fifth tool is added.
+3. **Clean output & editorial independence:** sponsors never appear in MCP tool responses, `--json` output, or tool schemas. Any human-facing CLI mention is clearly labelled `Sponsor:`, dim, and removable with `DONSETCH_NO_SPONSOR=1`. Sponsorship buys visibility and agreed integration work — never biased benchmarks or exclusivity against other BYOK providers.
+4. **Delivery & active maintenance:** standard scoped integrations ship within an agreed window (typically 1–2 weeks after payment and sandbox/test credentials are provided); larger custom architectures are quoted separately. Sponsors provide a modest test API key so the integration stays verified across releases while sponsorship is active.
+5. **Fair lifecycle:** when a sponsorship ends, README banners and CLI mentions come down at the end of the paid term. Working integrations stay in DonSeTch for users; if an unsponsored integration later breaks due to upstream API changes or becomes a maintenance burden, it may be deprecated or removed after a heads-up.
+6. **Billing & refunds:** monthly or prepaid billing via PayPal (GitHub Sponsors payouts are not available in my region yet). The upfront Integration Partner fee is non-refundable once agreed implementation starts.
 
 #### How to sponsor
 
-1. Email [bhandaribishesh879@gmail.com](mailto:bhandaribishesh879@gmail.com) with your site or product URL, chosen tier, and how many months you'd like to sponsor. For Gold, include your banner if you have one and mention any integration idea.
-2. We'll confirm the placement, term, and any product-fit discussion.
-3. I'll share PayPal payment details and arrange the placement with you. GitHub Sponsors payouts aren't available in my region, so email is the reliable way to set this up.
+Email [bhandaribishesh879@gmail.com](mailto:bhandaribishesh879@gmail.com) with your product URL, banner (if you have one), and whether you want a Sponsor slot or an Integration Partner scope check. I'll confirm slot availability and share PayPal details.
 
-#### Prepay to lock your rate
-
-You can prepay any number of months at the current price. That rate stays fixed for the whole paid term, even if prices rise later.
-
-| Example | Total | Rate kept for |
-|---|---:|---|
-| 6 months of Silver | **$150** | All 6 months at $25/month |
-| 6 months of Gold | **$474** | All 6 months at $79/month |
-
-Later price changes apply to new sponsorships, not to an already prepaid term. One-time support is welcome at any amount through [Ko-fi](https://ko-fi.com/G5Y624N5RE).
-
-Using Bright Data? [This partner link](https://get.brightdata.com/ivqwoicrrlbr) supports DonSeTch at no extra cost to you.
+One-time support is welcome at any amount through [Ko-fi](https://ko-fi.com/G5Y624N5RE). Using Bright Data? [This partner link](https://get.brightdata.com/ivqwoicrrlbr) supports DonSeTch at no extra cost to you.
 
 ---
 
