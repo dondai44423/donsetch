@@ -316,7 +316,9 @@ fn render(
                     // Block boundaries inside inline rendering
                     // (multi-paragraph comments, list items): at
                     // least a space : the words must never fuse.
-                    "p" | "li" | "div" | "blockquote" => {
+                    "p" | "li" | "div" | "blockquote" | "span"
+                        if name != "span" || super::blocks::is_para_span(c) =>
+                    {
                         if !buf.is_empty() && !buf.ends_with(' ') {
                             buf.push(' ');
                         }

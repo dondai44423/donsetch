@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Mintlify docs keep their paragraphs in page order.** Mintlify renders every paragraph as `<span data-as="p">`, a sibling of the headings, lists, tables and code blocks around it. Read as inline spans, all of a container's paragraphs fused into one loose paragraph emitted ahead of its first block, so `code.claude.com/docs` and `mintlify.com/docs` pages opened with one unbroken wall of prose, their sections held only lists, tables and code, and text around a code block in a Steps component was joined across it. Such a span is now a paragraph block wherever a `<p>` is: it is emitted in source order, stays a separate paragraph, and breaks words apart inside a list item.
+
 ## [5.5.8] - 2026-11-20
 
 ### Added
