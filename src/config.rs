@@ -141,6 +141,9 @@ section!(SearchSection {
     /// Include Parallel's anonymous keyless MCP search source for searches without
     /// a language override. Set false to disable.
     parallel_mcp: bool = true,
+    /// Include Keenable's keyless public search endpoint for searches without
+    /// a language override. Off by default; set true to enable.
+    keenable: bool = false,
     /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
@@ -1723,6 +1726,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Bool,
             "true",
             "include Parallel's anonymous keyless MCP search source for searches without a language override (set false to disable)",
+        ),
+        (
+            "search",
+            "keenable",
+            FieldKind::Bool,
+            "false",
+            "include Keenable's keyless public search endpoint for searches without a language override (opt-in)",
         ),
         (
             "search",

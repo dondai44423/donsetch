@@ -56,6 +56,7 @@ Supports `site:`, `filetype:`, `intitle:`, `"…"`, `-term`, exact identifiers, 
 - **Answer metadata:** `confidence` (`high` | `medium` | `low` — retrieval agreement/coverage, not fact verification), `degraded`, `requested_results` / `returned_results` / `underfilled`, `source_type`, and `cache_age_ms` (only `high`-confidence merged sets are cached).
 - **Diagnostics:** `donsetch search --sources`, `donsetch search doctor`, `donsetch search --explain "query"`.
 - **Parallel MCP (keyless, enabled by default):** searches without an explicit `lang` include Parallel's anonymous MCP endpoint (`https://mcp.parallel.ai/mcp`) alongside the other keyless search engines using a reusable per-route session, DonSeTch's versioned `User-Agent`, and automatic ledger backoff on rate limits. Set `[search] parallel_mcp = false` (`DONSETCH_SEARCH__PARALLEL_MCP=false`) or deny `mcp.parallel.ai` in `[rules.url]` to disable it.
+- **Keenable (keyless, opt-in):** set `[search] keenable = true` (`DONSETCH_SEARCH__KEENABLE=true`) to add Keenable's public search endpoint (`https://api.keenable.ai/v1/search/public`) to searches without an explicit `lang`. It sends no key or cookies, names the client in `X-Keenable-Title`, and rests in the ledger on rate limits (keyless tier: 1,000 requests/hour per IP). Deny `api.keenable.ai` in `[rules.url]` to block it.
 
 ### Optional search providers
 

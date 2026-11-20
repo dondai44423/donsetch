@@ -172,6 +172,9 @@ pub(super) async fn engine_task_with_budget(
     if engine == super::parallel_mcp::SOURCE {
         return super::parallel_mcp::task(query, egress_id, proxy, context, budget).await;
     }
+    if engine == super::keenable::SOURCE {
+        return super::keenable::task(query, egress_id, proxy, context, budget).await;
+    }
     let EngineContext {
         fetcher,
         pool,
