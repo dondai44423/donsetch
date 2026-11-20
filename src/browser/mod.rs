@@ -697,6 +697,10 @@ const STDERR_LINE_BYTES: usize = 4096;
 /// stderr.
 const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
+// On Windows `tokio::process::Child` alone makes `Local` 320+ bytes against
+// `Remote`'s 48, which trips `large_enum_variant`; the Linux lint does not
+// fire. One value lives per browser session, so boxing buys nothing.
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 enum SessionBackend {
     Local {
         child: tokio::process::Child,
