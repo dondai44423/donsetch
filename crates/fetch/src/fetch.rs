@@ -197,18 +197,28 @@ enum Interface {
     Unanswered,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum WireGuardKey {
+    /// No resolver SSRF guard (`once()` or proxied egress).
+    None,
+    /// Shared public-only SSRF guard (all `allow_private == false` hosts).
+    PublicOnly,
+    /// Host-scoped private-allowed SSRF guard (evicted on `release()`).
+    PrivateHost(String),
+}
+
 /// One fetching context: its own clients (one per identity and egress) and the
 /// state it learns into. Single-threaded; `donsetch_fetch::Session` pools these.
 pub struct Worker {
     state: State,
-    wires: HashMap<(&'static str, Option<String>, Option<String>), Wire>,
+    wires: HashMap<(&'static str, Option<String>, WireGuardKey), Wire>,
     /// The egress of the fetch in progress.
     proxy: Option<String>,
     /// The document guard for this fetch: its resolver pins every name the
     /// document's connection resolves, redirects included. None through a
     /// proxy, where the proxy resolves.
     guard: Option<Arc<crate::envelope::Guard>>,
-    guard_host: Option<String>,
+    guard_key: WireGuardKey,
     /// The redirect and header rules of the fetch in progress.
     policy: crate::http::Policy,
     /// Learn from encounters: scores, cookies, credentials.
@@ -274,7 +284,7 @@ impl Worker {
             wires: HashMap::new(),
             proxy: None,
             guard: None,
-            guard_host: None,
+            guard_key: WireGuardKey::None,
             policy: crate::http::Policy::default(),
             persist,
             saves,
@@ -1356,11 +1366,12 @@ impl Worker {
     }
 
     fn wire(&mut self, identity: &'static Identity) -> Result<&Wire, String> {
-        let key = (
-            identity.name,
-            self.proxy.clone(),
-            self.guard_host.clone().filter(|_| self.guard.is_some()),
-        );
+        let guard_key = if self.guard.is_some() && self.proxy.is_none() {
+            self.guard_key.clone()
+        } else {
+            WireGuardKey::None
+        };
+        let key = (identity.name, self.proxy.clone(), guard_key);
         if !self.wires.contains_key(&key) {
             let wire = match (&self.guard, self.proxy.as_deref()) {
                 (Some(guard), None) => Wire::resolved(identity, guard, None)?,
@@ -1398,6 +1409,8 @@ impl Worker {
     /// in flight).
     fn release(&mut self) {
         let policy = std::mem::take(&mut self.policy);
+        self.guard = None;
+        let prev_guard = std::mem::replace(&mut self.guard_key, WireGuardKey::None);
         if policy
             .cancel
             .as_ref()
@@ -1405,6 +1418,12 @@ impl Worker {
         {
             self.wires.clear();
         } else {
+            // Do not accumulate unbounded per-host private-allowed wires across
+            // distinct test/local hosts; shared public-only wires stay pooled.
+            if matches!(prev_guard, WireGuardKey::PrivateHost(_)) {
+                self.wires
+                    .retain(|(_, _, k), _| !matches!(k, WireGuardKey::PrivateHost(_)));
+            }
             // `wire` sets the policy of the request that uses a wire before
             // every use, so the default left here is never applied.
             for wire in self.wires.values() {
@@ -1424,7 +1443,10 @@ impl Worker {
             .ok_or_else(|| format!("request: not a URL: {}", once.url))?;
         self.proxy = once.proxy.clone();
         self.policy = once.policy.clone();
-        let cookie = if once.cookies {
+        self.guard = None;
+        self.guard_key = WireGuardKey::None;
+        let stateless_redirect = is_stateless_redirect_url(&once.url);
+        let cookie = if once.cookies && !stateless_redirect {
             self.state.cookie_header_for(&once.url, identity.name)
         } else {
             None
@@ -1451,7 +1473,7 @@ impl Worker {
         });
         self.release();
         let response = result?;
-        if once.cookies {
+        if once.cookies && !stateless_redirect {
             let cookies = response.cookies.iter().map(stored).collect();
             self.state.store_cookies(&host, identity.name, cookies);
         }
@@ -1471,20 +1493,24 @@ impl Worker {
     pub fn fetch(&mut self, url: &str, options: &Options) -> Outcome {
         self.policy = options.policy.clone();
         self.proxy = options.proxy.clone();
-        self.guard_host = url::Url::parse(url)
+        let host = url::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase));
-        self.guard = if self.proxy.is_none() {
-            self.guard_host.as_deref().map(|host| {
-                crate::envelope::Guard::with_policy(
-                    crate::envelope::Limits::default(),
-                    host,
-                    options.allow_private,
-                )
-            })
+        if let (None, Some(host)) = (&self.proxy, host) {
+            self.guard_key = if options.allow_private {
+                WireGuardKey::PrivateHost(host.clone())
+            } else {
+                WireGuardKey::PublicOnly
+            };
+            self.guard = Some(crate::envelope::Guard::with_policy(
+                crate::envelope::Limits::default(),
+                if options.allow_private { &host } else { "" },
+                options.allow_private,
+            ));
         } else {
-            None
-        };
+            self.guard = None;
+            self.guard_key = WireGuardKey::None;
+        }
         let outcome = self.through_cache(url, options);
         self.release();
         self.pending = None;
@@ -2220,13 +2246,21 @@ impl Worker {
                 .get(&host)
                 .and_then(|per_identity| per_identity.get(identity.name))
                 .map(|credential| credential.vendor.clone());
-            let cookie_header = self.state.cookie_header_for(url, identity.name);
+            let stateless_redirect = is_stateless_redirect_url(url);
+            let cookie_header = if stateless_redirect {
+                None
+            } else {
+                self.state.cookie_header_for(url, identity.name)
+            };
             if cookie_header.is_some() {
                 spent_state = true;
             }
             let spent_credential = credential_vendor.is_some() && cookie_header.is_some();
             let referer = format!("{}://{}/", parsed.scheme(), host);
-            let arriving = options.arrival && self.state.seen_origin(&host) && parsed.path() != "/";
+            let arriving = !stateless_redirect
+                && options.arrival
+                && self.state.seen_origin(&host)
+                && parsed.path() != "/";
             // Revisit a cached page the way a browser does: its validators, sent by
             // the client that received it.
             let conditional: Vec<(&'static str, String)> = match &self.pending {
@@ -2406,7 +2440,7 @@ impl Worker {
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case("location"))
             {
-                if self.persist {
+                if self.persist && !stateless_redirect {
                     let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
                     self.state.store_cookies(&host, identity.name, cookies);
                     self.save_state();
@@ -2505,12 +2539,12 @@ impl Worker {
                 }
             }
             let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
-            if self.persist {
+            if self.persist && !stateless_redirect {
                 self.state
                     .store_cookies(&host, identity.name, cookies.clone());
             }
             let class_name = class_name(verdict.class);
-            if self.persist {
+            if self.persist && !stateless_redirect {
                 self.state.record(
                     &host,
                     identity.name,
@@ -3746,9 +3780,55 @@ mod retry_hint_tests {
     }
 }
 
+/// Stateless search-engine redirect hops (currently Google's signed-out
+/// `/goto?url=…` links) must never carry stored origin cookies or persist
+/// tracking cookies/verdicts under the redirector host (#456).
+fn is_stateless_redirect_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.path() != "/goto" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = lower.split('.').collect();
+    let is_google = match labels.as_slice() {
+        [.., "google", tld] => !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_alphabetic()),
+        [.., "google", second, cc] => {
+            matches!(*second, "co" | "com" | "org" | "net" | "ac")
+                && cc.len() == 2
+                && cc.bytes().all(|b| b.is_ascii_alphabetic())
+        }
+        _ => false,
+    };
+    is_google
+        && parsed
+            .query_pairs()
+            .any(|(k, v)| k == "url" && !v.trim().is_empty())
+}
+
 #[cfg(test)]
 mod navigation_tests {
-    use super::page_navigation;
+    use super::{is_stateless_redirect_url, page_navigation};
+
+    #[test]
+    fn google_goto_urls_are_stateless_redirects() {
+        assert!(is_stateless_redirect_url(
+            "https://www.google.com/goto?url=CAES123&gsessionid=abc"
+        ));
+        assert!(is_stateless_redirect_url(
+            "https://www.google.co.uk/goto?url=CAES123"
+        ));
+        assert!(!is_stateless_redirect_url(
+            "https://www.google.com/search?q=rust"
+        ));
+        assert!(!is_stateless_redirect_url(
+            "https://example.com/goto?url=CAES123"
+        ));
+    }
 
     #[test]
     fn reddits_redirect_shell_names_its_target() {

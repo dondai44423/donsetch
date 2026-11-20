@@ -667,8 +667,9 @@ impl Crawler {
                     }
                 }
             }
+            let reserves = keep.split_off(keep.len().min(opts.max_pages));
             plan.pages = keep;
-            plan.reserves.clear();
+            plan.reserves = reserves;
             if plan.pages.is_empty() {
                 plan.stop = model::plan::PlanStop::Covered;
             }

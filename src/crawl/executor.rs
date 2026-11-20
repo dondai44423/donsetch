@@ -433,6 +433,11 @@ fn page_sig(title: &str, markdown: &str) -> u64 {
 }
 
 fn wall_of(page: &FetchedPage) -> Option<WallReport> {
+    // status == 0 means no HTTP reply was received (network error, timeout, or
+    // benched lane) — a transient transport failure, never an origin bot wall.
+    if page.status == 0 {
+        return None;
+    }
     let (class, vendor) = match page.verdict {
         Verdict::Challenge(v) => ("challenge", Some(vendor_name(v).to_string())),
         Verdict::Blocked => ("blocked", None),
@@ -478,11 +483,14 @@ async fn wait_lane(governor: &Governor, host: &str, seq: u64, deadline: Instant)
         if let Some(lane) = governor.best_lane(host) {
             let id = lane.id.clone();
             let wait = governor.wait_for(host, &id, seq);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if wait > Duration::ZERO {
-                tokio::time::sleep(wait.min(remaining)).await;
+            if wait.is_zero() {
+                return Some(id);
             }
-            return Some(id);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(wait.min(remaining)).await;
+            // Loop back so deadline expiry returns `None` and the next
+            // `wait_for` atomically advances `next_allowed` for this slot.
+            continue;
         }
         // The shared host penalty box is still closed. Wait for it, not
         // for a fresh lane; a rate limit is waited out, never rotated.
@@ -651,6 +659,9 @@ pub async fn execute(
                 break 'work;
             }
             if !matches!(page.verdict, Verdict::ContentOk) || !(200..300).contains(&page.status) {
+                if page.status == 0 {
+                    governor.on_error(&host, &lane);
+                }
                 let reason = page
                     .error_hint
                     .clone()
@@ -1197,5 +1208,31 @@ mod tests {
         );
         assert_eq!(seed_host("ex.com:8080/path"), "ex.com");
         assert_eq!(seed_host(""), "");
+    }
+
+    #[test]
+    fn wall_of_ignores_zero_status_transport_failures_and_catches_real_http_blocks() {
+        let transport_err = FetchedPage {
+            lane: "direct".into(),
+            route: None,
+            url: "https://example.com/a".into(),
+            status: 0,
+            body: Vec::new(),
+            headers: Vec::new(),
+            verdict: Verdict::Blocked,
+            latency: Duration::from_millis(100),
+            cached: false,
+            error_hint: Some("timeout".into()),
+            denied: None,
+        };
+        assert!(
+            wall_of(&transport_err).is_none(),
+            "status=0 transport errors must not abort the crawl as permanently Walled"
+        );
+        let http_block = FetchedPage {
+            status: 403,
+            ..transport_err
+        };
+        assert_eq!(wall_of(&http_block).map(|w| w.status), Some(403));
     }
 }

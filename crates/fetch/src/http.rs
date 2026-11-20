@@ -323,13 +323,14 @@ pub fn default_hop(next: &str) -> Hop {
     }
 }
 
-/// The `Cookie` header of a redirect hop: the request's own, with what the
-/// earlier hops of this host set applied in order (a later value replaces an
-/// earlier one; an expired one removes it), as far as their paths cover `url`.
+/// The `Cookie` header of a redirect hop: the request's own (for the initial
+/// origin), with what the earlier hops of this `(host, scheme)` set applied in
+/// order (a later value replaces an earlier one; an expired one removes it),
+/// respecting `Secure` and RFC 6265 §5.1.4 path boundaries.
 fn hop_cookie_header(original: Option<&str>, set: &[SetCookie], url: &str) -> Option<String> {
-    let path = url::Url::parse(url)
-        .map(|url| url.path().to_string())
-        .unwrap_or_else(|_| "/".to_string());
+    let parsed = url::Url::parse(url).ok();
+    let path = parsed.as_ref().map(|u| u.path()).unwrap_or("/");
+    let is_https = parsed.as_ref().is_some_and(|u| u.scheme() == "https");
     let mut jar: Vec<(String, String)> = original
         .unwrap_or_default()
         .split(';')
@@ -340,11 +341,10 @@ fn hop_cookie_header(original: Option<&str>, set: &[SetCookie], url: &str) -> Op
         .collect();
     let now = unix_now();
     for cookie in set {
-        if cookie
-            .path
-            .as_deref()
-            .is_some_and(|scope| !path.starts_with(scope))
-        {
+        if cookie.secure && !is_https {
+            continue;
+        }
+        if !crate::state::path_matches(cookie.path.as_deref(), path) {
             continue;
         }
         jar.retain(|(name, _)| name != &cookie.name);
@@ -362,6 +362,69 @@ fn hop_cookie_header(original: Option<&str>, set: &[SetCookie], url: &str) -> Op
 
 /// Headers that validate one URL's cached copy; a redirect hop never carries them.
 const CONDITIONALS: &[&str] = &["if-none-match", "if-modified-since"];
+
+/// Recompute `Sec-Fetch-Site` across a redirect chain monotonically: once a
+/// chain crosses sites it stays `cross-site`, once it crosses origins on the
+/// same site it downgrades from `same-origin` to `same-site`.
+fn redirect_sec_fetch_site(
+    previous: Option<&str>,
+    from_url: &str,
+    to_url: &str,
+) -> Option<&'static str> {
+    let current = match previous? {
+        "cross-site" => return Some("cross-site"),
+        "none" => return Some("none"),
+        "same-site" => "same-site",
+        "same-origin" => "same-origin",
+        _ => return None,
+    };
+    let (Ok(from), Ok(to)) = (url::Url::parse(from_url), url::Url::parse(to_url)) else {
+        return Some("cross-site");
+    };
+    let same_origin = from.scheme() == to.scheme()
+        && from.host_str().map(str::to_ascii_lowercase)
+            == to.host_str().map(str::to_ascii_lowercase)
+        && from.port_or_known_default() == to.port_or_known_default();
+    if same_origin {
+        return Some(current);
+    }
+    let same_site = from.scheme() == to.scheme()
+        && from.host_str().zip(to.host_str()).is_some_and(|(a, b)| {
+            crate::state::site_of(&a.to_ascii_lowercase())
+                == crate::state::site_of(&b.to_ascii_lowercase())
+        });
+    if same_site {
+        Some("same-site")
+    } else {
+        Some("cross-site")
+    }
+}
+
+/// Apply `strict-origin-when-cross-origin` to a `Referer` across a redirect:
+/// drop it on `https -> http` downgrade, keep only `scheme://host[:port]/` on
+/// cross-origin transitions.
+fn redirect_referer(referer: &str, to_url: &str) -> Option<String> {
+    let (Ok(ref_u), Ok(to_u)) = (url::Url::parse(referer), url::Url::parse(to_url)) else {
+        return None;
+    };
+    if ref_u.scheme() == "https" && to_u.scheme() != "https" {
+        return None;
+    }
+    let same_origin = ref_u.scheme() == to_u.scheme()
+        && ref_u.host_str().map(str::to_ascii_lowercase)
+            == to_u.host_str().map(str::to_ascii_lowercase)
+        && ref_u.port_or_known_default() == to_u.port_or_known_default();
+    if same_origin {
+        Some(referer.to_string())
+    } else {
+        let host = ref_u.host_str()?;
+        let origin = match ref_u.port() {
+            Some(port) => format!("{}://{host}:{port}/", ref_u.scheme()),
+            None => format!("{}://{host}/", ref_u.scheme()),
+        };
+        Some(origin)
+    }
+}
 
 fn host_and_scheme(url: &str) -> Option<(String, String)> {
     let url = url::Url::parse(url).ok()?;
@@ -860,29 +923,63 @@ impl Wire {
         let mut method = call.method.to_string();
         let mut body = call.body;
         let mut kept: Vec<SetCookie> = Vec::new();
+        let mut hop_jars: std::collections::HashMap<(String, String), Vec<SetCookie>> =
+            std::collections::HashMap::new();
+        let mut downgraded_to_get = false;
+        let mut hop_sec_fetch_site: Option<&str> = extra
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("sec-fetch-site"))
+            .map(|(_, v)| *v);
+        let mut hop_referer: Option<String> = extra
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
+            .map(|(_, v)| (*v).to_string());
         for hop in 0..=REDIRECTS_MAX {
             let here = host_and_scheme(&url);
             let same = here.is_some() && here == first;
-            // A browser's next hop carries what the redirect just set (a gate
-            // that validates on the first hop opens its session there).
+            // A browser's next hop carries what the redirect just set on that
+            // same `(host, scheme)` — including after `http -> https` or
+            // `apex -> www` transitions — without leaking across origins.
             let hop_cookie = if same && hop > 0 {
                 hop_cookie_header(call.cookie, &kept, &url)
             } else if same {
                 call.cookie.map(str::to_string)
+            } else if let Some(jar) = here.as_ref().and_then(|k| hop_jars.get(k)) {
+                hop_cookie_header(None, jar, &url)
             } else {
                 None
             };
+            let mut owned_headers: Vec<(String, String)> = Vec::new();
             let headers: Vec<(&str, &str)> = if hop == 0 {
                 extra.clone()
             } else {
-                extra
+                for &(name, value) in &extra {
+                    if CONDITIONALS
+                        .iter()
+                        .any(|conditional| name.eq_ignore_ascii_case(conditional))
+                    {
+                        continue;
+                    }
+                    if downgraded_to_get && name.eq_ignore_ascii_case("content-type") {
+                        continue;
+                    }
+                    if name.eq_ignore_ascii_case("sec-fetch-site") {
+                        if let Some(site) = hop_sec_fetch_site {
+                            owned_headers.push((name.to_string(), site.to_string()));
+                        }
+                        continue;
+                    }
+                    if name.eq_ignore_ascii_case("referer") {
+                        if let Some(ref_val) = &hop_referer {
+                            owned_headers.push((name.to_string(), ref_val.clone()));
+                        }
+                        continue;
+                    }
+                    owned_headers.push((name.to_string(), value.to_string()));
+                }
+                owned_headers
                     .iter()
-                    .copied()
-                    .filter(|(name, _)| {
-                        !CONDITIONALS
-                            .iter()
-                            .any(|conditional| name.eq_ignore_ascii_case(conditional))
-                    })
+                    .map(|(n, v)| (n.as_str(), v.as_str()))
                     .collect()
             };
             let mut response = self.send(
@@ -901,6 +998,11 @@ impl Wire {
             )?;
             if same {
                 kept.append(&mut response.cookies);
+            } else if let Some(key) = here {
+                hop_jars
+                    .entry(key)
+                    .or_default()
+                    .append(&mut response.cookies);
             }
             let location = response
                 .headers
@@ -945,7 +1047,12 @@ impl Wire {
             {
                 method = "GET".to_string();
                 body = None;
+                downgraded_to_get = true;
             }
+            hop_sec_fetch_site = redirect_sec_fetch_site(hop_sec_fetch_site, &url, &next);
+            hop_referer = hop_referer
+                .as_deref()
+                .and_then(|r| redirect_referer(r, &next));
             url = next;
         }
         Err(format!("redirect: more than {REDIRECTS_MAX} redirects"))
@@ -1295,5 +1402,84 @@ mod describe_tests {
         assert!(!names_407("http://127.0.0.1:4070/"));
         assert!(!names_407("body of 14070 bytes"));
         assert!(!names_407("version 1.407"));
+    }
+
+    #[test]
+    fn hop_cookie_enforces_path_boundaries_and_secure_flag() {
+        use super::{hop_cookie_header, SetCookie};
+        let set = vec![
+            SetCookie {
+                name: "docs".into(),
+                value: "1".into(),
+                domain: None,
+                path: Some("/docs".into()),
+                expires_unix: None,
+                secure: false,
+                http_only: false,
+            },
+            SetCookie {
+                name: "sec".into(),
+                value: "2".into(),
+                domain: None,
+                path: Some("/".into()),
+                expires_unix: None,
+                secure: true,
+                http_only: true,
+            },
+        ];
+        // /docsearch must not receive a Path=/docs cookie; http:// must not receive Secure.
+        assert_eq!(
+            hop_cookie_header(None, &set, "http://a.test/docsearch"),
+            None
+        );
+        assert_eq!(
+            hop_cookie_header(None, &set, "https://a.test/docs/guide").as_deref(),
+            Some("docs=1; sec=2")
+        );
+    }
+
+    #[test]
+    fn redirect_headers_downgrade_sec_fetch_site_and_referer_monotonically() {
+        use super::{redirect_referer, redirect_sec_fetch_site};
+        assert_eq!(
+            redirect_sec_fetch_site(
+                Some("same-origin"),
+                "https://a.example.com/start",
+                "https://b.example.com/next"
+            ),
+            Some("same-site")
+        );
+        assert_eq!(
+            redirect_sec_fetch_site(
+                Some("same-site"),
+                "https://b.example.com/next",
+                "https://other.org/target"
+            ),
+            Some("cross-site")
+        );
+        // Never upgrades back to same-origin even if redirected back.
+        assert_eq!(
+            redirect_sec_fetch_site(
+                Some("cross-site"),
+                "https://other.org/target",
+                "https://a.example.com/done"
+            ),
+            Some("cross-site")
+        );
+        assert_eq!(
+            redirect_referer(
+                "https://a.example.com/secret/path",
+                "http://a.example.com/next"
+            ),
+            None
+        );
+        assert_eq!(
+            redirect_referer(
+                "https://a.example.com/secret/path",
+                "https://other.org/next"
+            )
+            .as_deref(),
+            Some("https://a.example.com/")
+        );
     }
 }

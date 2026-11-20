@@ -795,10 +795,10 @@ impl State {
             .entry(identity.to_string())
             .or_default();
         for cookie in cookies {
-            match per_identity
-                .iter_mut()
-                .find(|known| known.name == cookie.name && known.path == cookie.path)
-            {
+            let new_path = cookie.path.as_deref().unwrap_or("/");
+            match per_identity.iter_mut().find(|known| {
+                known.name == cookie.name && known.path.as_deref().unwrap_or("/") == new_path
+            }) {
                 Some(slot) => *slot = cookie,
                 None => per_identity.push(cookie),
             }
@@ -836,20 +836,26 @@ impl State {
         let host = parsed.host_str()?.to_ascii_lowercase();
         let secure = parsed.scheme() == "https";
         let path = parsed.path();
-        join_cookies(
-            self.spendable(&host, identity)
-                .into_iter()
-                .filter(|cookie| secure || !cookie.secure)
-                .filter(|cookie| path_matches(cookie.path.as_deref(), path))
-                .collect(),
-        )
+        let mut matched: Vec<StoredCookie> = self
+            .spendable(&host, identity)
+            .into_iter()
+            .filter(|cookie| secure || !cookie.secure)
+            .filter(|cookie| path_matches(cookie.path.as_deref(), path))
+            .collect();
+        // RFC 6265 §5.4: longer cookie paths come first.
+        matched.sort_by(|a, b| {
+            let la = a.path.as_deref().unwrap_or("/").len();
+            let lb = b.path.as_deref().unwrap_or("/").len();
+            lb.cmp(&la)
+        });
+        join_cookies(matched)
     }
 }
 
 /// The site a host belongs to, for ordering priors only: its last two labels,
 /// or three under a two-letter country code whose second level is a short
 /// generic one (`bbc.co.uk`, `abc.net.au`). An IP address is its own site.
-fn site_of(host: &str) -> &str {
+pub(crate) fn site_of(host: &str) -> &str {
     if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
         return host;
     }
@@ -879,7 +885,7 @@ fn site_of(host: &str) -> &str {
 /// RFC 6265 §5.1.4: a cookie path covers the request path when they are equal,
 /// or the cookie path is a prefix ending at a `/` boundary. A cookie with no
 /// stored path is the site's own default and covers every path here.
-fn path_matches(cookie_path: Option<&str>, request_path: &str) -> bool {
+pub(crate) fn path_matches(cookie_path: Option<&str>, request_path: &str) -> bool {
     let Some(cookie_path) = cookie_path.filter(|path| path.starts_with('/')) else {
         return true;
     };
@@ -1596,5 +1602,70 @@ mod tests {
             }],
         );
         assert!(state.cookie_header("e.test", "plain").is_none());
+    }
+
+    #[test]
+    fn root_path_none_and_slash_deduplicate_and_expire_together() {
+        let mut state = State::default();
+        state.store_cookies(
+            "f.test",
+            "chrome",
+            vec![StoredCookie {
+                name: "tok".into(),
+                value: "v1".into(),
+                domain: None,
+                path: None,
+                expires_unix: None,
+                secure: false,
+                http_only: false,
+            }],
+        );
+        // Updating via Path=/ replaces the pathless entry instead of duplicating it.
+        state.store_cookies(
+            "f.test",
+            "chrome",
+            vec![
+                StoredCookie {
+                    name: "tok".into(),
+                    value: "v2".into(),
+                    domain: None,
+                    path: Some("/".into()),
+                    expires_unix: None,
+                    secure: false,
+                    http_only: false,
+                },
+                StoredCookie {
+                    name: "tok".into(),
+                    value: "docs".into(),
+                    domain: None,
+                    path: Some("/docs".into()),
+                    expires_unix: None,
+                    secure: false,
+                    http_only: false,
+                },
+            ],
+        );
+        // Longer path must precede shorter path (RFC 6265 §5.4).
+        assert_eq!(
+            state
+                .cookie_header_for("https://f.test/docs/page", "chrome")
+                .as_deref(),
+            Some("tok=docs; tok=v2")
+        );
+        // Expiring Path=/ clears the root cookie cleanly.
+        state.store_cookies(
+            "f.test",
+            "chrome",
+            vec![StoredCookie {
+                name: "tok".into(),
+                value: String::new(),
+                domain: None,
+                path: Some("/".into()),
+                expires_unix: Some(1),
+                secure: false,
+                http_only: false,
+            }],
+        );
+        assert_eq!(state.cookie_header_for("https://f.test/", "chrome"), None);
     }
 }

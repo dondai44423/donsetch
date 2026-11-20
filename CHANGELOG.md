@@ -1,5 +1,20 @@
 # Changelog
 
+## [5.5.8] - 2026-11-20
+
+### Added
+
+- **Keyless Parallel MCP search enabled by default (`parallel-mcp`, based on #457).** Searches without an explicit `lang` now include Parallel's anonymous Streamable HTTP MCP endpoint (`https://mcp.parallel.ai/mcp`) as a first-class engine alongside `google-cse`, `bing`, `ddg`, `yahoo`, `brave`, and `yandex` with zero API keys or accounts required. Per-route sessions are cached (`search-parallel-mcp.json`, 25 min TTL) so warm searches take a single POST (~1.1–1.4 s), `publish_date` and rich excerpts feed into multi-engine fusion and freshness ranking, HTTP 429s rest cleanly in the ledger while the remaining engines answer, and requests carry DonSeTch's versioned `User-Agent`. Disable anytime with `[search] parallel_mcp = false` (`DONSETCH_SEARCH__PARALLEL_MCP=false`) or a `[rules.url]` deny rule on `mcp.parallel.ai`.
+- **External CDP browser endpoint for screenshots (`browser.cdp_url` / `DONSETCH_BROWSER__CDP_URL`).** Hosts that cannot install Chrome locally (such as NAS devices or slim containers) can point `web_screenshot` and `donsetch doctor` at an external Chromium DevTools Protocol endpoint (`http(s)://host:port` or `ws(s)://...`). DonSeTch rewrites container-local `127.0.0.1`/`localhost` debugger URLs onto the configured host, creates an isolated incognito browser context per capture, enforces the full `Fetch.requestPaused` SSRF/URL-rule guard on flattened target sessions, and disposes only its target and context without closing the external browser.
+
+### Fixed
+
+- **Bright Data and BYOK Google `/goto` links resolve to real publisher URLs (#456).** Opaque signed-out `google.*/goto?url=…` links returned by Google SERP providers are resolved concurrently via cookie-less, no-Referer, non-following `GET` 302 probes (bounded concurrency, tight deadline, batch-stop on 403/429/503, honors `[rules.url]`) before deduplication, so models, deny rules, and citations see the real destination host instead of `google.com`. Local redirect wrappers (`/url?q=`, `uddg=`) also unwrap before deduplication, keyless `contract::url_class` classifies Google `/goto` as a redirector, and `donsetch-fetch` suppresses stored Google cookies and cookie/state persistence if a `/goto` URL is ever fetched directly.
+- **Fetch wire pooling, cookie scope, and redirect header stealth.** `Worker` shares one public-only SSRF `Guard` wire per `(identity, proxy)` instead of allocating an unbounded Tokio runtime and client per unique host, evicts temporary `allow_private` wires, and clears `guard` on `release()` / `once()`. `State::store_cookies` normalizes pathless (`None`) and `Path=/` cookies into the same slot and orders `Cookie` headers by path length descending (RFC 6265 §5.4). Redirect chains now enforce RFC 6265 path boundaries and `Secure` flags on hop cookies, carry destination-host cookies across `http→https` and `apex→www` hops, monotonically downgrade `Sec-Fetch-Site` and `Referer` (`strict-origin-when-cross-origin`), and strip `Content-Type` when 301/302/303 downgrades `POST` to `GET`.
+- **Search latency and recall fixes.** `byok_flight` followers wake as soon as a failing leader exits `byok_inflight` instead of sleeping 12 s; `decode_bing` handles `?u=a1…` as the first query parameter; and `enrich_results` parses HTML once with cached selectors on `spawn_blocking` instead of twice synchronously on async workers.
+- **Crawl reliability and budget enforcement.** Zero-status transport errors (`status == 0`) now report to `governor.on_error` and skip the page instead of permanently aborting the crawl as `Walled`; `wait_lane` loops after pacing sleeps so `Crawl-delay` and 429 backoff apply on every page and stop cleanly at the deadline; and `diff_mode` respects `opts.max_pages` instead of promoting every reserve row into `plan.pages`.
+- **CDP request guard on flattened sessions.** `Cdp::spawn_request_guard_for_session` forwards `sessionId` on `Fetch.continueRequest`/`Fetch.failRequest` and detaches `guard_queue` on `RequestGuard::drop` so trailing events never kill a reused WebSocket.
+
 ## [5.5.7] - 2026-11-18
 
 ### Changed
