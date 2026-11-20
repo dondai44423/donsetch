@@ -91,6 +91,34 @@ pub(crate) fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// True when `raw` is one of Google's opaque signed-out `/goto?url=…`
+/// redirector links (`google.com`, `www.google.co.uk`, etc.).
+pub(crate) fn is_google_goto(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") || u.path() != "/goto" {
+        return false;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = lower.split('.').collect();
+    let is_google_host = match labels.as_slice() {
+        [.., "google", tld] => !tld.is_empty() && tld.bytes().all(|b| b.is_ascii_alphabetic()),
+        [.., "google", second, cc] => {
+            matches!(*second, "co" | "com" | "org" | "net" | "ac")
+                && cc.len() == 2
+                && cc.bytes().all(|b| b.is_ascii_alphabetic())
+        }
+        _ => false,
+    };
+    is_google_host
+        && u.query_pairs()
+            .any(|(k, v)| k == "url" && !v.trim().is_empty())
+}
+
 /// A redirect wrapper's payload, decoded locally: Google's `/url?q=`, DDG's
 /// `uddg=`, Bing's `apiclick`, Yahoo's `/RU=`. `None` when the URL is not a
 /// wrapper, or when the wrapper does not carry its target.
@@ -133,7 +161,10 @@ pub fn decode_redirect(raw: &str) -> Option<String> {
     }
     // A wrapper inside a wrapper is not an answer.
     let lower = target.to_ascii_lowercase();
-    if lower.contains("news.google.com") || REDIRECTORS.iter().any(|p| lower.contains(p)) {
+    if lower.contains("news.google.com")
+        || REDIRECTORS.iter().any(|p| lower.contains(p))
+        || is_google_goto(target)
+    {
         return None;
     }
     Some(target.to_string())
@@ -198,7 +229,7 @@ pub fn url_class(raw: &str) -> UrlClass {
         return UrlClass::Invalid;
     }
     let lower = raw.to_lowercase();
-    if REDIRECTORS.iter().any(|p| lower.contains(p)) {
+    if REDIRECTORS.iter().any(|p| lower.contains(p)) || is_google_goto(raw) {
         return UrlClass::Redirect;
     }
     if is_serp_url(raw) {
@@ -1193,5 +1224,22 @@ mod tests {
         assert_eq!(window_from_str("12h"), Some(window_days(1)));
         assert_eq!(window_from_str("0d"), None);
         assert_eq!(window_from_str("7x"), None);
+    }
+
+    #[test]
+    fn google_goto_links_are_recognized_as_redirects() {
+        let goto = "https://www.google.com/goto?url=CAES123456&gsessionid=abc";
+        assert!(is_google_goto(goto));
+        assert!(is_google_goto("https://www.google.co.uk/goto?url=CAES123"));
+        assert_eq!(url_class(goto), UrlClass::Redirect);
+        assert!(decode_redirect(goto).is_none());
+        // Negative cases: non-Google hosts, non-/goto paths, or missing url=.
+        assert!(!is_google_goto("https://example.com/goto?url=CAES123"));
+        assert!(!is_google_goto("https://notgoogle.com/goto?url=CAES123"));
+        assert!(!is_google_goto(
+            "https://google.example.com/goto?url=CAES123"
+        ));
+        assert!(!is_google_goto("https://www.google.com/goto"));
+        assert!(!is_google_goto("https://www.google.com/search?q=tokio"));
     }
 }

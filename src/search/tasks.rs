@@ -50,6 +50,7 @@ pub(super) struct EngineContext<'a> {
     pub pool: &'a EgressPool,
     pub google: &'a engines::google_wml::ProfileSelector,
     pub cse: &'a super::cse::Client,
+    pub parallel_mcp: &'a super::parallel_mcp::Client,
     /// The query's language, when the script named one.
     pub lang: Option<super::lang::Lang>,
     /// Shared allowance for engine HTTP requests after first-party reserves.
@@ -168,6 +169,9 @@ pub(super) async fn engine_task_with_budget(
     if engine == "google-cse" {
         return super::cse::task(query, egress_id, proxy, context, budget).await;
     }
+    if engine == super::parallel_mcp::SOURCE {
+        return super::parallel_mcp::task(query, egress_id, proxy, context, budget).await;
+    }
     let EngineContext {
         fetcher,
         pool,
@@ -176,6 +180,7 @@ pub(super) async fn engine_task_with_budget(
         requests: allowance,
         facts: original_facts,
         cse: _,
+        parallel_mcp: _,
     } = context;
     let mut label = engine.clone();
     let deadline = tokio::time::Instant::now() + budget;
@@ -821,6 +826,7 @@ mod tests {
         let pool = EgressPool::new(Vec::new());
         let google = engines::google_wml::ProfileSelector::from_env();
         let cse = super::super::cse::Client::default();
+        let parallel_mcp = super::super::parallel_mcp::Client::default();
         let allowance = RequestAllowance::new(2);
         let facts = super::super::query::QueryFacts::new("rust ownership");
         let context = EngineContext {
@@ -828,6 +834,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &cse,
+            parallel_mcp: &parallel_mcp,
             lang: None,
             requests: &allowance,
             facts: Some(&facts),
@@ -1114,6 +1121,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
+            parallel_mcp: &super::super::parallel_mcp::Client::default(),
             lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,
@@ -1147,6 +1155,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
+            parallel_mcp: &super::super::parallel_mcp::Client::default(),
             lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,
@@ -1326,6 +1335,7 @@ mod tests {
             pool: &pool,
             google: &google,
             cse: &super::super::cse::Client::default(),
+            parallel_mcp: &super::super::parallel_mcp::Client::default(),
             lang: None,
             requests: &RequestAllowance::new(6),
             facts: None,

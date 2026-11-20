@@ -274,8 +274,11 @@ impl Searcher {
                             .map(|(_, v)| v.clone())
                             .unwrap_or_default();
                         let html = crate::extract::charset::decode(&o.body, &ct);
-                        let title = extract_title(&html);
-                        let desc = extract_description(&html);
+                        let (title, desc) = tokio::task::spawn_blocking(move || {
+                            extract_title_and_description(&html)
+                        })
+                        .await
+                        .unwrap_or((None, None));
                         // v3 F1: keep the body for the warm handoff, even
                         // when there is no metadata to enrich with.
                         sink.lock()
@@ -608,27 +611,28 @@ fn same_publisher(a: &str, b: &str) -> bool {
         && (a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")))
 }
 
-/// Extract <title> from raw HTML.
-fn extract_title(html: &str) -> Option<String> {
+/// Extract `<title>` and `<meta name="description">` / `og:description` in a
+/// single HTML parse using cached CSS selectors.
+fn extract_title_and_description(html: &str) -> (Option<String>, Option<String>) {
+    static TITLE_SEL: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| Selector::parse("title").expect("valid title selector"));
+    static DESC_SEL: std::sync::LazyLock<Selector> = std::sync::LazyLock::new(|| {
+        Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#)
+            .expect("valid description selector")
+    });
     let doc = scraper::Html::parse_document(html);
-    let sel = Selector::parse("title").ok()?;
-    doc.select(&sel)
+    let title = doc
+        .select(&TITLE_SEL)
         .next()
         .map(|e| e.text().collect::<Vec<_>>().join(" ").trim().to_string())
-        .filter(|t| !t.is_empty())
-}
-
-/// Extract <meta name="description"> (or og:description)
-/// from raw HTML.
-fn extract_description(html: &str) -> Option<String> {
-    let doc = scraper::Html::parse_document(html);
-    let sel =
-        Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).ok()?;
-    doc.select(&sel)
+        .filter(|t| !t.is_empty());
+    let desc = doc
+        .select(&DESC_SEL)
         .next()
         .and_then(|e| e.value().attr("content"))
         .map(|s| s.trim().to_string())
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty());
+    (title, desc)
 }
 
 /// A transport error that says "slow", not "dead": the connect timed

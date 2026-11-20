@@ -138,6 +138,9 @@ section!(BypassSection {
 });
 
 section!(SearchSection {
+    /// Include Parallel's anonymous keyless MCP search source for searches without
+    /// a language override. Set false to disable.
+    parallel_mcp: bool = true,
     /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
@@ -196,6 +199,9 @@ section!(SearchSection {
 
 section!(BrowserSection {
     chromium_path: String = String::new(),
+    /// External Chromium DevTools Protocol endpoint (`http(s)://host:port` or
+    /// `ws(s)://...`) for `web_screenshot` on hosts without local Chrome (e.g. NAS/containers).
+    cdp_url: String = String::new(),
     playwright_path: String = String::new(),
     route_probes: bool = true,
     probe_scan_secs: u64 = 120,
@@ -1713,6 +1719,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
+            "parallel_mcp",
+            FieldKind::Bool,
+            "true",
+            "include Parallel's anonymous keyless MCP search source for searches without a language override (set false to disable)",
+        ),
+        (
+            "search",
             "brightdata_zone",
             FieldKind::Str,
             "(unset)",
@@ -1767,6 +1780,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Str,
             "(discovery)",
             "explicit Chromium/Chrome binary path",
+        ),
+        (
+            "browser",
+            "cdp_url",
+            FieldKind::Str,
+            "(unset)",
+            "external CDP endpoint (http(s)://host:port or ws(s)://...) for web_screenshot without local Chrome",
         ),
         (
             "browser",
@@ -2173,6 +2193,19 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.browser.probe_stale_secs < 60 || c.browser.probe_stale_secs > 604_800 {
         return err("browser.probe_stale_secs must be 60..=604800".into());
+    }
+    let cdp = c.browser.cdp_url.trim();
+    if !cdp.is_empty() {
+        let parsed = url::Url::parse(cdp).map_err(|_| {
+            ConfigError::Validate(format!(
+                "browser.cdp_url must be a valid http(s):// or ws(s):// URL (got {cdp:?})"
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") || !parsed.has_host() {
+            return err(format!(
+                "browser.cdp_url must use http(s):// or ws(s):// with a host (got {cdp:?})"
+            ));
+        }
     }
     if c.rules.crawl_denied_urls_per_rule > 200 {
         return err("rules.crawl_denied_urls_per_rule must be 0..=200".into());

@@ -411,7 +411,9 @@ impl ByokSearcher {
                         });
                         continue;
                     }
-                    let results = to_merged(outcome.hits, &provider, max);
+                    let mut hits = outcome.hits;
+                    resolve_redirect_hits(&mut hits).await;
+                    let results = to_merged(hits, &provider, max);
                     let mut report = std::mem::take(&mut walk);
                     report.push(EngineReport {
                         cache_age_ms: None,
@@ -566,14 +568,167 @@ async fn dispatch(
     }
 }
 
+/// Max concurrent cookie-less `/goto` 302 probes per BYOK search.
+const GOTO_CONCURRENCY: usize = 4;
+/// Per-request timeout for one `/goto` redirect probe.
+const GOTO_REQ_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Whole-batch budget for resolving opaque `/goto` links in one search.
+const GOTO_BATCH_BUDGET: Duration = Duration::from_secs(4);
+
+/// Build a cookie-less, redirect-disabled HTTP client for resolving one
+/// opaque `/goto` link (honors DonSeTch's proxy configuration).
+fn goto_client_for(url: &str) -> Option<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(GOTO_REQ_TIMEOUT)
+        .no_proxy();
+    match crate::egress::proxy::from_env_for(url) {
+        Ok(Some(proxy)) => {
+            if proxy.scheme == crate::egress::proxy::ProxyScheme::Socks5 {
+                return None;
+            }
+            builder = builder.proxy(reqwest::Proxy::all(proxy.wire_url()).ok()?);
+        }
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    builder.build().ok()
+}
+
+/// Outcome of one cookie-less `/goto` 302 lookup.
+enum GotoOutcome {
+    /// Clean 3xx `Location` pointing at a fetchable page URL.
+    Resolved(String),
+    /// Upstream refused/throttled (403/429/503) — trip batch stop.
+    Refused,
+    /// Timeout, transport error, non-3xx, or unusable `Location`.
+    Unresolved,
+}
+
+/// Resolve one opaque redirect URL with a single cookie-less, no-Referer,
+/// non-following GET and validate the returned `Location` target.
+async fn resolve_one_goto(client: &reqwest::Client, raw: &str) -> GotoOutcome {
+    let resp = match client.get(raw).send().await {
+        Ok(r) => r,
+        Err(_) => return GotoOutcome::Unresolved,
+    };
+    let status = resp.status().as_u16();
+    if matches!(status, 403 | 429 | 503) {
+        return GotoOutcome::Refused;
+    }
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return GotoOutcome::Unresolved;
+    }
+    let Some(location) = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return GotoOutcome::Unresolved;
+    };
+    let Ok(base) = url::Url::parse(raw) else {
+        return GotoOutcome::Unresolved;
+    };
+    let Ok(resolved) = base.join(location.trim()) else {
+        return GotoOutcome::Unresolved;
+    };
+    let candidate = crate::search::contract::decode_redirect(resolved.as_str())
+        .unwrap_or_else(|| resolved.to_string());
+    if crate::search::contract::url_class(&candidate) != crate::search::contract::UrlClass::Page {
+        return GotoOutcome::Unresolved;
+    }
+    GotoOutcome::Resolved(candidate)
+}
+
+/// Unwrap local redirect wrappers and resolve opaque Google `/goto?url=…`
+/// links returned by signed-out Google SERP providers (e.g. Bright Data, #456).
+///
+/// Only runs network requests when at least one hit is a Google `/goto` link.
+/// Every request is cookie-less, sends no `Referer`, does not follow the
+/// redirect, respects `[rules.url]`, runs with bounded concurrency and a tight
+/// deadline, and stops the batch immediately on HTTP 403/429/503.
+async fn resolve_redirect_hits(hits: &mut [SearchHit]) {
+    resolve_redirect_hits_with(hits, None, crate::search::contract::is_google_goto).await;
+}
+
+async fn resolve_redirect_hits_with<F>(
+    hits: &mut [SearchHit],
+    override_client: Option<reqwest::Client>,
+    should_resolve: F,
+) where
+    F: Fn(&str) -> bool,
+{
+    for hit in hits.iter_mut() {
+        if let Some(decoded) = crate::search::contract::decode_redirect(&hit.url) {
+            hit.url = decoded;
+        }
+    }
+    let check_url_policy = override_client.is_none();
+    let targets: Vec<(usize, String)> = hits
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| should_resolve(&h.url))
+        .filter(|(_, h)| {
+            !check_url_policy || crate::fetch::guards::validate_url_basic(&h.url).is_ok()
+        })
+        .map(|(i, h)| (i, h.url.clone()))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let client = match override_client {
+        Some(c) => c,
+        None => match goto_client_for(&targets[0].1) {
+            Some(c) => c,
+            None => return,
+        },
+    };
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(GOTO_CONCURRENCY));
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut join = tokio::task::JoinSet::new();
+    for (idx, url) in targets {
+        let client = client.clone();
+        let sem = std::sync::Arc::clone(&sem);
+        let stopped = std::sync::Arc::clone(&stopped);
+        join.spawn(async move {
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return (idx, GotoOutcome::Unresolved);
+            };
+            if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return (idx, GotoOutcome::Unresolved);
+            }
+            let outcome = resolve_one_goto(&client, &url).await;
+            if matches!(outcome, GotoOutcome::Refused) {
+                stopped.store(true, std::sync::atomic::Ordering::Release);
+            }
+            (idx, outcome)
+        });
+    }
+    let deadline = tokio::time::Instant::now() + GOTO_BATCH_BUDGET;
+    while let Ok(Some(res)) = tokio::time::timeout_at(deadline, join.join_next()).await {
+        if let Ok((idx, GotoOutcome::Resolved(url))) = res {
+            hits[idx].url = url;
+        }
+    }
+    join.abort_all();
+}
+
 /// Convert provider hits to the Merged format used by the
 /// local search pipeline. Each hit gets a single source
-/// (the provider name) with its score. Deduplicates by
-/// normalized URL and filters empty titles/URLs.
+/// (the provider name) with its score. Unwraps local
+/// redirectors, deduplicates by normalized URL, and filters
+/// empty titles/URLs.
 fn to_merged(hits: Vec<SearchHit>, provider: &str, max: usize) -> Vec<Merged> {
     use crate::search::rank::norm_key;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     hits.into_iter()
+        .map(|mut h| {
+            if let Some(decoded) = crate::search::contract::decode_redirect(&h.url) {
+                h.url = decoded;
+            }
+            h
+        })
         .filter(|h| !h.url.is_empty() && !h.title.trim().is_empty())
         .filter(|h| seen.insert(norm_key(&h.url)))
         .take(max)
@@ -1058,5 +1213,162 @@ mod tests {
         // The bare prefix (the pre-fix shape) never yields an empty status.
         assert_eq!(compact_failure("all keys exhausted: "), "no usable key");
         assert_eq!(compact_failure(""), "no usable key");
+    }
+
+    // #456: Bright Data / Google SERP opaque `/goto` 302 links resolve
+    // cookie-lessly without following the redirect, while invalid/non-page
+    // targets and rate-limited replies keep the original URL cleanly.
+    #[tokio::test]
+    async fn goto_redirect_resolution_unwraps_302_without_cookies_or_referer() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut reader = BufReader::new(socket);
+                let mut first_line = String::new();
+                if reader.read_line(&mut first_line).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line.trim().is_empty()
+                    {
+                        break;
+                    }
+                    headers.push(line.to_ascii_lowercase());
+                }
+                assert!(
+                    !headers.iter().any(|h| h.starts_with("cookie:")),
+                    "must never send cookies on /goto: {headers:?}"
+                );
+                assert!(
+                    !headers.iter().any(|h| h.starts_with("referer:")),
+                    "must never send referer on /goto: {headers:?}"
+                );
+                let reply = if first_line.contains("url=ok1") {
+                    "HTTP/1.1 302 Found\r\nLocation: https://docs.rs/tokio/latest/tokio/macro.select.html\r\nSet-Cookie: NID=tracking; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if first_line.contains("url=dup1") {
+                    "HTTP/1.1 302 Found\r\nLocation: https://docs.rs/tokio/latest/tokio/macro.select.html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if first_line.contains("url=badloc") {
+                    "HTTP/1.1 302 Found\r\nLocation: https://www.google.com/goto?url=loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = reader.get_mut().write_all(reply.as_bytes()).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut hits = vec![
+            SearchHit {
+                title: "Tokio select!".into(),
+                url: format!("http://{addr}/goto?url=ok1"),
+                snippet: "macro".into(),
+                score: 1.0,
+            },
+            SearchHit {
+                title: "Duplicate via goto".into(),
+                url: format!("http://{addr}/goto?url=dup1"),
+                snippet: "dup".into(),
+                score: 0.5,
+            },
+            SearchHit {
+                title: "Nested redirector".into(),
+                url: format!("http://{addr}/goto?url=badloc"),
+                snippet: "loop".into(),
+                score: 0.33,
+            },
+            SearchHit {
+                title: "Wrapped /url?q=".into(),
+                url: "https://www.google.com/url?q=https%3A%2F%2Fusers.rust-lang.org%2Ft%2F1"
+                    .into(),
+                snippet: "local decode".into(),
+                score: 0.2,
+            },
+        ];
+
+        resolve_redirect_hits_with(&mut hits, Some(client.clone()), |u| {
+            u.contains("/goto?url=")
+        })
+        .await;
+
+        assert_eq!(
+            hits[0].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert_eq!(
+            hits[1].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert_eq!(
+            hits[2].url,
+            format!("http://{addr}/goto?url=badloc"),
+            "nested redirector Location must be refused"
+        );
+        assert_eq!(
+            hits[3].url, "https://users.rust-lang.org/t/1",
+            "local /url?q= wrappers must unwrap without network"
+        );
+
+        let merged = to_merged(hits, "brightdata", 5);
+        assert_eq!(
+            merged.len(),
+            3,
+            "duplicate resolved /goto hits must collapse in to_merged"
+        );
+        assert_eq!(
+            merged[0].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert_eq!(merged[2].url, "https://users.rust-lang.org/t/1");
+
+        // Rate-limited batch preserves the original /goto URLs cleanly.
+        let mut rl_hits = vec![SearchHit {
+            title: "Rate limited".into(),
+            url: format!("http://{addr}/goto?url=rl"),
+            snippet: "rl".into(),
+            score: 1.0,
+        }];
+        resolve_redirect_hits_with(&mut rl_hits, Some(client), |u| u.contains("/goto?url=")).await;
+        assert_eq!(rl_hits[0].url, format!("http://{addr}/goto?url=rl"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goto_resolution_respects_url_deny_rules() {
+        let mut cfg = crate::config::DonsetchConfig::default();
+        cfg.rules.url.insert(
+            "google.com".into(),
+            crate::rules::UrlRule {
+                action: crate::rules::RuleAction::Deny,
+                message: Some("no google".into()),
+                ..Default::default()
+            },
+        );
+        crate::config::install(cfg).unwrap();
+
+        let original = "https://www.google.com/goto?url=CAES_DENIED".to_string();
+        let mut hits = vec![SearchHit {
+            title: "Denied".into(),
+            url: original.clone(),
+            snippet: "s".into(),
+            score: 1.0,
+        }];
+        // Would fail/hang if it attempted a live network call against a dead client;
+        // validate_url_basic rejects google.com before any HTTP client is built.
+        resolve_redirect_hits(&mut hits).await;
+        assert_eq!(hits[0].url, original);
     }
 }

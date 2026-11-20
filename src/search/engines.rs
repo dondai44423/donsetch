@@ -139,7 +139,7 @@ fn urlencoding_decode(s: &str) -> Result<String, ()> {
 /// after the "a1" prefix).
 fn decode_bing(href: &str) -> String {
     if href.contains("bing.com/ck/a")
-        && let Some((_, u)) = href.split_once("&u=")
+        && let Some((_, u)) = href.split_once("&u=").or_else(|| href.split_once("?u="))
     {
         let u = u.split('&').next().unwrap_or(u);
         if let Some(b64) = u.strip_prefix("a1")
@@ -1618,5 +1618,16 @@ mod structured_answer_tests {
             hits[0].url,
             "https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html"
         );
+    }
+
+    #[test]
+    fn decode_bing_handles_first_query_param_u() {
+        // "https://example.org/first" -> base64url "aHR0cHM6Ly9leGFtcGxlLm9yZy9maXJzdA"
+        let first_param = "https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9leGFtcGxlLm9yZy9maXJzdA&ntb=1";
+        assert_eq!(decode_bing(first_param), "https://example.org/first");
+        let second_param =
+            "https://www.bing.com/ck/a?p=1&u=a1aHR0cHM6Ly9leGFtcGxlLm9yZy9maXJzdA&ntb=1";
+        assert_eq!(decode_bing(second_param), "https://example.org/first");
+        assert_eq!(decode_bing("https://www.bing.com/ck/a?u=not-a1"), "");
     }
 }

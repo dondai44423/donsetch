@@ -31,6 +31,7 @@ mod lang;
 pub(crate) mod ledger;
 pub use lang::{Lang, native_script};
 mod news;
+pub(crate) mod parallel_mcp;
 mod persist;
 pub mod quality;
 mod render;
@@ -538,6 +539,7 @@ pub struct Searcher {
     pool: std::sync::Arc<EgressPool>,
     google: engines::google_wml::ProfileSelector,
     cse: cse::Client,
+    parallel_mcp: parallel_mcp::Client,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
@@ -705,6 +707,7 @@ impl Searcher {
             pool,
             google: engines::google_wml::ProfileSelector::from_env(),
             cse: cse::Client::load(),
+            parallel_mcp: parallel_mcp::Client::load(),
             trust: Mutex::new(trust),
             trust_intent: Mutex::new(trust_intent),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -909,8 +912,16 @@ impl Searcher {
                 if let Some(hit) = self.byok_cache_get(query, intent, max) {
                     return Ok(hit);
                 }
+                let still_running = self
+                    .byok_inflight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&key);
+                if !still_running {
+                    break;
+                }
             }
-            // Leader died or stalled : compute ourselves.
+            // Leader failed or stalled: compute ourselves.
         }
         let _guard = InflightGuard {
             map: &self.byok_inflight,
@@ -1475,6 +1486,7 @@ impl Searcher {
         let intent = forced_intent.unwrap_or_else(|| intent::detect(query));
         // The caller's language, or the English default for a Latin query.
         // No script is turned into a language or a market here.
+        let explicit_lang = lang.is_some();
         let lang = lang::effective(query, lang);
         let cache_key = format!(
             "{}|{}|lang={}",
@@ -1530,7 +1542,10 @@ impl Searcher {
             });
         }
 
-        let engines = intent::engines_for(intent);
+        let mut engines: Vec<&str> = intent::engines_for(intent).to_vec();
+        if crate::config::cfg().search.parallel_mcp && !explicit_lang {
+            engines.insert(1.min(engines.len()), parallel_mcp::SOURCE);
+        }
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
         // polluted with the literal token).
@@ -1618,6 +1633,9 @@ impl Searcher {
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
         let mut priority_sources = vec!["google-cse".to_string()];
+        if live.contains(&parallel_mcp::SOURCE) {
+            priority_sources.push(parallel_mcp::SOURCE.to_string());
+        }
         // Authority cannot lift a source absent from the candidate pool.
         // Two scoped recalls join the initial wave, on an engine that honors
         // site:, only while the pool is healthy. Results still need ranking.
@@ -1665,6 +1683,7 @@ impl Searcher {
             pool: self.pool.as_ref(),
             google: &self.google,
             cse: &self.cse,
+            parallel_mcp: &self.parallel_mcp,
             lang: lang.clone(),
             requests: &engine_allowance,
             facts: Some(&query_facts),
@@ -1691,6 +1710,8 @@ impl Searcher {
                     0
                 } else if name == "google-cse" {
                     self.cse.request_cost(eg.proxy.as_ref())
+                } else if name == parallel_mcp::SOURCE {
+                    self.parallel_mcp.request_cost(eg.proxy.as_ref())
                 } else {
                     1
                 },
