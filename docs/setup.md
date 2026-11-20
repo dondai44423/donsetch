@@ -97,6 +97,15 @@ chromium_path = "/path/to/chrome"
 
 The environment equivalent is `DONSETCH_BROWSER__CHROMIUM_PATH`. Legacy `DONGHOST_CHROME` is still supported. A custom Playwright cache can be named with `browser.playwright_path` or `PLAYWRIGHT_BROWSERS_PATH`.
 
+On hosts that cannot install Chrome locally (such as a NAS or slim container), point screenshots at an external Chromium DevTools Protocol endpoint instead:
+
+```toml
+[browser]
+cdp_url = "http://192.168.1.50:9222" # or ws://.../devtools/browser/...
+```
+
+The environment equivalent is `DONSETCH_BROWSER__CDP_URL`. Each capture creates an isolated incognito browser context, enforces the same SSRF and URL rules on requests, and disposes only its own target and context when finished.
+
 Screenshots use a throwaway profile with no signed-in cookies. `donsetch doctor` includes a browser launch check.
 
 ## Configuration

@@ -992,6 +992,9 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
 }
 
 async fn check_chrome() -> CheckResult {
+    if let Some(cdp_url) = crate::browser::configured_cdp_url() {
+        return CheckResult::Pass(format!("external CDP configured ({cdp_url})"));
+    }
     let result = tokio::task::spawn_blocking(crate::browser::resolve_browser).await;
     match result {
         Ok(Ok(browser)) => {
@@ -1012,7 +1015,7 @@ async fn check_chrome() -> CheckResult {
         }
         Ok(Err(error)) => CheckResult::Fail(
             error.to_string(),
-            "Install Chromium or set DONGHOST_CHROME.".into(),
+            "Install Chromium, set DONGHOST_CHROME, or set browser.cdp_url for an external CDP browser.".into(),
         ),
         Err(error) => CheckResult::Fail(
             format!("browser resolution task failed: {error}"),
@@ -1021,29 +1024,27 @@ async fn check_chrome() -> CheckResult {
     }
 }
 
-/// The REAL browser test: launch the resolved Chromium headless
-/// exactly as login and web_screenshot would, probe it over CDP,
-/// close. Bounded to 40s. This is what turns the 50-case report's
-/// "a feature that works only when the user guesses the hidden
-/// prerequisite is not finished".
+/// The REAL browser test: launch the resolved Chromium headless (or connect to
+/// the configured external CDP browser) exactly as web_screenshot would, probe
+/// it over CDP, close. Bounded to 40s.
 async fn check_browser_launch() -> CheckResult {
-    let resolved = match crate::browser::resolve_browser() {
-        Ok(r) => r,
-        Err(e) => {
-            return CheckResult::Fail(
-                format!("launch failed: {e}"),
-                "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
-            );
-        }
-    };
+    let remote = crate::browser::configured_cdp_url();
+    if remote.is_none()
+        && let Err(e) = crate::browser::resolve_browser()
+    {
+        return CheckResult::Fail(
+            format!("launch failed: {e}"),
+            "Browser-backed features (screenshot) will not work. Install Chromium, set DONGHOST_CHROME, or set browser.cdp_url.".into(),
+        );
+    }
     let inner = async {
         let t0 = std::time::Instant::now();
-        let session = match crate::browser::launch_headless(&resolved.path).await {
+        let session = match crate::browser::open_capture_session().await {
             Ok(s) => s,
             Err(e) => {
                 return CheckResult::Fail(
                     format!("launch failed: {e}"),
-                    "Browser-backed features (screenshot) will not work. Install Chromium or set DONGHOST_CHROME.".into(),
+                    "Browser-backed features (screenshot) will not work. Install Chromium, set DONGHOST_CHROME, or verify browser.cdp_url.".into(),
                 );
             }
         };
@@ -1053,7 +1054,7 @@ async fn check_browser_launch() -> CheckResult {
         let probe = session
             .cdp()
             .call(
-                None,
+                session.session_id(),
                 "Runtime.evaluate",
                 serde_json::json!({"expression": "1+1", "returnByValue": true}),
             )

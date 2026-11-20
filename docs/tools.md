@@ -55,6 +55,7 @@ Supports `site:`, `filetype:`, `intitle:`, `"…"`, `-term`, exact identifiers, 
 
 - **Answer metadata:** `confidence` (`high` | `medium` | `low` — retrieval agreement/coverage, not fact verification), `degraded`, `requested_results` / `returned_results` / `underfilled`, `source_type`, and `cache_age_ms` (only `high`-confidence merged sets are cached).
 - **Diagnostics:** `donsetch search --sources`, `donsetch search doctor`, `donsetch search --explain "query"`.
+- **Parallel MCP (keyless, enabled by default):** searches without an explicit `lang` include Parallel's anonymous MCP endpoint (`https://mcp.parallel.ai/mcp`) alongside the other keyless search engines using a reusable per-route session, DonSeTch's versioned `User-Agent`, and automatic ledger backoff on rate limits. Set `[search] parallel_mcp = false` (`DONSETCH_SEARCH__PARALLEL_MCP=false`) or deny `mcp.parallel.ai` in `[rules.url]` to disable it.
 
 ### Optional search providers
 
@@ -127,7 +128,7 @@ donsetch screenshot https://example.com --out page.png
 donsetch screenshot https://example.com --full-page --wait-ms 1500
 ```
 
-Launches an [installed Chromium-family browser](setup.md#browser-for-screenshots) with an isolated throwaway profile (default settle `600 ms`, `wait_ms` up to `5,000 ms`, default deadline `60 s`), checking document requests against SSRF and local rules. MCP returns the inline PNG block plus server-local path.
+Launches an [installed Chromium-family browser](setup.md#browser-for-screenshots) with an isolated throwaway profile — or attaches an isolated incognito target on an external CDP browser via `browser.cdp_url` (`DONSETCH_BROWSER__CDP_URL`) on hosts without local Chrome (default settle `600 ms`, `wait_ms` up to `5,000 ms`, default deadline `60 s`), checking document requests against SSRF and local rules. MCP returns the inline PNG block plus server-local path.
 
 ## Result contract
 

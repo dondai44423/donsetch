@@ -37,6 +37,8 @@ const GUARD_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 struct PausedRequest {
     id: String,
     url: String,
+    /// Attached target session ID (`flatten: true`), or `None` for page-level WS.
+    session_id: Option<String>,
     /// A document request of the page's main frame: the navigation
     /// itself or one of its redirect hops.
     main_document: bool,
@@ -50,6 +52,7 @@ fn paused_cost(id: &str, url: &str) -> usize {
 /// The installed guard's inlet, while it runs.
 struct GuardInlet {
     main_frame: String,
+    session_id: Option<String>,
     requests: mpsc::UnboundedSender<PausedRequest>,
     /// Budget bytes of the paused requests not answered yet.
     held: Arc<AtomicUsize>,
@@ -104,10 +107,13 @@ impl Clone for Cdp {
 }
 
 /// The running request guard of one page (see
-/// [`Cdp::spawn_request_guard`]). Dropping it stops the guard.
+/// [`Cdp::spawn_request_guard`]). Dropping it stops the guard and detaches
+/// its inlet so trailing events on a reused browser WebSocket never trip a
+/// dead-guard error.
 pub struct RequestGuard {
     task: tokio::task::JoinHandle<()>,
     refusal: Arc<std::sync::Mutex<Option<FetchError>>>,
+    guard_queue: Arc<GuardQueue>,
 }
 
 impl RequestGuard {
@@ -123,6 +129,7 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
+        *self.guard_queue.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.task.abort();
     }
 }
@@ -201,6 +208,10 @@ impl Cdp {
                     let Some(inlet) = queue.as_ref() else {
                         continue;
                     };
+                    let event_session = v.get("sessionId").and_then(Value::as_str);
+                    if inlet.session_id.as_deref() != event_session {
+                        continue;
+                    }
                     let id = v.pointer("/params/requestId").and_then(Value::as_str);
                     let url = v.pointer("/params/request/url").and_then(Value::as_str);
                     // Keep only routing data, never post bodies.
@@ -223,6 +234,7 @@ impl Cdp {
                         .send(PausedRequest {
                             id: id.into(),
                             url: url.into(),
+                            session_id: event_session.map(str::to_string),
                             main_document,
                         })
                         .is_err()
@@ -282,6 +294,16 @@ impl Cdp {
     /// when it connects, so a name that changes its answer in between
     /// (DNS rebinding) is not caught.
     pub fn spawn_request_guard(&self, main_frame: String) -> RequestGuard {
+        self.spawn_request_guard_for_session(main_frame, None)
+    }
+
+    /// Like [`Self::spawn_request_guard`], scoped to an attached target's
+    /// `sessionId` (`Target.attachToTarget` with `flatten: true`).
+    pub fn spawn_request_guard_for_session(
+        &self,
+        main_frame: String,
+        session_id: Option<String>,
+    ) -> RequestGuard {
         let cdp = self.clone();
         let refusal = Arc::new(std::sync::Mutex::new(None));
         let refusal_task = Arc::clone(&refusal);
@@ -289,6 +311,7 @@ impl Cdp {
         let held = Arc::new(AtomicUsize::new(0));
         *self.guard_queue.lock().unwrap_or_else(|p| p.into_inner()) = Some(GuardInlet {
             main_frame,
+            session_id,
             requests: tx,
             held: Arc::clone(&held),
         });
@@ -322,7 +345,11 @@ impl Cdp {
                 }
             }
         });
-        RequestGuard { task, refusal }
+        RequestGuard {
+            task,
+            refusal,
+            guard_queue: Arc::clone(&self.guard_queue),
+        }
     }
 
     /// Check one paused request and answer it. `Err` only when the
@@ -357,7 +384,9 @@ impl Cdp {
                 )
             }
         };
-        let reply = self.exchange(None, method, params, 20).await?;
+        let reply = self
+            .exchange(request.session_id.as_deref(), method, params, 20)
+            .await?;
         // An error reply is how Chrome rejects a disposition for a
         // request it no longer holds ("Invalid InterceptionId." once the
         // page has cancelled it): nothing is left paused, so the guard

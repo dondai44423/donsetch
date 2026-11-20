@@ -49,6 +49,17 @@ impl BrowserResolution {
     }
 }
 
+/// Configured external CDP endpoint (`browser.cdp_url` / `DONSETCH_BROWSER__CDP_URL`),
+/// when set to a non-empty URL.
+pub fn configured_cdp_url() -> Option<String> {
+    let raw = crate::config::cfg().browser.cdp_url.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
 /// Resolve the installed Chromium-family binary.
 pub fn resolve_browser() -> Result<BrowserResolution, String> {
     resolve_browser_without_download()
@@ -686,19 +697,39 @@ const STDERR_LINE_BYTES: usize = 4096;
 /// stderr.
 const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// A throwaway headless browser. One per capture; killed on drop.
+enum SessionBackend {
+    Local {
+        child: tokio::process::Child,
+        profile: PathBuf,
+        /// Keeps the browser's stderr drained until the session ends.
+        _stderr: StderrTail,
+    },
+    Remote {
+        browser_context_id: Option<String>,
+        target_id: String,
+    },
+}
+
+/// A throwaway headless browser session — either a locally launched Chromium
+/// process (killed on close/drop) or an isolated incognito target attached over
+/// an external CDP endpoint (target + context disposed on close; never closes
+/// the external browser).
 pub struct HeadlessSession {
-    child: tokio::process::Child,
+    backend: SessionBackend,
     cdp: cdp::Cdp,
-    profile: PathBuf,
+    session_id: Option<String>,
     guard: Option<cdp::RequestGuard>,
-    /// Keeps the browser's stderr drained until the session ends.
-    _stderr: StderrTail,
 }
 
 impl HeadlessSession {
     pub fn cdp(&self) -> &cdp::Cdp {
         &self.cdp
+    }
+
+    /// Flattened CDP target `sessionId` when attached over a browser-level
+    /// WebSocket (`None` for a page-level WebSocket).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// From now until the session closes, each request the `Fetch`
@@ -711,19 +742,23 @@ impl HeadlessSession {
     /// prefetches, and the requests made inside a cross-site iframe or by
     /// a shared or service worker.
     pub async fn guard_requests(&mut self) -> Result<(), String> {
+        let sid = self.session_id.as_deref();
         let main_frame = self
             .cdp
-            .call(None, "Page.getFrameTree", json!({}))
+            .call(sid, "Page.getFrameTree", json!({}))
             .await
             .map_err(|e| e.to_string())?
             .pointer("/frameTree/frame/id")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| "the page reported no main frame".to_string())?;
-        self.guard = Some(self.cdp.spawn_request_guard(main_frame));
+        self.guard = Some(
+            self.cdp
+                .spawn_request_guard_for_session(main_frame, self.session_id.clone()),
+        );
         self.cdp
             .call(
-                None,
+                sid,
                 "Fetch.enable",
                 json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
             )
@@ -742,8 +777,9 @@ impl HeadlessSession {
 
     /// Navigate and wait until the main document is complete, bounded.
     pub async fn navigate(&self, url: &str) -> Result<(), String> {
+        let sid = self.session_id.as_deref();
         self.cdp
-            .call(None, "Page.navigate", json!({ "url": url }))
+            .call(sid, "Page.navigate", json!({ "url": url }))
             .await
             .map_err(|e| e.to_string())?;
         let started = std::time::Instant::now();
@@ -751,7 +787,7 @@ impl HeadlessSession {
             let ready = self
                 .cdp
                 .call(
-                    None,
+                    sid,
                     "Runtime.evaluate",
                     json!({
                         "expression": "document.readyState === 'complete' && location.href !== 'about:blank'",
@@ -785,7 +821,7 @@ impl HeadlessSession {
     pub async fn page_text(&self) -> Result<String, String> {
         self.cdp
             .call(
-                None,
+                self.session_id.as_deref(),
                 "Runtime.evaluate",
                 json!({
                     "expression": "document.body ? document.body.innerText : ''",
@@ -804,7 +840,7 @@ impl HeadlessSession {
     pub async fn current_url(&self) -> Option<String> {
         self.cdp
             .call(
-                None,
+                self.session_id.as_deref(),
                 "Runtime.evaluate",
                 json!({ "expression": "location.href", "returnByValue": true }),
             )
@@ -818,17 +854,55 @@ impl HeadlessSession {
             .filter(|u| u != "about:blank")
     }
 
-    /// Close the browser and remove its throwaway profile.
+    /// Close the local browser (and remove its throwaway profile) or dispose
+    /// the isolated remote target and browser context without shutting down
+    /// the external browser.
     pub async fn close(mut self) {
-        let _ = self.cdp.call(None, "Browser.close", json!({})).await;
-        if tokio::time::timeout(std::time::Duration::from_secs(6), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.start_kill();
-            let _ = self.child.wait().await;
+        // Detach the request guard before tearing down the target so trailing
+        // paused events cannot mark the link dead mid-cleanup.
+        self.guard = None;
+        match self.backend {
+            SessionBackend::Local {
+                mut child,
+                profile,
+                _stderr: _,
+            } => {
+                let _ = self.cdp.call(None, "Browser.close", json!({})).await;
+                if tokio::time::timeout(std::time::Duration::from_secs(6), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                let _ = std::fs::remove_dir_all(&profile);
+            }
+            SessionBackend::Remote {
+                browser_context_id,
+                target_id,
+            } => {
+                let _ = self
+                    .cdp
+                    .call_with_timeout(
+                        None,
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        5,
+                    )
+                    .await;
+                if let Some(ctx_id) = browser_context_id {
+                    let _ = self
+                        .cdp
+                        .call_with_timeout(
+                            None,
+                            "Target.disposeBrowserContext",
+                            json!({ "browserContextId": ctx_id }),
+                            5,
+                        )
+                        .await;
+                }
+            }
         }
-        let _ = std::fs::remove_dir_all(&self.profile);
     }
 }
 
@@ -897,12 +971,215 @@ async fn launch_headless_within(
         }
     };
     Ok(HeadlessSession {
-        child,
+        backend: SessionBackend::Local {
+            child,
+            profile,
+            _stderr: stderr,
+        },
         cdp,
-        profile,
+        session_id: None,
         guard: None,
-        _stderr: stderr,
     })
+}
+
+/// Rewrite a Chrome-reported `webSocketDebuggerUrl` (which often advertises
+/// `ws://127.0.0.1:9222/...` or `ws://localhost/...` inside Docker/NAS
+/// containers) onto the operator-configured `http(s)://` CDP endpoint's host,
+/// port, and WebSocket scheme.
+fn rewrite_remote_ws_url(discovered_ws: &str, base_http: &url::Url) -> Result<String, String> {
+    let mut ws = url::Url::parse(discovered_ws)
+        .map_err(|e| format!("external CDP returned invalid webSocketDebuggerUrl: {e}"))?;
+    let ws_scheme = if base_http.scheme() == "https" {
+        "wss"
+    } else {
+        "ws"
+    };
+    let _ = ws.set_scheme(ws_scheme);
+    let reported_host = ws.host_str().unwrap_or("").to_ascii_lowercase();
+    let is_loopback = matches!(
+        reported_host.as_str(),
+        "" | "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"
+    );
+    if is_loopback || ws.port_or_known_default() != base_http.port_or_known_default() {
+        if let Some(host) = base_http.host_str() {
+            ws.set_host(Some(host))
+                .map_err(|e| format!("external CDP host rewrite failed: {e}"))?;
+        }
+        ws.set_port(base_http.port())
+            .map_err(|_| "external CDP port rewrite failed".to_string())?;
+    }
+    Ok(ws.to_string())
+}
+
+/// Resolve an operator-configured `browser.cdp_url` (`http(s)://host:port` or
+/// `ws(s)://...`) to a DevTools WebSocket URL.
+async fn resolve_remote_ws_url(cdp_url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(cdp_url)
+        .map_err(|e| format!("invalid browser.cdp_url {cdp_url:?}: {e}"))?;
+    match parsed.scheme() {
+        "ws" | "wss" => Ok(cdp_url.to_string()),
+        "http" | "https" => {
+            let mut version_url = parsed.clone();
+            let path = version_url.path().trim_end_matches('/');
+            if !path.ends_with("/json/version") {
+                version_url.set_path(&format!("{path}/json/version"));
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .no_proxy()
+                .build()
+                .map_err(|e| format!("external CDP client: {e}"))?;
+            let resp =
+                client.get(version_url.as_str()).send().await.map_err(|e| {
+                    format!("external CDP /json/version failed: {}", e.without_url())
+                })?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "external CDP /json/version returned HTTP {}",
+                    resp.status().as_u16()
+                ));
+            }
+            let json: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("external CDP /json/version invalid JSON: {e}"))?;
+            let raw_ws = json
+                .get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "external CDP /json/version did not include webSocketDebuggerUrl".to_string()
+                })?;
+            rewrite_remote_ws_url(raw_ws, &parsed)
+        }
+        other => Err(format!(
+            "unsupported browser.cdp_url scheme {other:?} (use http, https, ws, or wss)"
+        )),
+    }
+}
+
+/// Attach an isolated, throwaway incognito page target on an external CDP
+/// browser (`browser.cdp_url`). No local Chrome binary is required; closing the
+/// returned session disposes only the created target and browser context.
+pub async fn connect_remote_cdp(cdp_url: &str) -> Result<HeadlessSession, String> {
+    let ws_url = resolve_remote_ws_url(cdp_url).await?;
+    let cdp = cdp::Cdp::connect(&ws_url)
+        .await
+        .map_err(|e| format!("external CDP connect: {e}"))?;
+    let browser_context_id = cdp
+        .call(
+            None,
+            "Target.createBrowserContext",
+            json!({ "disposeOnDetach": true }),
+        )
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("browserContextId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let mut create_params = json!({
+        "url": "about:blank",
+        "width": 1280,
+        "height": 800,
+    });
+    if let Some(ctx_id) = &browser_context_id {
+        create_params["browserContextId"] = json!(ctx_id);
+    }
+    let target_id = match cdp.call(None, "Target.createTarget", create_params).await {
+        Ok(v) => v
+            .get("targetId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "external CDP Target.createTarget returned no targetId".to_string()),
+        Err(e) => Err(format!("external CDP Target.createTarget: {e}")),
+    };
+    let target_id = match target_id {
+        Ok(id) => id,
+        Err(err) => {
+            if let Some(ctx_id) = &browser_context_id {
+                let _ = cdp
+                    .call_with_timeout(
+                        None,
+                        "Target.disposeBrowserContext",
+                        json!({ "browserContextId": ctx_id }),
+                        3,
+                    )
+                    .await;
+            }
+            return Err(err);
+        }
+    };
+    let session_id = match cdp
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await
+    {
+        Ok(v) => v
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "external CDP Target.attachToTarget returned no sessionId".to_string()),
+        Err(e) => Err(format!("external CDP Target.attachToTarget: {e}")),
+    };
+    let session_id = match session_id {
+        Ok(sid) => sid,
+        Err(err) => {
+            let _ = cdp
+                .call_with_timeout(
+                    None,
+                    "Target.closeTarget",
+                    json!({ "targetId": target_id }),
+                    3,
+                )
+                .await;
+            if let Some(ctx_id) = &browser_context_id {
+                let _ = cdp
+                    .call_with_timeout(
+                        None,
+                        "Target.disposeBrowserContext",
+                        json!({ "browserContextId": ctx_id }),
+                        3,
+                    )
+                    .await;
+            }
+            return Err(err);
+        }
+    };
+    let _ = cdp
+        .call(
+            Some(&session_id),
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": 1280,
+                "height": 800,
+                "deviceScaleFactor": 1,
+                "mobile": false
+            }),
+        )
+        .await;
+    Ok(HeadlessSession {
+        backend: SessionBackend::Remote {
+            browser_context_id,
+            target_id,
+        },
+        cdp,
+        session_id: Some(session_id),
+        guard: None,
+    })
+}
+
+/// Open a capture session: connects to `browser.cdp_url` when configured, or
+/// launches the locally installed Chromium binary otherwise.
+pub async fn open_capture_session() -> Result<HeadlessSession, String> {
+    if let Some(cdp_url) = configured_cdp_url() {
+        return connect_remote_cdp(&cdp_url).await;
+    }
+    let resolved = resolve_browser_without_download()?;
+    launch_headless(&resolved.path).await
 }
 
 /// The DevTools ws URL of the first page target (`/json/list`). Fails as
@@ -1082,10 +1359,7 @@ pub async fn capture_page_png(
     full_page: bool,
     wait_ms: u64,
 ) -> Result<(Vec<u8>, String), FetchError> {
-    let resolved = resolve_browser_without_download().map_err(FetchError::browser)?;
-    let mut session = launch_headless(&resolved.path)
-        .await
-        .map_err(FetchError::browser)?;
+    let mut session = open_capture_session().await.map_err(FetchError::browser)?;
     let result: Result<(Vec<u8>, String), String> = async {
         session.guard_requests().await?;
         session.navigate(url).await?;
@@ -1095,7 +1369,7 @@ pub async fn capture_page_png(
         let res = session
             .cdp()
             .call(
-                None,
+                session.session_id(),
                 "Page.captureScreenshot",
                 json!({ "format": "png", "captureBeyondViewport": full_page }),
             )
@@ -1467,11 +1741,14 @@ mod session_tests {
             .spawn()
             .unwrap();
         let session = HeadlessSession {
-            child,
+            backend: SessionBackend::Local {
+                child,
+                profile: PathBuf::new(),
+                _stderr: StderrTail::spawn(tokio::io::empty()),
+            },
             cdp,
-            profile: PathBuf::new(),
+            session_id: None,
             guard: None,
-            _stderr: StderrTail::spawn(tokio::io::empty()),
         };
         let started = Instant::now();
         let error = session.navigate("http://127.0.0.1/").await.unwrap_err();
@@ -1586,5 +1863,143 @@ mod launch_tests {
         assert_eq!(lines[0], "line 10");
         assert_eq!(lines[10], "x".repeat(STDERR_LINE_CHARS));
         assert_eq!(lines[11], "last \u{fffd} line without newline");
+    }
+
+    #[test]
+    fn remote_cdp_ws_rewrites_container_loopback_onto_configured_host() {
+        let base = url::Url::parse("http://192.168.1.50:9222").unwrap();
+        let rewritten =
+            rewrite_remote_ws_url("ws://127.0.0.1:9222/devtools/browser/abc-123", &base).unwrap();
+        assert_eq!(rewritten, "ws://192.168.1.50:9222/devtools/browser/abc-123");
+
+        let tls_base = url::Url::parse("https://nas.local:9443").unwrap();
+        let rewritten_tls =
+            rewrite_remote_ws_url("ws://localhost:9222/devtools/browser/xyz", &tls_base).unwrap();
+        assert_eq!(rewritten_tls, "wss://nas.local:9443/devtools/browser/xyz");
+    }
+
+    #[tokio::test]
+    async fn remote_cdp_session_isolates_context_guards_flattened_requests_and_never_closes_browser()
+     {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let saw_methods =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let saw_clone = std::sync::Arc::clone(&saw_methods);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(msg)) = ws.next().await {
+                let Message::Text(text) = msg else { continue };
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap().to_string();
+                let sid = req
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                saw_clone
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), sid.clone()));
+
+                let result = match method.as_str() {
+                    "Target.createBrowserContext" => json!({"browserContextId": "ctx-1"}),
+                    "Target.createTarget" => {
+                        assert_eq!(req["params"]["browserContextId"], "ctx-1");
+                        json!({"targetId": "tgt-1"})
+                    }
+                    "Target.attachToTarget" => {
+                        assert_eq!(req["params"]["flatten"], true);
+                        json!({"sessionId": "sid-1"})
+                    }
+                    "Emulation.setDeviceMetricsOverride" => {
+                        assert_eq!(sid.as_deref(), Some("sid-1"));
+                        json!({})
+                    }
+                    "Page.getFrameTree" => {
+                        assert_eq!(sid.as_deref(), Some("sid-1"));
+                        json!({"frameTree": {"frame": {"id": "frame-main"}}})
+                    }
+                    "Fetch.enable" => {
+                        assert_eq!(sid.as_deref(), Some("sid-1"));
+                        // Emit a paused request for a private IP on this flattened session;
+                        // the guard MUST reply with Fetch.failRequest carrying sessionId "sid-1".
+                        let paused = json!({
+                            "method": "Fetch.requestPaused",
+                            "sessionId": "sid-1",
+                            "params": {
+                                "requestId": "req-private",
+                                "frameId": "frame-main",
+                                "resourceType": "Document",
+                                "request": {"url": "http://127.0.0.1/secret"}
+                            }
+                        });
+                        ws.send(Message::Text(paused.to_string().into()))
+                            .await
+                            .unwrap();
+                        json!({})
+                    }
+                    "Fetch.failRequest" => {
+                        assert_eq!(sid.as_deref(), Some("sid-1"));
+                        assert_eq!(req["params"]["requestId"], "req-private");
+                        json!({})
+                    }
+                    "Target.closeTarget" => {
+                        assert_eq!(req["params"]["targetId"], "tgt-1");
+                        json!({"success": true})
+                    }
+                    "Target.disposeBrowserContext" => {
+                        assert_eq!(req["params"]["browserContextId"], "ctx-1");
+                        json!({})
+                    }
+                    "Browser.close" => panic!("external CDP close must NEVER call Browser.close"),
+                    _ => json!({}),
+                };
+                let reply = json!({"id": id, "result": result});
+                ws.send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut session = connect_remote_cdp(&format!("ws://{addr}/devtools/browser/test"))
+            .await
+            .expect("connect remote CDP");
+        assert_eq!(session.session_id(), Some("sid-1"));
+        session.guard_requests().await.expect("guard_requests");
+        // Wait briefly for the guard task to answer the paused private-IP request.
+        for _ in 0..40 {
+            if saw_methods
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(m, _)| m == "Fetch.failRequest")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            session.take_refusal().is_some(),
+            "flattened session guard must record main-document SSRF refusal"
+        );
+        session.close().await;
+        server.abort();
+
+        let methods: Vec<String> = saw_methods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect();
+        assert!(methods.contains(&"Fetch.failRequest".to_string()));
+        assert!(methods.contains(&"Target.closeTarget".to_string()));
+        assert!(methods.contains(&"Target.disposeBrowserContext".to_string()));
+        assert!(!methods.contains(&"Browser.close".to_string()));
     }
 }
