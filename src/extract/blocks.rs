@@ -296,7 +296,7 @@ fn walk<'a>(
                 );
             }
         }
-        "p" => {
+        "p" | "span" if name == "p" || is_para_span(el) => {
             let (md, ld) = inline::markdown(el, base, opts);
             if !md.is_empty() {
                 let md = card_link(md, card, false);
@@ -658,7 +658,12 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
                     buf.push('\u{0}');
                     continue;
                 }
-                if INLINE_TAGS.contains(&n) && !crate::extract::junk::skip(c) && !contains_block(c)
+                // A paragraph span is a block of its own: the walk emits
+                // it in source order, between its sibling blocks.
+                if INLINE_TAGS.contains(&n)
+                    && !is_para_span(c)
+                    && !crate::extract::junk::skip(c)
+                    && !contains_block(c)
                 {
                     let (md, _) = inline::element_markdown(c, base, opts);
                     // Newlines inside inline content are real line breaks
@@ -697,10 +702,21 @@ fn loose_text(el: ElementRef<'_>, base: &str, opts: &super::ExtractOptions) -> (
     (inline::collapse_to_markdown(&buf), ld)
 }
 
+/// True for a `<span data-as="p">`: a paragraph that some site generators
+/// (Mintlify docs) emit as a span instead of a `<p>`. It is a paragraph
+/// block everywhere a `<p>` is.
+pub(super) fn is_para_span(el: ElementRef<'_>) -> bool {
+    let e = el.value();
+    e.name() == "span" && e.attr("data-as") == Some("p")
+}
+
 /// True when an element has block-level descendants.
 fn contains_block(el: ElementRef<'_>) -> bool {
     let mut stack: Vec<ElementRef<'_>> = el.children().filter_map(ElementRef::wrap).collect();
     while let Some(node) = stack.pop() {
+        if is_para_span(node) {
+            return true;
+        }
         if matches!(
             node.value().name(),
             "h1" | "h2"

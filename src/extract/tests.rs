@@ -1130,6 +1130,79 @@ fn edge_div_soup() {
     assert!(r.markdown.contains("main content paragraph"));
 }
 
+/// Mintlify docs (code.claude.com/docs/en/hooks) write every paragraph as
+/// `<span data-as="p">`, a direct child of the content div beside its
+/// headings, lists and tables. Read as inline spans, all of them fused into
+/// one loose paragraph ahead of the first heading.
+const PARA_SPAN_PAGE: &str = r#"<html><body><main>
+<div id="content" class="mdx-content">
+<span data-as="p">Intro paragraph that explains what the hooks reference page covers in some detail.</span>
+<h2>Lifecycle</h2>
+<span data-as="p">Events fall into three cadences that the following list describes one by one.</span>
+<ul><li>per session events</li><li>per turn events</li></ul>
+<span data-as="p">First paragraph after the list, about how matchers select the events.</span>
+<span data-as="p">Second paragraph after the list, about how handlers receive their input.</span>
+<h2>Configuration</h2>
+<span data-as="p">Hooks are defined in JSON settings files with three levels of nesting.</span>
+</div>
+</main></body></html>"#;
+
+#[test]
+fn para_spans_keep_source_order() {
+    let md = extract_html(PARA_SPAN_PAGE).markdown;
+    let order = [
+        "Intro paragraph",
+        "## Lifecycle",
+        "Events fall into three cadences",
+        "per session events",
+        "First paragraph after the list",
+        "Second paragraph after the list",
+        "## Configuration",
+        "Hooks are defined in JSON",
+    ];
+    let pos: Vec<usize> = order
+        .iter()
+        .map(|s| {
+            md.find(s)
+                .unwrap_or_else(|| panic!("missing {s:?} in:\n{md}"))
+        })
+        .collect();
+    assert!(pos.windows(2).all(|w| w[0] < w[1]), "out of order:\n{md}");
+}
+
+#[test]
+fn para_spans_are_separate_paragraphs() {
+    let md = extract_html(PARA_SPAN_PAGE).markdown;
+    assert!(
+        md.contains("matchers select the events.\n\nSecond paragraph"),
+        "adjacent paragraph spans fused:\n{md}"
+    );
+}
+
+#[test]
+fn para_spans_inside_a_list_item_do_not_fuse() {
+    let html = r#"<html><body><main><div id="content">
+<span data-as="p">A list of steps follows, each with two paragraphs of explanation text.</span>
+<ul><li><span data-as="p">Step one ends here.</span><span data-as="p">Then step one continues.</span></li></ul>
+</div></main></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(md.contains("ends here. Then"), "words fused:\n{md}");
+}
+
+#[test]
+fn plain_spans_stay_inline() {
+    // Negative: a span without data-as="p" (or with another value) is still
+    // phrasing content of its container's loose paragraph.
+    let html = r#"<html><body><main><div id="content">
+<span>Loose text in a plain span,</span> <span data-as="label">joined with a labelled span,</span> and bare text that closes the same paragraph.
+</div></main></body></html>"#;
+    let md = extract_html(html).markdown;
+    assert!(
+        md.contains("plain span, joined with a labelled span, and bare text"),
+        "plain spans split:\n{md}"
+    );
+}
+
 #[test]
 fn edge_whitespace_only() {
     let html = "<html><body>   \n\n\n   </body></html>";
