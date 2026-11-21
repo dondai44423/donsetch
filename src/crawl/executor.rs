@@ -676,9 +676,14 @@ pub async fn execute(
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                 .map(|(_, v)| v.as_str())
-                .unwrap_or("text/html");
+                .unwrap_or("");
             if crate::fetch::guards::is_binary(&page.body, ctype) {
-                let kind = ctype.split(';').next().unwrap_or("unknown").trim();
+                let kind = ctype
+                    .split(';')
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown");
                 job.skipped
                     .push((row.url.clone(), format!("binary ({kind})")));
                 break 'fetch;

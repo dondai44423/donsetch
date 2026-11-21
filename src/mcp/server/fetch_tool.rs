@@ -1281,7 +1281,12 @@ async fn fetch_single_inner(
         // Binary content guard: images, video, audio, etc.
         // Don't pass binary bytes to extract (mojibake).
         if crate::fetch::guards::is_binary(&o.body, &ct) {
-            let kind = ct.split(';').next().unwrap_or("unknown").trim();
+            let kind = ct
+                .split(';')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
             return tool_error_structured(
                 format!(
                     "binary content: {url} returned {kind} ({} bytes) : not text, cannot extract",
