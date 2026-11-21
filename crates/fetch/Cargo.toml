@@ -22,7 +22,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 deno_core = "0.413"
 # WebCrypto for the engine: the BoringSSL bindings the TLS stack already links.
 btls = "=0.5.6"
-getrandom = "0.2"
+getrandom = "0.4"
 # Trust: the bundled Mozilla roots plus the OS's own store, as Chrome trusts it:
 # Windows' ROOT store, the macOS keychain, the Linux bundle, SSL_CERT_FILE /
 # SSL_CERT_DIR. Set on every client (`http::trust_roots`), not through wreq's
