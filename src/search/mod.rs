@@ -1544,11 +1544,15 @@ impl Searcher {
         }
 
         let mut engines: Vec<&str> = intent::engines_for(intent).to_vec();
-        if crate::config::cfg().search.parallel_mcp && !explicit_lang {
-            engines.insert(1.min(engines.len()), parallel_mcp::SOURCE);
-        }
-        if crate::config::cfg().search.keenable && !explicit_lang {
-            engines.insert(1.min(engines.len()), keenable::SOURCE);
+        if !explicit_lang {
+            let mut pos = 1.min(engines.len());
+            if crate::config::cfg().search.parallel_mcp {
+                engines.insert(pos, parallel_mcp::SOURCE);
+                pos += 1;
+            }
+            if crate::config::cfg().search.keenable {
+                engines.insert(pos, keenable::SOURCE);
+            }
         }
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
@@ -1639,6 +1643,9 @@ impl Searcher {
         let mut priority_sources = vec!["google-cse".to_string()];
         if live.contains(&parallel_mcp::SOURCE) {
             priority_sources.push(parallel_mcp::SOURCE.to_string());
+        }
+        if live.contains(&keenable::SOURCE) {
+            priority_sources.push(keenable::SOURCE.to_string());
         }
         // Authority cannot lift a source absent from the candidate pool.
         // Two scoped recalls join the initial wave, on an engine that honors
@@ -3656,7 +3663,10 @@ mod tests {
     /// "all engines failed" instead of reaching the network.
     fn bench_every_source(s: &Searcher, queries: &[&str]) {
         let mut failures = s.failures.lock().unwrap();
-        let engines = intent::engines_for(Intent::Web).iter().copied();
+        let engines = intent::engines_for(Intent::Web)
+            .iter()
+            .copied()
+            .chain([parallel_mcp::SOURCE, keenable::SOURCE]);
         for e in engines.map(engine_health_key) {
             failures.insert(e.to_string(), (3, Instant::now()));
         }

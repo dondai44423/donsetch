@@ -54,7 +54,7 @@ const HEALTH_DISK_VERSION: u32 = 1;
 /// available : a 429/CAPTCHA from DDG or Brave on a proxy
 /// is a wasted fan-out slot. Direct works for these engines
 /// because our residential IP isn't on blocklists.
-const PROXY_AVERSE: &[&str] = &["brave", "ddg", "parallel-mcp"];
+const PROXY_AVERSE: &[&str] = &["brave", "ddg", "parallel-mcp", "keenable"];
 
 /// Health is shared by DDG's primary and alternate endpoints. This is not
 /// ranking's index-family map: Bing and Yahoo keep their own egress health.

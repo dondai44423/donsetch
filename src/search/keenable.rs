@@ -1,9 +1,10 @@
 //! Keyless Keenable search through its public REST endpoint.
 //!
-//! Opt-in (`[search] keenable = true`). Sends one `POST` to
-//! `https://api.keenable.ai/v1/search/public` with no key, cookie or account,
-//! naming the client in `X-Keenable-Title` as the public endpoint requires.
-//! A 429 rests this lane in the ledger while the other engines answer.
+//! Enabled by default when `lang` is unset (`[search] keenable = false` to
+//! disable). Sends one `POST` to `https://api.keenable.ai/v1/search/public`
+//! with no key, cookie or account, naming the client in `X-Keenable-Title` as
+//! the public endpoint requires. A 429 rests this lane in the ledger while the
+//! other engines answer.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -25,7 +26,7 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const TITLE_HEADER: &str = "x-keenable-title";
 const TITLE: &str = "DonSeTch";
 const MAX_RESULTS: usize = 10;
-const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const DEFAULT_RETRY_SECS: u64 = 60;
 const RULE_DENIED_STATUS: &str = "invalid-config: excluded by the operator's local DonSeTch rules";
 
@@ -308,8 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn keenable_is_opt_in() {
-        assert!(!crate::config::DonsetchConfig::default().search.keenable);
+    fn keenable_is_enabled_by_default() {
+        assert!(crate::config::DonsetchConfig::default().search.keenable);
     }
 
     #[tokio::test]
