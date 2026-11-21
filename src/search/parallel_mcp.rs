@@ -619,7 +619,7 @@ fn parse_search_reply(mut reply: Value) -> Result<SearchPayload, WireError> {
         .map_err(|_| WireError::Other("invalid-response: bad text payload".into()))
 }
 
-fn evidence_text(text: &str, max_chars: usize) -> String {
+pub(super) fn evidence_text(text: &str, max_chars: usize) -> String {
     text.split_whitespace()
         .flat_map(|word| word.chars().chain(std::iter::once(' ')))
         .filter(|c| !c.is_control())

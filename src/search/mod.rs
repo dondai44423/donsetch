@@ -30,6 +30,7 @@ mod lane_cache;
 mod lang;
 pub(crate) mod ledger;
 pub use lang::{Lang, native_script};
+mod keenable;
 mod news;
 pub(crate) mod parallel_mcp;
 mod persist;
@@ -1545,6 +1546,9 @@ impl Searcher {
         let mut engines: Vec<&str> = intent::engines_for(intent).to_vec();
         if crate::config::cfg().search.parallel_mcp && !explicit_lang {
             engines.insert(1.min(engines.len()), parallel_mcp::SOURCE);
+        }
+        if crate::config::cfg().search.keenable && !explicit_lang {
+            engines.insert(1.min(engines.len()), keenable::SOURCE);
         }
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
