@@ -192,8 +192,11 @@ fn words_pattern(phrase: &str) -> String {
 struct Heading {
     level: u8,
     text: String,
-    /// Byte offset of the heading line.
+    /// Byte offset of the heading's opening line.
     start: usize,
+    /// Exclusive byte offset right after the heading's closing line (the ATX
+    /// line, or the underline line for a setext heading).
+    heading_end: usize,
     /// End of the section: the next heading of the same or a higher level.
     end: usize,
     /// Index of the enclosing heading.
@@ -204,14 +207,39 @@ struct Heading {
 struct Doc<'a> {
     text: &'a str,
     /// Where the body starts: after the source frontmatter (title, byline,
-    /// URL and description lines) when the document opens with one.
+    /// URL and description lines) or YAML frontmatter when the document opens
+    /// with one.
     body: usize,
     headings: Vec<Heading>,
 }
 
-fn is_fence(line: &str) -> bool {
-    let t = line.trim_start();
-    line.len() - t.len() <= 3 && (t.starts_with("```") || t.starts_with("~~~"))
+fn fence_open(line: &str) -> Option<(u8, usize)> {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 {
+        return None;
+    }
+    let first = *t.as_bytes().first()?;
+    if first != b'`' && first != b'~' {
+        return None;
+    }
+    let len = t.bytes().take_while(|&b| b == first).count();
+    if len < 3 {
+        return None;
+    }
+    // CommonMark §4.5: backtick fence info strings cannot contain backticks.
+    if first == b'`' && t[len..].contains('`') {
+        return None;
+    }
+    Some((first, len))
+}
+
+fn is_fence_close(line: &str, ch: u8, min_len: usize) -> bool {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 {
+        return false;
+    }
+    let len = t.bytes().take_while(|&b| b == ch).count();
+    len >= min_len && t[len..].bytes().all(|b| b == b' ' || b == b'\t')
 }
 
 fn heading_of(line: &str) -> Option<(u8, &str)> {
@@ -221,6 +249,164 @@ fn heading_of(line: &str) -> Option<(u8, &str)> {
     }
     let text = line[hashes..].trim().trim_end_matches('#').trim();
     (!text.is_empty()).then_some((hashes as u8, text))
+}
+
+/// CommonMark §4.3 setext heading underline: 0–3 leading spaces, one or more
+/// `=` (level 1) or `-` (level 2), and optional trailing spaces/tabs.
+fn setext_underline(line: &str) -> Option<u8> {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 {
+        return None;
+    }
+    let first = *t.as_bytes().first()?;
+    if first != b'=' && first != b'-' {
+        return None;
+    }
+    let run = t.bytes().take_while(|&b| b == first).count();
+    if !t[run..].bytes().all(|b| b == b' ' || b == b'\t') {
+        return None;
+    }
+    Some(if first == b'=' { 1 } else { 2 })
+}
+
+fn is_thematic_break(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 {
+        return false;
+    }
+    let Some(&ch) = t.as_bytes().first() else {
+        return false;
+    };
+    if !matches!(ch, b'-' | b'*' | b'_') {
+        return false;
+    }
+    let mut count = 0usize;
+    for b in t.bytes() {
+        if b == ch {
+            count += 1;
+        } else if b != b' ' && b != b'\t' {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+fn is_blockquote(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    line.len() - t.len() <= 3 && t.starts_with('>')
+}
+
+fn is_indented_code(line: &str) -> bool {
+    line.starts_with('\t') || line.starts_with("    ")
+}
+
+fn is_empty_list_marker(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 {
+        return false;
+    }
+    let trimmed = t.trim_end_matches([' ', '\t']);
+    if matches!(trimmed, "-" | "*" | "+") {
+        return true;
+    }
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && digits <= 9 && matches!(&trimmed[digits..], "." | ")")
+}
+
+fn is_link_ref_def(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 || !t.starts_with('[') {
+        return false;
+    }
+    t[1..].find("]:").is_some_and(|i| i > 0)
+}
+
+fn is_html_block_start(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    if line.len() - t.len() > 3 || !t.starts_with('<') {
+        return false;
+    }
+    if t.starts_with("<!--") || t.starts_with("<!") || t.starts_with("<?") {
+        return true;
+    }
+    let rest = t[1..].strip_prefix('/').unwrap_or(&t[1..]);
+    let tag_len = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
+    if tag_len == 0 {
+        return false;
+    }
+    let after = rest.as_bytes().get(tag_len).copied();
+    if !matches!(after, None | Some(b' ' | b'\t' | b'>' | b'/')) {
+        return false;
+    }
+    let tag = &rest[..tag_len];
+    const BLOCK_TAGS: &[&str] = &[
+        "address",
+        "article",
+        "aside",
+        "base",
+        "basefont",
+        "blockquote",
+        "body",
+        "caption",
+        "center",
+        "col",
+        "colgroup",
+        "dd",
+        "details",
+        "dialog",
+        "dir",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "frame",
+        "frameset",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "header",
+        "hr",
+        "html",
+        "iframe",
+        "legend",
+        "li",
+        "link",
+        "main",
+        "menu",
+        "menuitem",
+        "nav",
+        "noframes",
+        "ol",
+        "optgroup",
+        "option",
+        "p",
+        "param",
+        "pre",
+        "script",
+        "search",
+        "section",
+        "style",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "title",
+        "tr",
+        "track",
+        "ul",
+    ];
+    BLOCK_TAGS.iter().any(|b| b.eq_ignore_ascii_case(tag))
 }
 
 /// Markdown text without link targets: `[Title](https://...)` reads as
@@ -260,37 +446,104 @@ pub(crate) fn link_text(title: &str) -> String {
     out
 }
 
-/// Lines with their byte offsets (`\n` excluded, `\r` trimmed).
-fn lines_from(text: &str, from: usize) -> impl Iterator<Item = (usize, &str)> {
+/// Lines with their byte spans (`start`, exclusive `end` including `\n`, and
+/// the trimmed line text).
+fn lines_with_spans(text: &str, from: usize) -> impl Iterator<Item = (usize, usize, &str)> {
     let mut at = from;
     text[from..].split_inclusive('\n').map(move |raw| {
         let start = at;
         at += raw.len();
-        (start, raw.trim_end_matches(['\n', '\r']))
+        (start, at, raw.trim_end_matches(['\n', '\r']))
     })
+}
+
+/// Lines with their byte offsets (`\n` excluded, `\r` trimmed).
+fn lines_from(text: &str, from: usize) -> impl Iterator<Item = (usize, &str)> {
+    lines_with_spans(text, from).map(|(start, _, line)| (start, line))
 }
 
 impl<'a> Doc<'a> {
     fn parse(text: &'a str) -> Doc<'a> {
         let body = frontmatter_end(text);
         let mut headings: Vec<Heading> = Vec::new();
-        let mut fenced = false;
-        for (start, line) in lines_from(text, body) {
-            if is_fence(line) {
-                fenced = !fenced;
+        let mut fence: Option<(u8, usize)> = None;
+        let mut para: Option<(usize, Vec<&str>)> = None;
+        let mut block_open = false;
+        for (start, line_end, line) in lines_with_spans(text, body) {
+            if let Some((ch, min_len)) = fence {
+                if is_fence_close(line, ch, min_len) {
+                    fence = None;
+                }
                 continue;
             }
-            if fenced {
+            if let Some(opened) = fence_open(line) {
+                fence = Some(opened);
+                para = None;
+                block_open = false;
+                continue;
+            }
+            if line.trim().is_empty() {
+                para = None;
+                block_open = false;
+                continue;
+            }
+            if let Some(level) = setext_underline(line)
+                && let Some((pstart, plines)) = para.take()
+            {
+                let joined = plines.join(" ");
+                let title = link_text(joined.trim());
+                if !title.is_empty() {
+                    headings.push(Heading {
+                        level,
+                        text: title,
+                        start: pstart,
+                        heading_end: line_end,
+                        end: text.len(),
+                        parent: None,
+                    });
+                }
+                block_open = false;
                 continue;
             }
             if let Some((level, title)) = heading_of(line) {
+                para = None;
+                block_open = false;
                 headings.push(Heading {
                     level,
                     text: link_text(title),
                     start,
+                    heading_end: line_end,
                     end: text.len(),
                     parent: None,
                 });
+                continue;
+            }
+            if is_thematic_break(line) {
+                para = None;
+                block_open = false;
+                continue;
+            }
+            if is_blockquote(line)
+                || list_item(line).is_some()
+                || is_empty_list_marker(line)
+                || is_html_block_start(line)
+                || is_link_ref_def(line)
+            {
+                para = None;
+                block_open = true;
+                continue;
+            }
+            if para.is_none() && is_indented_code(line) {
+                block_open = true;
+                continue;
+            }
+            if block_open {
+                continue;
+            }
+            let trimmed = line.trim();
+            match &mut para {
+                Some((_, lines)) => lines.push(trimmed),
+                None => para = Some((start, vec![trimmed])),
             }
         }
         let mut open: Vec<usize> = Vec::new();
@@ -310,6 +563,15 @@ impl<'a> Doc<'a> {
             text,
             body,
             headings,
+        }
+    }
+
+    /// True when `at` is the byte offset of a line belonging to a heading
+    /// (either an ATX line or a setext heading's text or underline line).
+    fn is_heading_line(&self, at: usize) -> bool {
+        match self.headings.partition_point(|h| h.start <= at) {
+            0 => false,
+            n => at < self.headings[n - 1].heading_end,
         }
     }
 
@@ -334,22 +596,89 @@ impl<'a> Doc<'a> {
     }
 }
 
-/// The source frontmatter ends at the first blank line, when the opening
-/// block names the source URL; otherwise there is none.
-fn frontmatter_end(text: &str) -> usize {
-    let Some(blank) = text.find("\n\n") else {
-        return 0;
+/// True when `line` looks like a top-level YAML mapping key (`key: ...`).
+fn is_yaml_key_line(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
     };
-    let head = &text[..blank];
-    if head
-        .lines()
-        .any(|l| l.starts_with("http://") || l.starts_with("https://"))
-        && head.lines().count() <= 8
-    {
-        blank + 2
-    } else {
-        0
+    if key.is_empty() {
+        return false;
     }
+    let unquoted = key
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| key.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(key);
+    !unquoted.is_empty()
+        && unquoted
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// If `text[from..]` opens with YAML frontmatter (`---` ... `---` / `...`),
+/// return the byte offset right after its closing delimiter line; else `from`.
+fn yaml_frontmatter_end(text: &str, from: usize) -> usize {
+    let mut lines = lines_with_spans(text, from);
+    let Some((_, _, first)) = lines.next() else {
+        return from;
+    };
+    if first.trim_end_matches([' ', '\t']) != "---" {
+        return from;
+    }
+    let mut saw_content = false;
+    let mut first_body = true;
+    for (_, line_end, line) in lines {
+        let trimmed_end = line.trim_end_matches([' ', '\t']);
+        if trimmed_end == "---" || trimmed_end == "..." {
+            return line_end;
+        }
+        if first_body && line.trim().is_empty() {
+            // A blank line immediately after `---` is a thematic break, not YAML.
+            return from;
+        }
+        first_body = false;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if !saw_content {
+                return from;
+            }
+            continue;
+        }
+        if line.starts_with('#') || line.starts_with("- ") || trimmed_end == "-" {
+            saw_content = true;
+            continue;
+        }
+        if is_yaml_key_line(line) {
+            saw_content = true;
+            continue;
+        }
+        return from;
+    }
+    from
+}
+
+/// The source frontmatter ends at the first blank line, when the opening
+/// block names the source URL; YAML frontmatter (`---` ... `---`) at the top
+/// of a markdown document is skipped too.
+fn frontmatter_end(text: &str) -> usize {
+    let at = match text.find("\n\n") {
+        Some(blank) => {
+            let head = &text[..blank];
+            if head
+                .lines()
+                .any(|l| l.starts_with("http://") || l.starts_with("https://"))
+                && head.lines().count() <= 8
+            {
+                blank + 2
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
+    yaml_frontmatter_end(text, at)
 }
 
 fn size_label(chars: usize) -> String {
@@ -488,7 +817,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
     let mut list_indent: Option<usize> = None;
     let mut table_head: Option<String> = None;
     let mut table_id = 0usize;
-    let mut fence: Option<(usize, String, Vec<&str>)> = None;
+    let mut fence: Option<(usize, String, u8, usize, Vec<&str>)> = None;
 
     let flush = |cur: &mut Option<(usize, String)>, out: &mut Vec<Passage>| {
         if let Some((start, text)) = cur.take()
@@ -504,14 +833,15 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
     };
 
     for (start, line) in lines_from(&doc.text[..hi], lo) {
-        if let Some((fstart, open, body)) = fence.as_mut() {
-            if is_fence(line) {
+        if let Some((fstart, open, ch, min_len, body)) = fence.as_mut() {
+            if is_fence_close(line, *ch, *min_len) {
                 let section = doc.section_at(*fstart);
+                let close: String = std::iter::repeat_n(*ch as char, *min_len).collect();
                 if body.len() > CODE_SPLIT_LINES {
                     for (k, window) in body.chunks(CODE_WINDOW).enumerate() {
                         out.push(Passage {
                             start: *fstart + k,
-                            text: format!("{open}\n{}\n```", window.join("\n")),
+                            text: format!("{open}\n{}\n{close}", window.join("\n")),
                             section,
                             table: None,
                         });
@@ -519,7 +849,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
                 } else {
                     out.push(Passage {
                         start: *fstart,
-                        text: format!("{open}\n{}\n```", body.join("\n")),
+                        text: format!("{open}\n{}\n{close}", body.join("\n")),
                         section,
                         table: None,
                     });
@@ -530,14 +860,14 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
             }
             continue;
         }
-        if is_fence(line) {
+        if let Some((ch, min_len)) = fence_open(line) {
             flush(&mut cur, &mut out);
             list_indent = None;
             table_head = None;
-            fence = Some((start, line.trim().to_string(), Vec::new()));
+            fence = Some((start, line.trim().to_string(), ch, min_len, Vec::new()));
             continue;
         }
-        if line.trim().is_empty() || heading_of(line).is_some() {
+        if line.trim().is_empty() || doc.is_heading_line(start) {
             flush(&mut cur, &mut out);
             list_indent = None;
             table_head = None;
@@ -586,7 +916,7 @@ fn passages(doc: &Doc, lo: usize, hi: usize) -> Vec<Passage> {
             None => cur = Some((start, line.to_string())),
         }
     }
-    if let Some((fstart, open, body)) = fence {
+    if let Some((fstart, open, _, _, body)) = fence {
         // An unclosed fence still carries its code.
         out.push(Passage {
             start: fstart,
@@ -2363,5 +2693,190 @@ alpha alpha alpha alpha\n\n## B\n\nthe zebra crossed the road once\n\n## C\n\nun
             None,
         );
         assert!(r.text.contains("×1000+"), "{}", &r.text[..200]);
+    }
+
+    #[test]
+    fn setext_headings_populate_toc_section_and_focus_paths() {
+        let md = "\
+Project
+=======
+
+Intro text about the project.
+
+Install
+-------
+
+Run the installer with curl or npm.
+
+Usage
+-----
+
+Call the tool from your terminal.
+";
+        let doc = Doc::parse(md);
+        let levels: Vec<(u8, &str)> = doc
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        assert_eq!(levels, [(1, "Project"), (2, "Install"), (2, "Usage")]);
+        assert_eq!(doc.path(1), "Project › Install");
+        assert_eq!(doc.path(2), "Project › Usage");
+
+        let toc = render(
+            md,
+            &View {
+                toc: true,
+                ..view()
+            },
+            None,
+        );
+        assert_eq!(toc.status, "outline");
+        assert!(toc.text.contains("- [s1] Project · "), "{}", toc.text);
+        assert!(toc.text.contains("  - [s2] Install · "), "{}", toc.text);
+        assert!(toc.text.contains("  - [s3] Usage · "), "{}", toc.text);
+
+        let sec = render(
+            md,
+            &View {
+                section: Some("Install".into()),
+                ..view()
+            },
+            None,
+        );
+        assert!(sec.text.contains("Run the installer"), "{}", sec.text);
+        assert!(!sec.text.contains("Call the tool"), "{}", sec.text);
+
+        // Focus attaches the setext heading path and never emits the setext
+        // title/underline lines as a prose passage.
+        let p = source_passages(md);
+        assert!(
+            p.iter()
+                .any(|(path, body)| path == "Project › Install"
+                    && body.contains("Run the installer")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .all(|(_, body)| !body.contains("-------") && !body.contains("=======")),
+            "setext underlines must not become passages: {p:?}"
+        );
+    }
+
+    #[test]
+    fn setext_headings_support_multiline_links_and_mixed_atx() {
+        let md = "\
+[Guide](https://example.com/guide)
+Overview
+========
+
+Lead paragraph.
+
+Setup
+-----
+
+### Substep
+
+Nested detail.
+";
+        let doc = Doc::parse(md);
+        let levels: Vec<(u8, &str)> = doc
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        assert_eq!(
+            levels,
+            [(1, "Guide Overview"), (2, "Setup"), (3, "Substep")]
+        );
+        assert_eq!(doc.path(2), "Guide Overview › Setup › Substep");
+    }
+
+    #[test]
+    fn setext_negative_cases_do_not_create_false_headings() {
+        let md = "\
+---
+title: Real Document
+author: Jane Doe
+tags:
+  - rust
+---
+
+Intro paragraph.
+
+---
+
+- list item one
+---
+
+1. ordered item
+---
+
+> quoted line
+---
+
+> quoted line
+lazy continuation
+---
+
+# Real ATX Heading
+---
+
+    indented code
+---
+
+```markdown
+Fake Heading
+============
+
+Also Fake
+---------
+```
+
+Real Setext
+-----------
+
+Body under real setext.
+---
+---
+";
+        let doc = Doc::parse(md);
+        let names: Vec<(u8, &str)> = doc
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        // Only the ATX heading and the real setext heading survive;
+        // YAML frontmatter, horizontal rules, list/quote/indented-code/fenced
+        // blocks and consecutive underlines are ignored.
+        // Note: "Body under real setext.\n---" IS a CommonMark §4.3 setext
+        // heading because there is no blank line before `---`; separate that
+        // in the next assertion.
+        assert_eq!(
+            names,
+            [
+                (1, "Real ATX Heading"),
+                (2, "Real Setext"),
+                (2, "Body under real setext."),
+            ]
+        );
+    }
+
+    #[test]
+    fn leading_horizontal_rule_is_not_swallowed_as_yaml_frontmatter() {
+        let md = "\
+---
+
+Intro Heading
+=============
+
+Body text.
+
+---
+";
+        let doc = Doc::parse(md);
+        assert_eq!(doc.body, 0);
+        let names: Vec<&str> = doc.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(names, ["Intro Heading"]);
     }
 }
