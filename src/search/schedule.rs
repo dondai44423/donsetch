@@ -2,7 +2,7 @@
 
 use super::{EngineResult, TaskFut, families, rank};
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 fn independently_answered(
@@ -26,22 +26,25 @@ fn independently_answered(
     })
 }
 
-fn failed_initial(outcomes: &[(String, EngineResult)]) -> bool {
-    outcomes.iter().any(|(name, result)| {
-        if rank::is_vertical(super::engine_name(name)) {
-            return false;
-        }
-        match result {
-            Ok(answer) => !answer.class.credits() || answer.hits.is_empty(),
-            Err((status, _, engine_lane)) => {
-                *engine_lane
-                    && !matches!(
-                        status.split(':').next().unwrap_or(status),
-                        "not-asked" | "rested" | "budget-skipped" | "pacing-timeout"
-                    )
+fn failed_initial_count(outcomes: &[(String, EngineResult)]) -> usize {
+    outcomes
+        .iter()
+        .filter(|(name, result)| {
+            if rank::is_vertical(super::engine_name(name)) {
+                return false;
             }
-        }
-    })
+            match result {
+                Ok(answer) => !answer.class.credits() || answer.hits.is_empty(),
+                Err((status, _, engine_lane)) => {
+                    *engine_lane
+                        && !matches!(
+                            status.split(':').next().unwrap_or(status),
+                            "not-asked" | "rested" | "budget-skipped" | "pacing-timeout"
+                        )
+                }
+            }
+        })
+        .count()
 }
 
 pub(super) async fn run<'a>(
@@ -52,8 +55,10 @@ pub(super) async fn run<'a>(
     news: bool,
     priority: &[String],
 ) -> (Vec<(String, EngineResult)>, Vec<String>) {
-    // Keep the fourth general engine in reserve. Its request is already inside
-    // the planner's ceiling; starting it spends no extra request allowance.
+    // Keep general engines beyond the initial 3-engine wave in an ordered
+    // reserve queue. When the initial 3 answer cleanly, reserves spend zero
+    // requests; when any active lane fails or returns thin/off-query, the next
+    // healthy reserve fires immediately.
     let engines: Vec<_> = lanes
         .iter()
         .enumerate()
@@ -75,17 +80,40 @@ pub(super) async fn run<'a>(
         .copied()
         .filter(|i| !priority.contains(&lanes[*i].0))
         .collect();
-    // Reserve a measured duplicate before delaying the only planned source in
+    let reserve_target = engines.len().saturating_sub(3);
+    let mut chosen: Vec<usize> = Vec::with_capacity(reserve_target);
+    // Reserve measured duplicates before delaying the only planned source in
     // another ranking family. Unknown suppliers are never hard-coded as peers.
-    let hedge_index = eligible
-        .iter()
-        .copied()
-        .find(|&i| family_counts[&rank::family_name(families, super::engine_name(&lanes[i].0))] > 1)
-        .or_else(|| eligible.first().copied());
-    let mut hedge = match hedge_index {
-        Some(index) if engines.len() >= 4 => Some(lanes.remove(index)),
-        _ => None,
-    };
+    for &i in &eligible {
+        if chosen.len() >= reserve_target {
+            break;
+        }
+        let fam = rank::family_name(families, super::engine_name(&lanes[i].0));
+        if family_counts.get(&fam).copied().unwrap_or(0) > 1 {
+            chosen.push(i);
+            *family_counts.entry(fam).or_default() -= 1;
+        }
+    }
+    for &i in &eligible {
+        if chosen.len() >= reserve_target {
+            break;
+        }
+        if !chosen.contains(&i) {
+            chosen.push(i);
+        }
+    }
+    // Remove highest indices first so Vec::remove doesn't shift earlier ones,
+    // then reverse so reserves fire highest-ranked first.
+    chosen.sort_unstable_by(|a, b| b.cmp(a));
+    let mut removed: Vec<(usize, (String, TaskFut<'a>))> = chosen
+        .into_iter()
+        .map(|idx| (idx, lanes.remove(idx)))
+        .collect();
+    removed.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut reserves: VecDeque<(String, TaskFut<'a>)> =
+        removed.into_iter().map(|(_, lane)| lane).collect();
+    let mut reserves_launched = 0usize;
+    let mut soft_hedged = false;
     let start = tokio::time::Instant::now();
     let soft = start + super::stage_budget(super::FANOUT_SOFT_MARK, Duration::from_millis(300));
     let hard = start + super::stage_budget(super::FANOUT_HARD_MARK, Duration::from_millis(200));
@@ -130,14 +158,26 @@ pub(super) async fn run<'a>(
         if now >= hard {
             break;
         }
-        if (now >= soft || futures.is_empty() || failed_initial(&outcomes))
-            && let Some((name, future)) = hedge.take()
-        {
+        while !reserves.is_empty() {
+            let need_failover = failed_initial_count(&outcomes) > reserves_launched;
+            let need_soft = !soft_hedged && (now >= soft || futures.is_empty());
+            if !need_failover && !need_soft {
+                break;
+            }
             if !independently_answered(&outcomes, families) {
-                *pending.entry(name).or_default() += 1;
-                futures.push(future);
+                if let Some((name, future)) = reserves.pop_front() {
+                    *pending.entry(name).or_default() += 1;
+                    futures.push(future);
+                    reserves_launched += 1;
+                    if !need_failover {
+                        soft_hedged = true;
+                    }
+                }
             } else {
-                outcomes.push((name, Err(("not-asked".into(), "hedge".into(), false))));
+                while let Some((name, _)) = reserves.pop_front() {
+                    outcomes.push((name, Err(("not-asked".into(), "hedge".into(), false))));
+                }
+                break;
             }
         }
         if futures.is_empty() {
@@ -171,7 +211,7 @@ pub(super) async fn run<'a>(
             Err(_) => continue,
         }
     }
-    if let Some((name, _)) = hedge {
+    while let Some((name, _)) = reserves.pop_front() {
         outcomes.push((name, Err(("not-asked".into(), "hedge".into(), false))));
     }
     let mut late: Vec<_> = pending
@@ -385,5 +425,56 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].0, "brave");
         assert_eq!(late.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multiple_failures_promote_multiple_reserves_in_order() {
+        let start = tokio::time::Instant::now();
+        let starts = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut lanes = Vec::new();
+        for name in ["google-cse", "keenable", "exa-mcp", "parallel-mcp", "bing"] {
+            let starts = std::sync::Arc::clone(&starts);
+            let future: TaskFut<'_> = Box::pin(async move {
+                starts.lock().unwrap().insert(name, start.elapsed());
+                match name {
+                    "google-cse" => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        (
+                            name.into(),
+                            Err(("rate-limited:60".into(), "direct".into(), true)),
+                        )
+                    }
+                    "keenable" => {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        (
+                            name.into(),
+                            Err(("blocked:403".into(), "direct".into(), true)),
+                        )
+                    }
+                    _ => {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        (name.into(), Err(("late".into(), "direct".into(), true)))
+                    }
+                }
+            });
+            lanes.push((name.into(), future));
+        }
+        let _ = run(
+            lanes,
+            vec![],
+            &Default::default(),
+            false,
+            false,
+            &["google-cse".into(), "keenable".into(), "exa-mcp".into()],
+        )
+        .await;
+        let starts = starts.lock().unwrap();
+        // Both reserves must promote promptly in priority order before the soft mark.
+        assert!(
+            starts["parallel-mcp"] < Duration::from_millis(100),
+            "{starts:?}"
+        );
+        assert!(starts["bing"] < Duration::from_millis(100), "{starts:?}");
+        assert!(starts["parallel-mcp"] <= starts["bing"], "{starts:?}");
     }
 }

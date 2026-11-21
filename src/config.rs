@@ -144,6 +144,9 @@ section!(SearchSection {
     /// Include Keenable's keyless public search endpoint for searches without
     /// a language override. Set false to disable.
     keenable: bool = true,
+    /// Include Exa's keyless public MCP search endpoint for searches without
+    /// a language override. Set false to disable.
+    exa_mcp: bool = true,
     /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
@@ -1733,6 +1736,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
             FieldKind::Bool,
             "true",
             "include Keenable's keyless public search endpoint for searches without a language override (set false to disable)",
+        ),
+        (
+            "search",
+            "exa_mcp",
+            FieldKind::Bool,
+            "true",
+            "include Exa's keyless public MCP search endpoint for searches without a language override (set false to disable)",
         ),
         (
             "search",

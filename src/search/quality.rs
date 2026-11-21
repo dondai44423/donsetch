@@ -45,7 +45,9 @@ pub struct Assessment {
 
 impl Assessment {
     pub fn degraded(self) -> bool {
-        self.confidence == Confidence::Low || self.families < 2 || self.junk_ratio > 0.2
+        // Tolerate 1 discarded off-query lane out of 3+ attempted (<= 0.34)
+        // when at least two independent families answered cleanly.
+        self.confidence == Confidence::Low || self.families < 2 || self.junk_ratio > 0.34
     }
 }
 
@@ -97,7 +99,7 @@ pub(crate) fn assess(
         && measured_agreement
         && agreement >= 2
         && coverage >= 0.45
-        && junk_ratio <= 0.2
+        && junk_ratio <= 0.34
     {
         Confidence::High
     } else {

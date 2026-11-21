@@ -28,7 +28,13 @@ const TITLE: &str = "DonSeTch";
 const MAX_RESULTS: usize = 10;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const DEFAULT_RETRY_SECS: u64 = 60;
+const LOW_QUOTA_WATERMARK: u64 = 15;
+const LOW_QUOTA_COOLDOWN_SECS: u64 = 60;
 const RULE_DENIED_STATUS: &str = "invalid-config: excluded by the operator's local DonSeTch rules";
+
+/// Proactive soft cooldown triggered when `X-RateLimit-Remaining` drops below
+/// `LOW_QUOTA_WATERMARK`, shifting load to peer engines before hitting a 429.
+static LOW_QUOTA_UNTIL: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(Default::default);
 
 #[cfg(test)]
 tokio::task_local! {
@@ -142,6 +148,18 @@ async fn post_search(
     if !status.is_success() {
         return Err(format!("blocked:{}", status.as_u16()));
     }
+    if let Some(remaining) = resp
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        && remaining <= LOW_QUOTA_WATERMARK
+    {
+        *LOW_QUOTA_UNTIL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Instant::now() + Duration::from_secs(LOW_QUOTA_COOLDOWN_SECS));
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -226,6 +244,14 @@ pub(super) async fn task(
         }
         if crate::fetch::guards::validate_url_basic(ENDPOINT).is_err() {
             return Err(RULE_DENIED_STATUS.into());
+        }
+        if let Some(until) = *LOW_QUOTA_UNTIL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && let Some(rem) = until.checked_duration_since(Instant::now())
+            && !rem.is_zero()
+        {
+            return Err(format!("rested:{}", rem.as_secs().max(1)));
         }
         context.pool.pace(SOURCE, &lane).await;
         let proxy = request_proxy(proxy.as_ref())?;

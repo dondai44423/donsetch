@@ -30,6 +30,7 @@ mod lane_cache;
 mod lang;
 pub(crate) mod ledger;
 pub use lang::{Lang, native_script};
+mod exa_mcp;
 mod keenable;
 mod news;
 pub(crate) mod parallel_mcp;
@@ -541,6 +542,9 @@ pub struct Searcher {
     google: engines::google_wml::ProfileSelector,
     cse: cse::Client,
     parallel_mcp: parallel_mcp::Client,
+    /// Round-robin cursor spreading primary slots across healthy Tier-1
+    /// keyless engines so no single upstream bears 100% of query load.
+    tier1_cursor: std::sync::atomic::AtomicUsize,
     /// engine -> trust EWMA (1.0 seed; 0.2..2.0 clamp).
     /// Persisted to disk: an engine that learned "this walled me"
     /// keeps that memory across daemon restarts instead of
@@ -709,6 +713,7 @@ impl Searcher {
             google: engines::google_wml::ProfileSelector::from_env(),
             cse: cse::Client::load(),
             parallel_mcp: parallel_mcp::Client::load(),
+            tier1_cursor: std::sync::atomic::AtomicUsize::new(0),
             trust: Mutex::new(trust),
             trust_intent: Mutex::new(trust_intent),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -1543,17 +1548,39 @@ impl Searcher {
             });
         }
 
-        let mut engines: Vec<&str> = intent::engines_for(intent).to_vec();
-        if !explicit_lang {
-            let mut pos = 1.min(engines.len());
-            if crate::config::cfg().search.parallel_mcp {
-                engines.insert(pos, parallel_mcp::SOURCE);
-                pos += 1;
+        let base_engines = intent::engines_for(intent);
+        let engines: Vec<&str> = if explicit_lang {
+            base_engines.to_vec()
+        } else {
+            let cfg = crate::config::cfg();
+            let mut tier1: Vec<&str> = Vec::with_capacity(4);
+            if base_engines.contains(&"google-cse") {
+                tier1.push("google-cse");
             }
-            if crate::config::cfg().search.keenable {
-                engines.insert(pos, keenable::SOURCE);
+            if cfg.search.keenable {
+                tier1.push(keenable::SOURCE);
             }
-        }
+            if cfg.search.exa_mcp {
+                tier1.push(exa_mcp::SOURCE);
+            }
+            if cfg.search.parallel_mcp {
+                tier1.push(parallel_mcp::SOURCE);
+            }
+            if tier1.len() > 1 {
+                let shift = self
+                    .tier1_cursor
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % tier1.len();
+                tier1.rotate_left(shift);
+            }
+            let mut ordered = tier1;
+            for &e in base_engines {
+                if !ordered.contains(&e) {
+                    ordered.push(e);
+                }
+            }
+            ordered
+        };
         // C2: compile operators once; each engine gets the form it
         // actually honors (DDG lite strips site: so BM25 is not
         // polluted with the literal token).
@@ -1623,7 +1650,10 @@ impl Searcher {
                     .copied()
                     .unwrap_or(1.0)
             };
-            live.sort_by(|a, b| score(b).total_cmp(&score(a)));
+            // Bucket trust into coarse 0.15 bands so healthy Tier-1 peers keep
+            // their load-spreading rotation order while degraded lanes drop behind.
+            let band = |e: &str| (score(e) / 0.15).floor() as i64;
+            live.sort_by_key(|a| std::cmp::Reverse(band(a)));
         }
         // ── Adaptive fan-out width: the governor. Under
         // stress the system shrinks its appetite instead of
@@ -1640,12 +1670,22 @@ impl Searcher {
             .iter()
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
-        let mut priority_sources = vec!["google-cse".to_string()];
-        if live.contains(&parallel_mcp::SOURCE) {
-            priority_sources.push(parallel_mcp::SOURCE.to_string());
-        }
-        if live.contains(&keenable::SOURCE) {
-            priority_sources.push(keenable::SOURCE.to_string());
+        // Only mark the initial active wave (first 3 lanes) as priority so
+        // additional healthy Tier-1 engines stay eligible for the reserve queue.
+        let mut priority_sources: Vec<String> = live
+            .iter()
+            .take(3)
+            .copied()
+            .filter(|e| {
+                matches!(
+                    *e,
+                    "google-cse" | parallel_mcp::SOURCE | keenable::SOURCE | exa_mcp::SOURCE
+                )
+            })
+            .map(String::from)
+            .collect();
+        if priority_sources.is_empty() {
+            priority_sources.push("google-cse".to_string());
         }
         // Authority cannot lift a source absent from the candidate pool.
         // Two scoped recalls join the initial wave, on an engine that honors
@@ -1964,7 +2004,7 @@ impl Searcher {
             // served by another general index than by a third vertical.
             let vert_cap = if intent == Intent::Paper { 3 } else { 2 };
             let room = match class {
-                0 => engines_kept < 4,
+                0 => engines_kept < 5,
                 1 => verticals_kept < vert_cap,
                 2 => news_kept < 2,
                 _ => guesses_kept < 1,
@@ -3663,10 +3703,11 @@ mod tests {
     /// "all engines failed" instead of reaching the network.
     fn bench_every_source(s: &Searcher, queries: &[&str]) {
         let mut failures = s.failures.lock().unwrap();
-        let engines = intent::engines_for(Intent::Web)
-            .iter()
-            .copied()
-            .chain([parallel_mcp::SOURCE, keenable::SOURCE]);
+        let engines = intent::engines_for(Intent::Web).iter().copied().chain([
+            parallel_mcp::SOURCE,
+            keenable::SOURCE,
+            exa_mcp::SOURCE,
+        ]);
         for e in engines.map(engine_health_key) {
             failures.insert(e.to_string(), (3, Instant::now()));
         }

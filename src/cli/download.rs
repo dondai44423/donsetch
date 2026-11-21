@@ -561,13 +561,13 @@ async fn attempt_parallel(
         .collect();
     let next_chunk = Arc::new(AtomicUsize::new(0));
     let mut join_set = tokio::task::JoinSet::new();
-    for worker_idx in 0..worker_count {
+    for (worker_got_cell, _) in &lane_bytes {
         let client = client.clone();
         let url = active_url.clone();
         let accept = accept.map(str::to_string);
         let stall = policy.stall;
         let delivered = Arc::clone(&delivered);
-        let worker_got = Arc::clone(&lane_bytes[worker_idx].0);
+        let worker_got = Arc::clone(worker_got_cell);
         let segments = Arc::clone(&segments);
         let slots = Arc::clone(&slots);
         let next_chunk = Arc::clone(&next_chunk);
@@ -725,12 +725,12 @@ async fn attempt(
     client: &reqwest::Client,
     route: &Route,
     source: &Source,
-    route_label: &str,
     buf: &mut Vec<u8>,
     policy: &Policy,
     patient: bool,
     progress: &mut impl FnMut(Progress<'_>),
 ) -> Result<Attempt, String> {
+    let route_label = route.label.as_str();
     let (url, accept) = source.resolve(client).await?;
     // Parallel ranges first: a single stream is throttled per connection on some
     // networks, and that is the shape that made upgrades crawl.
@@ -853,7 +853,6 @@ pub(crate) async fn download(
                     &client,
                     route,
                     source,
-                    &route.label,
                     &mut buf,
                     policy,
                     patient,
@@ -1198,7 +1197,6 @@ mod tests {
             &client,
             &direct(),
             &url("direct", url_text),
-            "direct",
             &mut buf,
             &policy,
             false,
