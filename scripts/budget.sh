@@ -61,17 +61,18 @@ avail_mb=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/nul
 case "$avail_mb" in
     ''|*[!0-9]*) avail_mb=0 ;;
 esac
-mem_jobs=0
-# ~700 MB per rustc with codegen-units=16 and opt-level 1 deps (measured on
-# this tree). The old 1.2 GB estimate was sized for 256-unit codegen, where
-# one crate could fan out into every core and several GB; that shape is gone.
-if [ "$avail_mb" -gt 1000 ]; then
-    mem_jobs=$(( (avail_mb - 1000) / 700 ))
-fi
-[ "$mem_jobs" -lt 1 ] && mem_jobs=1
-
 default_jobs=$core_jobs
-[ "$mem_jobs" -lt "$core_jobs" ] && default_jobs=$mem_jobs
+# ~700 MB per rustc with codegen-units=16 and opt-level 1 deps (measured on
+# this tree). Only cap by RAM when /proc/meminfo reported MemAvailable (Linux);
+# on macOS and Windows Git Bash keep the core count instead of throttling to 1.
+if [ "$avail_mb" -gt 0 ]; then
+    mem_jobs=1
+    if [ "$avail_mb" -gt 1000 ]; then
+        mem_jobs=$(( (avail_mb - 1000) / 700 ))
+    fi
+    [ "$mem_jobs" -lt 1 ] && mem_jobs=1
+    [ "$mem_jobs" -lt "$default_jobs" ] && default_jobs=$mem_jobs
+fi
 
 cores="${BG_CORES:-0-$(( core_jobs - 1 ))}"
 jobs="${BG_JOBS:-$default_jobs}"
@@ -120,4 +121,13 @@ if command -v sccache >/dev/null 2>&1; then
     fi
 fi
 
-exec nice -n 19 ionice -c3 taskset -c "$cores" "$@"
+if command -v taskset >/dev/null 2>&1; then
+    set -- taskset -c "$cores" "$@"
+fi
+if command -v ionice >/dev/null 2>&1; then
+    set -- ionice -c3 "$@"
+fi
+if command -v nice >/dev/null 2>&1; then
+    set -- nice -n 19 "$@"
+fi
+exec "$@"
