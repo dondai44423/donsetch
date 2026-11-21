@@ -160,7 +160,7 @@ impl Client {
         {
             return Ok(existing);
         }
-        let mut builder = HttpClient::builder()
+        let mut builder = crate::egress::trust::with_trusted_roots(HttpClient::builder())
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))

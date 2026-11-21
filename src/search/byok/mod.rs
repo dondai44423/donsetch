@@ -275,7 +275,7 @@ impl ByokSearcher {
     /// search() returns Err("not configured") and the caller
     /// falls back to local.
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(2)
@@ -578,7 +578,7 @@ const GOTO_BATCH_BUDGET: Duration = Duration::from_secs(4);
 /// Build a cookie-less, redirect-disabled HTTP client for resolving one
 /// opaque `/goto` link (honors DonSeTch's proxy configuration).
 fn goto_client_for(url: &str) -> Option<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
         .timeout(GOTO_REQ_TIMEOUT)

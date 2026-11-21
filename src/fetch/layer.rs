@@ -465,7 +465,7 @@ fn add_configured_roots() {
     });
 }
 
-fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
+pub(crate) fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     if !file.is_empty() {
         paths.push(file.into());

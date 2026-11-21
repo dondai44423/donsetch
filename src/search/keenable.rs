@@ -71,7 +71,7 @@ fn http_client(proxy: Option<&crate::egress::proxy::Proxy>) -> Result<HttpClient
     {
         return Ok(existing);
     }
-    let mut builder = HttpClient::builder()
+    let mut builder = crate::egress::trust::with_trusted_roots(HttpClient::builder())
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
@@ -433,6 +433,143 @@ mod tests {
         assert_eq!(
             answer.hits[0].published.as_deref(),
             Some("2026-11-12T00:00:00Z")
+        );
+    }
+
+    /// A TLS-inspecting HTTP proxy on loopback: answers one `CONNECT`, then
+    /// terminates the tunnel with `cert` (self-signed for `api.keenable.ai`)
+    /// and answers one search. The handle yields whether the client finished
+    /// the handshake.
+    async fn inspecting_proxy(
+        cert: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    ) -> (crate::egress::proxy::Proxy, tokio::task::JoinHandle<bool>) {
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(
+                    cert.cert.der().to_vec(),
+                )],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(rustls_pki_types::PrivatePkcs8KeyDer::from(
+                    cert.signing_key.serialize_der(),
+                )),
+            )
+            .unwrap();
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = crate::egress::proxy::Proxy::parse(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(socket.read_u8().await.unwrap());
+            }
+            assert!(head.starts_with(b"CONNECT api.keenable.ai:443 "));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let Ok(mut tls) = acceptor.accept(socket).await else {
+                return false;
+            };
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(tls.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            tls.read_exact(&mut body).await.unwrap();
+            let payload = json!({ "results": [{
+                "url": "https://docs.rs/tokio/latest/tokio/macro.select.html",
+                "title": "select in tokio - Rust",
+                "snippet": "Waits on multiple concurrent branches."
+            }]})
+            .to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            tls.write_all(reply.as_bytes()).await.unwrap();
+            let _ = tls.shutdown().await;
+            true
+        });
+        (proxy, server)
+    }
+
+    async fn search_through(proxy: crate::egress::proxy::Proxy) -> EngineResult {
+        let harness = Harness::new();
+        let (_, res) = task(
+            "tokio select macro".into(),
+            "direct".into(),
+            Some(proxy),
+            harness.context(),
+            Duration::from_secs(5),
+        )
+        .await;
+        res
+    }
+
+    // #467: behind a TLS-inspecting proxy the owner's `[tls] cert_file` root
+    // must reach this client, as it reaches fetch. Installs the config, so
+    // it relies on nextest's process per test.
+    #[tokio::test]
+    async fn keenable_trusts_the_configured_ca_behind_an_inspecting_proxy() {
+        let cert = rcgen::generate_simple_self_signed(vec!["api.keenable.ai".into()]).unwrap();
+        let bundle = crate::paths::cache_dir().join("inspecting-proxy-ca.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        let mut config = crate::config::DonsetchConfig::default();
+        config.state.no_disk_state = true;
+        config.proxy.from_environment = false;
+        config.tls.cert_file = bundle.to_string_lossy().into_owned();
+        crate::config::install(config).unwrap();
+        let (proxy, server) = inspecting_proxy(&cert).await;
+        let answer = search_through(proxy)
+            .await
+            .expect("the configured root is trusted");
+        assert!(server.await.unwrap());
+        assert_eq!(answer.hits.len(), 1);
+    }
+
+    // #467, the reporter's setup: the root arrives through SSL_CERT_FILE.
+    // Sets a process-wide variable, so it relies on nextest's process per test.
+    #[tokio::test]
+    async fn keenable_trusts_ssl_cert_file_behind_an_inspecting_proxy() {
+        install_test_config();
+        let cert = rcgen::generate_simple_self_signed(vec!["api.keenable.ai".into()]).unwrap();
+        let bundle = crate::paths::cache_dir().join("inspecting-proxy-env-ca.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        unsafe { std::env::set_var("SSL_CERT_FILE", &bundle) };
+        let (proxy, server) = inspecting_proxy(&cert).await;
+        let answer = search_through(proxy)
+            .await
+            .expect("the SSL_CERT_FILE root is trusted");
+        assert!(server.await.unwrap());
+        assert_eq!(answer.hits.len(), 1);
+    }
+
+    // The extra roots add trust, they do not switch verification off: an
+    // inspecting proxy whose root nobody configured is still refused.
+    #[tokio::test]
+    async fn keenable_refuses_an_unconfigured_inspecting_proxy() {
+        install_test_config();
+        let cert = rcgen::generate_simple_self_signed(vec!["api.keenable.ai".into()]).unwrap();
+        let (proxy, server) = inspecting_proxy(&cert).await;
+        let (status, _, _) = search_through(proxy).await.unwrap_err();
+        assert!(status.starts_with("transport:"), "{status}");
+        assert!(
+            !server.await.unwrap(),
+            "no request crosses an untrusted tunnel"
         );
     }
 
