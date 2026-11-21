@@ -149,9 +149,16 @@ pub(crate) fn configured_routes() -> Vec<Route> {
 }
 
 fn client_for(route: &Route, policy: &Policy) -> Result<reqwest::Client, String> {
+    // Force HTTP/1.1 with TCP_NODELAY so the 8 parallel range workers open 8
+    // independent TCP connections instead of multiplexing onto one HTTP/2
+    // socket with hyper's 64 KiB default stream window (which caps throughput
+    // at ~250 KB/s on high-RTT links).
     let mut builder = reqwest::Client::builder()
         .user_agent(concat!("donsetch-update/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(policy.connect)
+        .http1_only()
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(PARALLEL_CHUNKS + 2)
         .redirect(reqwest::redirect::Policy::limited(8));
     builder = match &route.proxy {
         Some(url) => builder.proxy(reqwest::Proxy::all(url).map_err(|e| format!("proxy: {e}"))?),
@@ -159,6 +166,183 @@ fn client_for(route: &Route, policy: &Policy) -> Result<reqwest::Client, String>
         None => builder.no_proxy(),
     };
     builder.build().map_err(|e| e.to_string())
+}
+
+/// When GitHub's release redirect points to `release-assets.githubusercontent.com`
+/// (Fastly proxy), its `jwt` query token names the underlying Azure Blob host
+/// (`"path": "releaseassetproduction.blob.core.windows.net"`) alongside the
+/// signed SAS query string. On ISPs with congested Fastly peering, fetching
+/// directly from that official Azure Blob origin can be 10–30× faster while
+/// carrying the exact same signed asset (still SHA-256 verified by the caller).
+fn direct_azure_blob_url(resolved: &str) -> Option<String> {
+    use base64::Engine as _;
+    let parsed = url::Url::parse(resolved).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("release-assets.githubusercontent.com")
+    {
+        return None;
+    }
+    let jwt = parsed
+        .query_pairs()
+        .find_map(|(k, v)| (k == "jwt").then(|| v.into_owned()))?;
+    let payload_b64 = jwt.split('.').nth(1)?.trim_end_matches('=');
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let blob_host = payload.get("path")?.as_str()?;
+    // Strict allowlist: only official Azure Blob hostnames, never arbitrary hosts.
+    if !blob_host.ends_with(".blob.core.windows.net")
+        || blob_host.len() <= ".blob.core.windows.net".len()
+        || !blob_host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+    {
+        return None;
+    }
+    let mut direct = parsed;
+    direct.set_host(Some(blob_host)).ok()?;
+    Some(direct.into())
+}
+
+fn no_redirect_client_for(route: &Route, policy: &Policy) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("donsetch-update/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(policy.connect)
+        .http1_only()
+        .tcp_nodelay(true)
+        .redirect(reqwest::redirect::Policy::none());
+    builder = match &route.proxy {
+        Some(url) => builder.proxy(reqwest::Proxy::all(url).map_err(|e| format!("proxy: {e}"))?),
+        None if route.from_environment => builder,
+        None => builder.no_proxy(),
+    };
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Follow up to a few 3xx hops on `github.com` / `api.github.com` without ever
+/// connecting to `release-assets.githubusercontent.com` first, so we get the
+/// signed redirect target in ~500 ms instead of waiting for a throttled Fastly
+/// handshake before racing the direct Azure Blob origin.
+async fn peek_github_redirect(
+    route: &Route,
+    policy: &Policy,
+    url: &str,
+    accept: Option<&str>,
+) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "github.com" && host != "api.github.com" {
+        return None;
+    }
+    let client = no_redirect_client_for(route, policy).ok()?;
+    let mut current = url.to_string();
+    let timeout = policy.connect.min(Duration::from_secs(8));
+    for _ in 0..4 {
+        let mut req = client.head(&current);
+        if let Some(accept) = accept {
+            req = req.header("Accept", accept);
+        }
+        let resp = tokio::time::timeout(timeout, req.send()).await.ok()?.ok()?;
+        if !resp.status().is_redirection() {
+            return None;
+        }
+        let loc = resp.headers().get("location")?.to_str().ok()?;
+        let next = url::Url::parse(&current).ok()?.join(loc).ok()?;
+        let next_str = next.to_string();
+        if direct_azure_blob_url(&next_str).is_some() {
+            return Some(next_str);
+        }
+        current = next_str;
+    }
+    None
+}
+
+async fn fetch_probe_slice(
+    client: &reqwest::Client,
+    url: &str,
+    accept: Option<&str>,
+    from: u64,
+    to_inclusive: u64,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Option<u64>), String> {
+    let want = (to_inclusive - from + 1) as usize;
+    let mut req = client
+        .get(url)
+        .header("Range", format!("bytes={from}-{to_inclusive}"));
+    if let Some(accept) = accept {
+        req = req.header("Accept", accept);
+    }
+    let mut resp = tokio::time::timeout(timeout, req.send())
+        .await
+        .map_err(|_| "probe timeout".to_string())?
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if status != 206 {
+        return Err(format!("probe HTTP {status}"));
+    }
+    let total = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(total_from_content_range);
+    let expected = total
+        .map(|t| (t.saturating_sub(from) as usize).min(want))
+        .unwrap_or(want);
+    let mut out = Vec::with_capacity(expected);
+    while out.len() < expected {
+        match tokio::time::timeout(timeout, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                let take = chunk.len().min(expected - out.len());
+                out.extend_from_slice(&chunk[..take]);
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("probe stall".into()),
+        }
+    }
+    if out.len() == expected {
+        Ok((out, total))
+    } else {
+        Err(format!("short probe: {} of {expected} bytes", out.len()))
+    }
+}
+
+/// Race a small 256 KiB ranged probe across `primary` (Fastly CDN) and `alt`
+/// (direct Azure Blob origin). Whichever completes the slice first wins both
+/// the route, the total asset length, and the already-fetched bytes so nothing
+/// is wasted.
+async fn race_fastest_origin(
+    client: &reqwest::Client,
+    primary: &str,
+    alt: &str,
+    accept: Option<&str>,
+    start: u64,
+    total_hint: Option<u64>,
+    timeout: Duration,
+) -> (String, Option<(Vec<u8>, Option<u64>)>) {
+    let probe_end = match total_hint {
+        Some(total) => (start + 256 * 1024).min(total).saturating_sub(1),
+        None => start + 256 * 1024 - 1,
+    };
+    let f_primary = Box::pin(fetch_probe_slice(
+        client, primary, accept, start, probe_end, timeout,
+    ));
+    let f_alt = Box::pin(fetch_probe_slice(
+        client, alt, accept, start, probe_end, timeout,
+    ));
+    match futures_util::future::select(f_primary, f_alt).await {
+        futures_util::future::Either::Left((Ok(res), _)) => (primary.to_string(), Some(res)),
+        futures_util::future::Either::Right((Ok(res), _)) => (alt.to_string(), Some(res)),
+        futures_util::future::Either::Left((Err(_), other)) => match other.await {
+            Ok(res) => (alt.to_string(), Some(res)),
+            Err(_) => (primary.to_string(), None),
+        },
+        futures_util::future::Either::Right((Err(_), other)) => match other.await {
+            Ok(res) => (primary.to_string(), Some(res)),
+            Err(_) => (primary.to_string(), None),
+        },
+    }
 }
 
 enum Attempt {
@@ -245,7 +429,7 @@ async fn fetch_segment(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend_from_slice(&chunk[..take]);
                 got += take;
-                lane_got.store(got as u64, Ordering::Relaxed);
+                lane_got.fetch_add(take as u64, Ordering::Relaxed);
                 delivered.fetch_add(take as u64, Ordering::Relaxed);
             }
             if got >= want {
@@ -263,6 +447,7 @@ async fn fetch_segment(
 #[allow(clippy::too_many_arguments)]
 async fn attempt_parallel(
     client: &reqwest::Client,
+    route: &Route,
     url: &str,
     accept: Option<&str>,
     route_label: &str,
@@ -273,35 +458,86 @@ async fn attempt_parallel(
 ) -> Result<Parallel, String> {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
-    let start = buf.len() as u64;
-    let mut probe = client.get(url).header("Range", format!("bytes={start}-"));
-    if let Some(accept) = accept {
-        probe = probe.header("Accept", accept);
-    }
-    let response = probe.send().await.map_err(|e| e.to_string())?;
-    let total = match response.status().as_u16() {
-        206 => response
-            .headers()
-            .get("content-range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(total_from_content_range),
-        // A server that ignores the Range answers 200: stream it instead.
-        200 => None,
-        other => return Err(format!("HTTP {other}")),
+    let mut start = buf.len() as u64;
+
+    // Fast path for GitHub releases: read the 302 Location from github.com
+    // without touching Fastly first, then race Fastly vs the signed Azure Blob
+    // origin for the first 256 KiB (and total length) in one round trip.
+    let (active_url, total) = if let Some(fastly_url) =
+        peek_github_redirect(route, policy, url, accept).await
+        && let Some(azure_url) = direct_azure_blob_url(&fastly_url)
+    {
+        let probe_timeout = policy.connect.min(Duration::from_secs(10));
+        let (winner, prefetched) = race_fastest_origin(
+            client,
+            &fastly_url,
+            &azure_url,
+            None,
+            start,
+            None,
+            probe_timeout,
+        )
+        .await;
+        if let Some((bytes, Some(total))) = prefetched {
+            buf.extend_from_slice(&bytes);
+            start = buf.len() as u64;
+            progress(Progress {
+                bytes: buf.len(),
+                total: Some(total),
+                lanes: None,
+                route: route_label,
+            });
+            if start >= total {
+                return Ok(Parallel::Done);
+            }
+            (winner, total)
+        } else {
+            return Ok(Parallel::Unsupported);
+        }
+    } else {
+        // Generic path: 1-byte ranged probe resolves redirects once and reads
+        // Content-Range without triggering a full-file transfer we would drop.
+        let mut probe = client
+            .get(url)
+            .header("Range", format!("bytes={start}-{start}"));
+        if let Some(accept) = accept {
+            probe = probe.header("Accept", accept);
+        }
+        let response = probe.send().await.map_err(|e| e.to_string())?;
+        let resolved_url = response.url().to_string();
+        let total = match response.status().as_u16() {
+            206 => response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(total_from_content_range),
+            // A server that ignores the Range answers 200: stream it instead.
+            200 => None,
+            other => return Err(format!("HTTP {other}")),
+        };
+        drop(response);
+        let Some(total) = total else {
+            return Ok(Parallel::Unsupported);
+        };
+        if total <= start {
+            return Ok(Parallel::Done);
+        }
+        if start == 0 && total - start < PARALLEL_FLOOR {
+            return Ok(Parallel::Unsupported);
+        }
+        (resolved_url, total)
     };
-    let Some(total) = total else {
-        return Ok(Parallel::Unsupported);
+
+    let remaining = total - start;
+    // Split large assets into ~2.5–5 MiB chunks across 8 persistent HTTP/1.1
+    // workers: large enough for TCP cwnd ramp-up, small enough for work stealing.
+    let chunk = if remaining >= 8 * 1024 * 1024 {
+        (remaining / 16).clamp(2 * 1024 * 1024, 5 * 1024 * 1024)
+    } else {
+        (remaining / PARALLEL_CHUNKS as u64).max(256 * 1024)
     };
-    drop(response);
-    if total <= start {
-        return Ok(Parallel::Done);
-    }
-    if start == 0 && total - start < PARALLEL_FLOOR {
-        return Ok(Parallel::Unsupported);
-    }
-    let chunk = ((total - start) / PARALLEL_CHUNKS as u64).max(256 * 1024);
     let mut segments = Vec::new();
     let mut at = start;
     while at < total {
@@ -309,37 +545,57 @@ async fn attempt_parallel(
         segments.push((at, end));
         at = end;
     }
+    let segments = Arc::new(segments);
     let begun = Instant::now();
     let delivered = Arc::new(AtomicU64::new(0));
-    let mut slots: Vec<Arc<Mutex<Vec<u8>>>> = Vec::with_capacity(segments.len());
-    let mut lane_bytes: Vec<(Arc<AtomicU64>, u64)> = Vec::with_capacity(segments.len());
+    let slots: Arc<Vec<Arc<Mutex<Vec<u8>>>>> = Arc::new(
+        segments
+            .iter()
+            .map(|&(from, to)| Arc::new(Mutex::new(Vec::with_capacity((to - from) as usize))))
+            .collect(),
+    );
+    let worker_count = PARALLEL_CHUNKS.min(segments.len());
+    let share = (remaining / worker_count.max(1) as u64).max(1);
+    let lane_bytes: Vec<(Arc<AtomicU64>, u64)> = (0..worker_count)
+        .map(|_| (Arc::new(AtomicU64::new(0)), share))
+        .collect();
+    let next_chunk = Arc::new(AtomicUsize::new(0));
     let mut join_set = tokio::task::JoinSet::new();
-    for (idx, &(from, to)) in segments.iter().enumerate() {
-        let want_u64 = to.saturating_sub(from);
-        let want = want_u64 as usize;
-        let slot = Arc::new(Mutex::new(Vec::with_capacity(want)));
-        let lane_got = Arc::new(AtomicU64::new(0));
-        slots.push(Arc::clone(&slot));
-        lane_bytes.push((Arc::clone(&lane_got), want_u64.max(1)));
+    for worker_idx in 0..worker_count {
         let client = client.clone();
-        let url = url.to_string();
+        let url = active_url.clone();
         let accept = accept.map(str::to_string);
         let stall = policy.stall;
         let delivered = Arc::clone(&delivered);
+        let worker_got = Arc::clone(&lane_bytes[worker_idx].0);
+        let segments = Arc::clone(&segments);
+        let slots = Arc::clone(&slots);
+        let next_chunk = Arc::clone(&next_chunk);
         join_set.spawn(async move {
-            (
-                idx,
-                fetch_segment(
+            let mut failed: Option<(usize, String)> = None;
+            loop {
+                let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                if idx >= segments.len() {
+                    break;
+                }
+                let range = segments[idx];
+                let slot = Arc::clone(&slots[idx]);
+                let res = fetch_segment(
                     &client,
                     &url,
                     accept.as_deref(),
-                    (from, to),
+                    range,
                     stall,
                     slot,
-                    (delivered, lane_got),
+                    (Arc::clone(&delivered), Arc::clone(&worker_got)),
                 )
-                .await,
-            )
+                .await;
+                if let Err(err) = res {
+                    failed = Some((idx, err));
+                    break;
+                }
+            }
+            failed
         });
     }
 
@@ -375,8 +631,8 @@ async fn attempt_parallel(
         tokio::select! {
             joined = join_set.join_next() => {
                 match joined {
-                    Some(Ok((idx, Err(err)))) => errors[idx] = Some(err),
-                    Some(Ok((_idx, Ok(())))) => {}
+                    Some(Ok(Some((idx, err)))) => errors[idx] = Some(err),
+                    Some(Ok(None)) => {}
                     Some(Err(err)) => {
                         if !err.is_cancelled() {
                             errors[0].get_or_insert_with(|| err.to_string());
@@ -467,6 +723,7 @@ async fn attempt_parallel(
 
 async fn attempt(
     client: &reqwest::Client,
+    route: &Route,
     source: &Source,
     route_label: &str,
     buf: &mut Vec<u8>,
@@ -479,6 +736,7 @@ async fn attempt(
     // networks, and that is the shape that made upgrades crawl.
     match attempt_parallel(
         client,
+        route,
         &url,
         accept,
         route_label,
@@ -593,6 +851,7 @@ pub(crate) async fn download(
                 };
                 match attempt(
                     &client,
+                    route,
                     source,
                     &route.label,
                     &mut buf,
@@ -900,6 +1159,7 @@ mod tests {
         let mut saw_lanes = false;
         let outcome = attempt_parallel(
             &client,
+            &direct(),
             &url_text,
             None,
             "direct",
@@ -936,6 +1196,7 @@ mod tests {
         let mut buf = Vec::new();
         let outcome = attempt(
             &client,
+            &direct(),
             &url("direct", url_text),
             "direct",
             &mut buf,
@@ -985,5 +1246,64 @@ mod tests {
             "fast route should resume after the contiguous prefix kept from segment 0"
         );
         assert!(notes.iter().any(|n| n.contains("too slow")), "{notes:?}");
+    }
+
+    #[test]
+    fn direct_azure_blob_url_extracts_verified_blob_host_only() {
+        use base64::Engine as _;
+        let encode = |json: &str| {
+            format!(
+                "eyJ0eXAiOiJKV1QifQ.{}.sig",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes())
+            )
+        };
+        let valid_jwt = encode(r#"{"path":"releaseassetproduction.blob.core.windows.net"}"#);
+        let fastly = format!(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sp=r&jwt={valid_jwt}"
+        );
+        assert_eq!(
+            direct_azure_blob_url(&fastly).as_deref(),
+            Some(
+                format!(
+                    "https://releaseassetproduction.blob.core.windows.net/github-production-release-asset/1/2?sp=r&jwt={valid_jwt}"
+                )
+                .as_str()
+            )
+        );
+
+        // Negative: non-Azure host in JWT path must be rejected.
+        let evil_jwt = encode(r#"{"path":"evil.example.com"}"#);
+        let evil_url = format!("https://release-assets.githubusercontent.com/a/b?jwt={evil_jwt}");
+        assert_eq!(direct_azure_blob_url(&evil_url), None);
+
+        // Negative: unrelated CDN host is untouched.
+        assert_eq!(
+            direct_azure_blob_url(&format!("https://example.com/a/b?jwt={valid_jwt}")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn race_fastest_origin_picks_faster_server_and_keeps_bytes() {
+        let body: Arc<Vec<u8>> = Arc::new((0..512_000u32).map(|i| (i % 251) as u8).collect());
+        let (slow, _) = serve(body.clone(), 4096, Duration::from_millis(30), false).await;
+        let (fast, _) = serve(body.clone(), 64 * 1024, Duration::ZERO, false).await;
+        let policy = fast_policy();
+        let client = client_for(&direct(), &policy).unwrap();
+        let (winner, res) = race_fastest_origin(
+            &client,
+            &slow,
+            &fast,
+            None,
+            0,
+            Some(body.len() as u64),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(winner, fast);
+        let (bytes, total) = res.expect("winning origin returns prefetched slice");
+        assert_eq!(total, Some(body.len() as u64));
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert_eq!(&bytes[..], &body[..256 * 1024]);
     }
 }
