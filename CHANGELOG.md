@@ -2,9 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Keyless Keenable search enabled by default (`keenable`, #463).** Searches without an explicit `lang` now include Keenable's public REST search endpoint (`https://api.keenable.ai/v1/search/public`) alongside `google-cse`, `parallel-mcp`, `bing`, `ddg`, `yahoo`, `brave`, and `yandex`. Sends one stateless `POST` with no key or cookies, names the client in `X-Keenable-Title: DonSeTch`, passes `published_at` and rich snippets into fusion/ranking, and rests cleanly in the ledger on HTTP 429 (keyless tier: 1,000 requests/hour per IP). Disable anytime with `[search] keenable = false` (`DONSETCH_SEARCH__KEENABLE=false`) or a `[rules.url]` deny rule on `api.keenable.ai`.
+
 ### Fixed
 
-- **Mintlify docs keep their paragraphs in page order.** Mintlify renders every paragraph as `<span data-as="p">`, a sibling of the headings, lists, tables and code blocks around it. Read as inline spans, all of a container's paragraphs fused into one loose paragraph emitted ahead of its first block, so `code.claude.com/docs` and `mintlify.com/docs` pages opened with one unbroken wall of prose, their sections held only lists, tables and code, and text around a code block in a Steps component was joined across it. Such a span is now a paragraph block wherever a `<p>` is: it is emitted in source order, stays a separate paragraph, and breaks words apart inside a list item.
+- **Mintlify docs keep their paragraphs in page order (#465).** Mintlify renders every paragraph as `<span data-as="p">`, a sibling of the headings, lists, tables and code blocks around it. Read as inline spans, all of a container's paragraphs fused into one loose paragraph emitted ahead of its first block, so `code.claude.com/docs` and `mintlify.com/docs` pages opened with one unbroken wall of prose, their sections held only lists, tables and code, and text around a code block in a Steps component was joined across it. Such a span is now a paragraph block wherever a `<p>` is: it is emitted in source order, stays a separate paragraph, and breaks words apart inside a list item.
+- **Setext markdown headings work with `toc`, `section`, and `focus` (#464).** `Doc::parse` now recognizes CommonMark level-1 (`===`) and level-2 (`---`) setext headings while skipping leading YAML frontmatter and guarding against false positives from horizontal rules, lists, blockquotes, ATX headings, HTML blocks, and fenced/indented code; `passages()` skips setext heading and underline lines so they are never emitted as duplicate prose.
+- **Bodies with no `Content-Type` sniff HTML instead of flattening markdown/plain text (#466).** Responses omitting `Content-Type` now preserve line structure, headings, code blocks, and angle-bracket generics as plain text unless the body opens with an HTML document root (`<!doctype html>`, `<html>`, `<head>`, or `<body>` after optional BOM/whitespace/comments), in both `web_fetch` and `web_crawl`.
+- **Offline search tests and cross-platform build wrapper.** Isolated `search::tests::bench_every_source` from live `parallel-mcp` and `keenable` requests, and guarded Linux-only `nice`/`ionice`/`taskset` and `/proc/meminfo` caps in `scripts/budget.sh` so `just` recipes work natively on macOS and Windows Git Bash.
 
 ## [5.5.8] - 2026-11-20
 
