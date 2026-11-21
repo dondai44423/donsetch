@@ -320,6 +320,9 @@ async fn post_json(
     body: Value,
 ) -> Result<Response, WireError> {
     let req = apply_headers(client.post(endpoint), protocol_version, session_id)?;
+    if !crate::fetch::layer::record_external_request() {
+        return Err(WireError::Other("budget-skipped".into()));
+    }
     let resp = req
         .json(&body)
         .send()

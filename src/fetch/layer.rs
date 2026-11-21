@@ -92,6 +92,30 @@ tokio::task_local! {
 
 pub(crate) type OriginGuard = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
+/// Account for one outbound HTTP exchange performed outside `donsetch-fetch`
+/// (e.g. `parallel-mcp` and `keenable` reqwest calls) against the active
+/// search's total and per-source request counters. Returns `false` if the
+/// scoped `REQUEST_LIMIT` has already been reached.
+pub(crate) fn record_external_request() -> bool {
+    use std::sync::atomic::Ordering;
+    let total = REQUEST_COUNT.try_with(Arc::clone).ok();
+    let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();
+    let limit = REQUEST_LIMIT.try_with(|limit| *limit).unwrap_or(usize::MAX);
+    if let Some(total) = &total
+        && total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < limit).then(|| used + 1)
+            })
+            .is_err()
+    {
+        return false;
+    }
+    if let Some(source) = &source {
+        source.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
 fn request_start(refusal: Arc<Mutex<Option<FetchError>>>) -> Option<donsetch_fetch::RequestStart> {
     let total = REQUEST_COUNT.try_with(Arc::clone).ok();
     let source = REQUEST_SOURCE_COUNT.try_with(Arc::clone).ok();

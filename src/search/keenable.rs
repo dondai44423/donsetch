@@ -117,6 +117,9 @@ async fn post_search(
     endpoint: &str,
     query: &str,
 ) -> Result<SearchPayload, String> {
+    if !crate::fetch::layer::record_external_request() {
+        return Err("budget-skipped".into());
+    }
     let mut resp = http
         .post(endpoint)
         .header(ACCEPT, "application/json")
@@ -462,5 +465,83 @@ mod tests {
         )
         .await;
         assert_eq!(res.unwrap_err().0, RULE_DENIED_STATUS);
+    }
+
+    #[tokio::test]
+    async fn keenable_accounts_for_requests_and_honors_request_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        install_test_config();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/search/public", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body =
+                r#"{"results":[{"url":"https://example.com/a","title":"A","snippet":"ok"}]}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        });
+
+        let total = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(AtomicUsize::new(0));
+        let harness = Harness::new();
+        let (_, res) = crate::fetch::layer::REQUEST_COUNT
+            .scope(
+                Arc::clone(&total),
+                crate::fetch::layer::REQUEST_LIMIT.scope(
+                    2,
+                    crate::fetch::layer::REQUEST_SOURCE_COUNT.scope(
+                        Arc::clone(&source),
+                        TEST_ENDPOINT.scope(
+                            endpoint.clone(),
+                            task(
+                                "rust async".into(),
+                                "direct".into(),
+                                None,
+                                harness.context(),
+                                Duration::from_secs(5),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        server.await.unwrap();
+        assert!(res.is_ok());
+        assert_eq!(total.load(Ordering::Relaxed), 1);
+        assert_eq!(source.load(Ordering::Relaxed), 1);
+
+        // Negative: when REQUEST_LIMIT is already reached, no request goes out.
+        let capped = Arc::new(AtomicUsize::new(1));
+        let capped_source = Arc::new(AtomicUsize::new(0));
+        let (_, blocked) = crate::fetch::layer::REQUEST_COUNT
+            .scope(
+                Arc::clone(&capped),
+                crate::fetch::layer::REQUEST_LIMIT.scope(
+                    1,
+                    crate::fetch::layer::REQUEST_SOURCE_COUNT.scope(
+                        Arc::clone(&capped_source),
+                        TEST_ENDPOINT.scope(
+                            endpoint,
+                            task(
+                                "rust async".into(),
+                                "direct".into(),
+                                None,
+                                harness.context(),
+                                Duration::from_secs(5),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(blocked.unwrap_err().0, "budget-skipped");
+        assert_eq!(capped_source.load(Ordering::Relaxed), 0);
     }
 }
