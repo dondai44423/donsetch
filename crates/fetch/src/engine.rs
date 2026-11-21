@@ -216,11 +216,10 @@ fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep
                 }
                 first = false;
                 match &name.prefix {
-                    Some(prefix) => write_json_string(
-                        out,
-                        &format!("{}:{}", prefix.as_ref(), name.local.as_ref()),
-                    ),
-                    None => write_json_string(out, name.local.as_ref()),
+                    Some(prefix) => {
+                        write_json_string(out, &format!("{}:{}", &**prefix, &*name.local))
+                    }
+                    None => write_json_string(out, &name.local),
                 }
                 out.push(':');
                 write_json_string(out, value);
@@ -693,7 +692,7 @@ async fn op_sleep_async(state: Rc<RefCell<OpState>>, #[smi] ms: i32) {
 #[string]
 fn op_random(#[smi] len: i32) -> String {
     let mut buffer = vec![0u8; len.clamp(0, 65536) as usize];
-    if getrandom::getrandom(&mut buffer).is_err() {
+    if getrandom::fill(&mut buffer).is_err() {
         for (index, byte) in buffer.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
         }
@@ -1362,8 +1361,7 @@ fn document_text_len(html: &str) -> usize {
                         continue;
                     }
                     if element.attrs.iter().any(|(key, value)| {
-                        key.local.as_ref() == "hidden"
-                            || (key.local.as_ref() == "aria-hidden" && value == "true")
+                        &*key.local == "hidden" || (&*key.local == "aria-hidden" && value == "true")
                     }) {
                         continue;
                     }
@@ -1516,7 +1514,7 @@ fn start_prefetch(
             element
                 .attrs
                 .iter()
-                .find(|(key, _)| key.local.as_ref() == name)
+                .find(|(key, _)| &*key.local == name)
                 .map(|(_, value)| value.to_string())
         };
         let target = match element.name() {
