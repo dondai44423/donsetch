@@ -1609,8 +1609,11 @@ impl Searcher {
         let mut used_egresses: Vec<String> = Vec::new();
         // Engines get the original query; the recall variant
         // goes only to the first two engines (top trust).
-        let benched =
-            |e: &str| self.quarantined(engine_health_key(e)) || self.resting(engine_health_key(e));
+        let benched = |e: &str| {
+            self.quarantined(engine_health_key(e))
+                || self.resting(engine_health_key(e))
+                || (e == keenable::SOURCE && keenable::is_cooling())
+        };
         let mut live: Vec<&str> = engines.iter().filter(|e| !benched(e)).copied().collect();
         // Every source resting at once means the roster, not the sources, is
         // wrong: try them all rather than answering from nothing.

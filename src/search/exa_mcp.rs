@@ -99,12 +99,20 @@ fn objective_for(query: &str, intent: Intent) -> String {
 }
 
 fn extract_jsonrpc_message(bytes: &[u8], is_sse: bool) -> Result<Value, String> {
-    if !is_sse && !bytes.starts_with(b"event:") && !bytes.starts_with(b"data:") {
-        return serde_json::from_slice(bytes)
+    let trimmed = bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .trim_ascii_start();
+    if !is_sse
+        && !trimmed.starts_with(b"event:")
+        && !trimmed.starts_with(b"data:")
+        && !trimmed.starts_with(b":")
+    {
+        return serde_json::from_slice(trimmed)
             .map_err(|_| "invalid-response: malformed json".into());
     }
     let text =
-        std::str::from_utf8(bytes).map_err(|_| "invalid-response: non-utf8 sse".to_string())?;
+        std::str::from_utf8(trimmed).map_err(|_| "invalid-response: non-utf8 sse".to_string())?;
     let mut data_buf = String::new();
     let mut last_value: Option<Value> = None;
     for raw_line in text.lines() {
@@ -218,13 +226,12 @@ async fn post_search(
         .map_err(|e| format!("transport:{}", e.without_url()))?;
     let status = resp.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        let secs = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|s| s.clamp(30, 900))
-            .unwrap_or(DEFAULT_RETRY_SECS);
+        let secs = super::tasks::parse_retry_after(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            DEFAULT_RETRY_SECS,
+        );
         return Err(format!("rate-limited:{secs}"));
     }
     if !status.is_success() {
@@ -643,5 +650,16 @@ ignored
         )
         .await;
         assert_eq!(res.unwrap_err().0, RULE_DENIED_STATUS);
+    }
+
+    #[test]
+    fn extract_jsonrpc_message_accepts_comment_prefixed_sse_and_bom() {
+        let payload = b"\xef\xbb\xbf: keepalive\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n";
+        let msg = extract_jsonrpc_message(payload, false).expect("comment-prefixed SSE parses");
+        assert_eq!(extract_tool_text(msg).unwrap(), "ok");
+
+        let plain = b"\xef\xbb\xbf {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"plain\"}]}}";
+        let msg = extract_jsonrpc_message(plain, false).expect("BOM-prefixed JSON parses");
+        assert_eq!(extract_tool_text(msg).unwrap(), "plain");
     }
 }

@@ -271,13 +271,13 @@ fn objective_for(query: &str, intent: Intent) -> String {
 }
 
 fn retry_after_secs(response: &Response) -> u64 {
-    response
-        .headers()
-        .get(RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|s| s.clamp(30, 900))
-        .unwrap_or(DEFAULT_RETRY_SECS)
+    super::tasks::parse_retry_after(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        DEFAULT_RETRY_SECS,
+    )
 }
 
 #[derive(Debug)]

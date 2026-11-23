@@ -36,6 +36,23 @@ const RULE_DENIED_STATUS: &str = "invalid-config: excluded by the operator's loc
 /// `LOW_QUOTA_WATERMARK`, shifting load to peer engines before hitting a 429.
 static LOW_QUOTA_UNTIL: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(Default::default);
 
+/// True while Keenable is proactively cooling down after a low
+/// `X-RateLimit-Remaining` header, so the planner benches it before wave
+/// selection instead of spending an active slot on an immediate `rested:` return.
+pub(super) fn is_cooling() -> bool {
+    let mut guard = LOW_QUOTA_UNTIL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *guard {
+        Some(until) if until > Instant::now() => true,
+        Some(_) => {
+            *guard = None;
+            false
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static TEST_ENDPOINT: String;
@@ -136,13 +153,12 @@ async fn post_search(
         .map_err(|e| format!("transport:{}", e.without_url()))?;
     let status = resp.status();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        let secs = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|s| s.clamp(30, 900))
-            .unwrap_or(DEFAULT_RETRY_SECS);
+        let secs = super::tasks::parse_retry_after(
+            resp.headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            DEFAULT_RETRY_SECS,
+        );
         return Err(format!("rate-limited:{secs}"));
     }
     if !status.is_success() {
@@ -706,5 +722,15 @@ mod tests {
             .await;
         assert_eq!(blocked.unwrap_err().0, "budget-skipped");
         assert_eq!(capped_source.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn low_quota_cooling_reports_active_and_clears_when_expired() {
+        assert!(!is_cooling());
+        *LOW_QUOTA_UNTIL.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+        assert!(is_cooling());
+        *LOW_QUOTA_UNTIL.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!is_cooling());
+        assert!(LOW_QUOTA_UNTIL.lock().unwrap().is_none());
     }
 }

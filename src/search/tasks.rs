@@ -817,6 +817,25 @@ pub(super) fn engine_fetch_status(e: &FetchError) -> String {
     }
 }
 
+/// Parse an HTTP `Retry-After` header (delta-seconds or RFC 9110 HTTP-date),
+/// clamping to `[30, 900]` seconds and falling back to `default_secs` when
+/// absent, unparseable, or in the past.
+pub(super) fn parse_retry_after(value: Option<&str>, default_secs: u64) -> u64 {
+    let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default_secs;
+    };
+    if let Ok(secs) = raw.parse::<u64>() {
+        return secs.clamp(30, 900);
+    }
+    if let Ok(at) = httpdate::parse_http_date(raw)
+        && let Ok(wait) = at.duration_since(std::time::SystemTime::now())
+        && wait.as_secs() > 0
+    {
+        return wait.as_secs().clamp(30, 900);
+    }
+    default_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1393,5 +1412,21 @@ mod tests {
         let hits = result.expect("the one on-path hit is kept").hits;
         let kept: Vec<&str> = hits.iter().map(|hit| hit.url.as_str()).collect();
         assert_eq!(kept, vec!["https://github.com/tokio-rs/tokio"]);
+    }
+
+    #[test]
+    fn parse_retry_after_handles_seconds_http_dates_and_bounds() {
+        assert_eq!(parse_retry_after(None, 60), 60);
+        assert_eq!(parse_retry_after(Some(""), 60), 60);
+        assert_eq!(parse_retry_after(Some("120"), 60), 120);
+        assert_eq!(parse_retry_after(Some("5"), 60), 30);
+        assert_eq!(parse_retry_after(Some("9999"), 60), 900);
+        assert_eq!(parse_retry_after(Some("not-a-date"), 60), 60);
+        let future =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(180));
+        let parsed = parse_retry_after(Some(&future), 60);
+        assert!((175..=181).contains(&parsed), "{parsed}");
+        let past = httpdate::fmt_http_date(std::time::SystemTime::now() - Duration::from_secs(120));
+        assert_eq!(parse_retry_after(Some(&past), 60), 60);
     }
 }
