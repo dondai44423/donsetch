@@ -341,12 +341,23 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
     ParamSpec {
         name: "intent",
         flag: "intent",
-        kind: ParamKind::Enum(&["auto", "web", "code", "paper", "news", "entity"]),
+        kind: ParamKind::Enum(&["auto", "web", "code", "paper", "news", "entity", "image"]),
         cli: CliKind::Flag,
         required: false,
-        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's first-party sources: code: GitHub, HN, StackExchange, MDN, and the crates.io, npm or PyPI record for a package name (`npm zod`, `cargo serde_json`); paper: OpenAlex, arXiv, Europe PMC for biomedical terms; news, or any query with a recent window (`this week`, `yesterday`): the Bing News wire, publisher feeds, GDELT, HN; entity: Wikipedia; web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
+        help: "auto (default) detects from query signals (code/tech tokens, paper terms, news words, who/what-is). Keyless mode adds that intent's first-party sources: code: GitHub, HN, StackExchange, MDN, and the crates.io, npm or PyPI record for a package name (`npm zod`, `cargo serde_json`); paper: OpenAlex, arXiv, Europe PMC for biomedical terms; news, or any query with a recent window (`this week`, `yesterday`): the Bing News wire, publisher feeds, GDELT, HN; entity: Wikipedia; image: keyless Bing Images + Wikimedia Commons returning ranked image URLs (explicit only; never auto-detected); web: general only. With a configured provider (donsetch keys) the provider replaces the fan-out: intent maps to its own filters and the keyless verticals do not join.",
         mcp_help: Some(
-            "auto (default) detects from the query. Keyless mode adds first-party sources: code: + GitHub, HN, StackExchange, MDN, crates.io/npm/PyPI for a package name; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news or a recent window ('this week'): + news wire, publisher feeds, HN; entity: + Wikipedia; web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
+            "auto (default) detects from the query. Keyless mode adds first-party sources: code: + GitHub, HN, StackExchange, MDN, crates.io/npm/PyPI for a package name; paper: + OpenAlex, arXiv, Europe PMC (biomedical); news or a recent window ('this week'): + news wire, publisher feeds, HN; entity: + Wikipedia; image: explicit-only Bing Images + Wikimedia Commons returning image URLs (pair with contact_sheet:true for an inline PNG grid); web: general only. With a configured provider, intent selects that provider's filters instead (one provider; the keyless verticals do not join).",
+        ),
+    },
+    ParamSpec {
+        name: "contact_sheet",
+        flag: "sheet",
+        kind: ParamKind::SetTrue,
+        cli: CliKind::Flag,
+        required: false,
+        help: "When intent is `image`, download top thumbnails and composite a rank-badged 3-column contact-sheet PNG (inline MCP image block, or save with `--out PATH` on the CLI).",
+        mcp_help: Some(
+            "With intent=\"image\", fetch top thumbnails (SSRF-guarded) and return an inline rank-badged 3-column contact-sheet PNG alongside the URLs.",
         ),
     },
 ];
@@ -636,6 +647,7 @@ pub static TOOLS: &[ToolSpec] = &[
             "donsetch fetch https://docs.example.com/guide --focus \"retry backoff limits\"",
             "donsetch fetch https://docs.example.com/guide --toc",
             "donsetch fetch https://docs.example.com/guide --section s4",
+            "donsetch fetch https://example.com/photo.png --out photo.png",
             "donsetch fetch https://a.example/x https://b.example/y --max-chars 20000",
         ],
     },
@@ -649,6 +661,7 @@ pub static TOOLS: &[ToolSpec] = &[
         examples: &[
             "donsetch search rust async trait objects",
             "donsetch search \"exact phrase\" --intent code",
+            "donsetch search \"armored core nine-ball\" --intent image --sheet --out refs.png",
             "donsetch search site:github.com tokio --max-results 10",
             "donsetch search \"rust async trait patterns\" --query-variant \"async fn in trait rust\"",
         ],
@@ -866,7 +879,9 @@ publisher feeds, merged by agreement between independent sources. \
 Results include reusable URLs: pass one to donsetch fetch <url>. \
 Session-local search handles are used only by the persistent MCP server. \
 Use --max-results to cap the list and --intent to pick a vertical \
-(web|news|code|paper|entity); the default auto-detects. \
+(web|news|code|paper|entity|image); the default auto-detects. \
+With --intent image, add --sheet (or --out <path.png>) to return a \
+contact sheet PNG of the top hits. \
 --json gives the full result envelope (titles, snippets, scores, \
 engine health)."
         }
@@ -1461,5 +1476,29 @@ mod tests {
         )
         .expect_err("ignore_rules must not be an MCP argument");
         assert!(err.contains("unknown parameter"), "{err}");
+    }
+
+    #[test]
+    fn image_search_intent_and_contact_sheet_flag_parse_cleanly() {
+        let tool = search_tool();
+        assert_eq!(
+            check_args(
+                tool,
+                &json!({ "query": "armored core", "intent": "image", "contact_sheet": true })
+            ),
+            Ok(())
+        );
+        let matches = cli_command(tool)
+            .try_get_matches_from(["search", "armored core", "--intent", "image", "--sheet"])
+            .expect("valid image search CLI");
+        let args = matches_to_json(tool, &matches);
+        assert_eq!(args["query"], "armored core");
+        assert_eq!(args["intent"], "image");
+        assert_eq!(args["contact_sheet"], true);
+
+        let plain = cli_command(tool)
+            .try_get_matches_from(["search", "armored core", "--intent", "image"])
+            .expect("image search without sheet");
+        assert!(matches_to_json(tool, &plain).get("contact_sheet").is_none());
     }
 }

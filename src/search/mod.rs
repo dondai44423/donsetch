@@ -14,6 +14,7 @@ pub mod evidence;
 pub mod explain;
 pub mod families;
 pub mod fuse;
+pub mod images;
 pub mod instant;
 pub mod intent;
 pub mod ltr;

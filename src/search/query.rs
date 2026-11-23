@@ -861,7 +861,7 @@ impl QueryFacts {
             super::intent::Intent::News => Shape::News,
             super::intent::Intent::Paper => Shape::Paper,
             super::intent::Intent::Entity => Shape::Entity,
-            super::intent::Intent::Web => Shape::Web,
+            super::intent::Intent::Web | super::intent::Intent::Image => Shape::Web,
         }
     }
 

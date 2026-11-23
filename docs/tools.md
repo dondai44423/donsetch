@@ -32,6 +32,7 @@ Returns clean Markdown (or a requested slice) across HTML, PDFs, feeds, JSON, pl
 
 - **Mutually exclusive views:** `must_contain`, `focus`, `toc`, and `since_last` cannot combine with one another (`section` narrows `must_contain`, `focus`, or full reads; `offset` paginates full/section reads).
 - **PDFs:** detected by `Content-Type` or `%PDF` magic bytes; fuses PDFium glyphs + pixels for layout, tables, and AcroForms, running PP-OCR on scanned/corrupt regions with explicit uncertainty markers.
+- **Direct raster images:** PNG, JPEG, WebP, and GIF URLs up to 8 MiB return a native MCP `image` content block plus dimensions (`read_status: "image"`); on the CLI, pass `--out photo.png` to write the image bytes directly to disk. Text views (`focus`, `toc`, `section`, `must_contain`) still fail honestly on raw images.
 
 ## Search
 
@@ -39,12 +40,14 @@ Returns clean Markdown (or a requested slice) across HTML, PDFs, feeds, JSON, pl
 donsetch search "rust async cancellation" --intent code --max-results 5
 donsetch search "site:postgresql.org vacuum analyze"
 donsetch search "attention is all you need" --intent paper --read 1
+donsetch search "armored core nine-ball" --intent image --sheet --out refs.png
 donsetch search "中華人民共和国 人口" --lang ja
 ```
 
 | MCP argument | CLI flag | Behavior |
 |---|---|---|
-| `intent` | `--intent` | `auto` (default), `web`, `code`, `paper`, `news`, `entity` |
+| `intent` | `--intent` | `auto` (default), `web`, `code`, `paper`, `news`, `entity`, `image` (explicit-only: Bing Images + Wikimedia Commons) |
+| `contact_sheet` | `--sheet` | With `intent="image"`, fetches top thumbnails (SSRF-guarded) and returns an inline rank-badged 3-column contact-sheet PNG (or saves via `--out PATH` on the CLI) |
 | `lang` | `--lang` | Explicit BCP-47 tag (`uk`, `ne`, `pt-BR`); only a region subtag sets a country market, and explicit `lang` uses local sources even when a paid provider is default |
 | `max_results` | `--max-results` | Default 7, max 12 |
 | `read` | `--read` | Fetch and extract up to 3 top pages inside the deadline (`page:` snippets) |

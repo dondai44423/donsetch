@@ -397,6 +397,7 @@ fn intent_str(intent: &Intent) -> &'static str {
         Intent::Paper => "paper",
         Intent::News => "news",
         Intent::Entity => "entity",
+        Intent::Image => "image",
     }
 }
 

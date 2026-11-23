@@ -8,6 +8,7 @@ pub enum Intent {
     Paper,
     News,
     Entity,
+    Image,
 }
 
 impl Intent {
@@ -21,6 +22,7 @@ impl Intent {
             Intent::Paper => 2,
             Intent::News => 3,
             Intent::Entity => 4,
+            Intent::Image => 5,
         }
     }
 
@@ -33,6 +35,7 @@ impl Intent {
             2 => Intent::Paper,
             3 => Intent::News,
             4 => Intent::Entity,
+            5 => Intent::Image,
             _ => Intent::Web,
         }
     }
@@ -281,6 +284,7 @@ pub fn engines_for(intent: Intent) -> &'static [&'static str] {
             &["google-cse", "bing", "ddg", "yahoo", "brave", "yandex"]
         }
         Intent::Paper => &["google-cse", "bing", "ddg", "yandex"],
+        Intent::Image => &[],
     }
 }
 
@@ -346,6 +350,7 @@ pub fn verticals_for(intent: Intent, query: &str) -> Vec<&'static str> {
             vec!["wikipedia"]
         }
         Intent::Web => vec![],
+        Intent::Image => vec![],
     }
 }
 
@@ -668,5 +673,18 @@ mod tests {
         assert!(!stressed.contains(&"hn"));
         assert!(stressed.contains(&"github"));
         assert!(stressed.contains(&"stackexchange"));
+    }
+
+    #[test]
+    fn image_intent_is_explicit_only_and_never_auto_detected() {
+        // The word "image" in technical or visual queries must never hijack
+        // normal web/code search into image mode; image mode is opt-in only.
+        assert_eq!(detect("docker image build"), Intent::Code);
+        assert_eq!(detect("rust image crate"), Intent::Code);
+        assert_eq!(detect("armored core wallpaper"), Intent::Web);
+        assert_ne!(detect("high resolution photo of mars"), Intent::Image);
+        assert_eq!(Intent::from_code(Intent::Image.code()), Intent::Image);
+        assert!(engines_for(Intent::Image).is_empty());
+        assert!(verticals_for(Intent::Image, "armored core nine-ball").is_empty());
     }
 }

@@ -35,11 +35,26 @@ pub(super) async fn search_tool(
         Some("paper") => Some(Intent::Paper),
         Some("news") => Some(Intent::News),
         Some("entity") => Some(Intent::Entity),
+        Some("image") => Some(Intent::Image),
         _ => None,
     };
+    let contact_sheet = args
+        .get("contact_sheet")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     search::SEARCH_DEADLINE
         .scope(deadline.map(|d| tokio::time::Instant::now() + d), async {
+            if intent == Some(Intent::Image) {
+                let query = &queries[0];
+                return run_with_budget(
+                    search_images_inner(query, max, contact_sheet),
+                    deadline,
+                    ctx.as_mut(),
+                    || search_deadline_error(query),
+                )
+                .await;
+            }
             if queries.len() == 1 {
                 let query = &queries[0];
                 run_with_budget(
@@ -61,6 +76,75 @@ pub(super) async fn search_tool(
             }
         })
         .await
+}
+
+async fn search_images_inner(query: &str, max: usize, contact_sheet: bool) -> Value {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+    let requested = max.clamp(1, 12);
+    let out = crate::search::images::search_images(query, requested, contact_sheet).await;
+    let md = crate::search::images::render_image_markdown(&out);
+
+    let mut content = Vec::new();
+    if let Some(png) = &out.sheet_png {
+        content.push(json!({
+            "type": "image",
+            "data": BASE64_STANDARD.encode(png),
+            "mimeType": "image/png"
+        }));
+    }
+    content.push(json!({ "type": "text", "text": md }));
+
+    let results = out
+        .results
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let mut item = json!({
+                "rank": i + 1,
+                "title": h.title,
+                "image_url": h.image_url,
+                "source": h.source,
+            });
+            if let Some(t) = &h.thumb_url {
+                item["thumb_url"] = json!(t);
+            }
+            if let Some(p) = &h.page_url {
+                item["page_url"] = json!(p);
+            }
+            if let Some(w) = h.width {
+                item["width"] = json!(w);
+            }
+            if let Some(ht) = h.height {
+                item["height"] = json!(ht);
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+
+    let mut structured = json!({
+        "ok": true,
+        "intent": "image",
+        "query": out.query,
+        "provider": "keyless-images",
+        "filled": !out.results.is_empty(),
+        "requested_results": requested,
+        "returned_results": out.results.len(),
+        "underfilled": out.results.len() < requested,
+        "contact_sheet": out.sheet_png.is_some(),
+        "results": results,
+        "sources": out.sources,
+    });
+    if let Some(note) = &out.sheet_note {
+        structured["sheet_note"] = json!(note);
+    }
+
+    json!({
+        "content": content,
+        "structuredContent": structured,
+        "isError": false,
+    })
 }
 
 /// Parse the required base query and at most two explicit alternate

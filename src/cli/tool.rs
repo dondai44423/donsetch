@@ -75,7 +75,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             _ => {}
         }
     }
-    let args_ref: &[String] = if cmd == "screenshot" {
+    let args_ref: &[String] = if matches!(cmd, "screenshot" | "search" | "fetch") {
         let mut clean: Vec<String> = Vec::with_capacity(args.len());
         let mut skip = false;
         for (i, a) in args.iter().enumerate() {
@@ -131,7 +131,14 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     };
 
     // Build the JSON args from parsed matches.
-    let base_args = spec::matches_to_json(tool, &matches);
+    let mut base_args = spec::matches_to_json(tool, &matches);
+    if cmd == "search"
+        && out_seen
+        && base_args.get("intent").and_then(Value::as_str) == Some("image")
+        && let Some(obj) = base_args.as_object_mut()
+    {
+        obj.insert("contact_sheet".into(), json!(true));
+    }
 
     if tool.cli_cmd == "fetch" {
         let urls: Vec<String> = matches
@@ -175,9 +182,9 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     // CLI-only: `screenshot --out PATH` writes the PNG alongside the
     // receipt. Failures stay honest: stderr + a real exit code, never
     // a silent no-save.
-    if cmd == "screenshot" && out_seen {
+    if matches!(cmd, "screenshot" | "search" | "fetch") && out_seen {
         let Some(path) = out_path else {
-            crate::diag!("[screenshot] error: --out given without a path; nothing saved");
+            crate::diag!("[{cmd}] error: --out given without a path; nothing saved");
             return EXIT_PERMANENT;
         };
         let img = result
@@ -196,19 +203,19 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
                     .and_then(|b| b.get("data").and_then(|d| d.as_str()))
             });
         let Some(data) = img else {
-            crate::diag!("[screenshot] error: capture returned no image to save");
+            crate::diag!("[{cmd}] error: response returned no image to save");
             return EXIT_PERMANENT;
         };
         let Ok(bytes) = BASE64_STANDARD
             .decode(data)
-            .map_err(|er| crate::diag!("[screenshot] error: bad image payload: {er}"))
+            .map_err(|er| crate::diag!("[{cmd}] error: bad image payload: {er}"))
         else {
             return EXIT_PERMANENT;
         };
         match std::fs::write(&path, &bytes) {
-            Ok(()) => crate::diag!("[screenshot] saved {} bytes to {}", bytes.len(), path),
+            Ok(()) => crate::diag!("[{cmd}] saved {} bytes to {}", bytes.len(), path),
             Err(er) => {
-                crate::diag!("[screenshot] error: could not write {path}: {er}");
+                crate::diag!("[{cmd}] error: could not write {path}: {er}");
                 return EXIT_PERMANENT;
             }
         }

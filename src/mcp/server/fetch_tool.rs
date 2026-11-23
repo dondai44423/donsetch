@@ -1278,9 +1278,65 @@ async fn fetch_single_inner(
             .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        // Binary content guard: images, video, audio, etc.
-        // Don't pass binary bytes to extract (mojibake).
+        // Binary content guard: direct raster images (PNG/JPEG/WebP/GIF within
+        // the inline cap) are returned as native MCP image blocks so vision
+        // agents can inspect image URLs directly. All other binaries (archives,
+        // video, audio, oversized files) remain honest permanent errors.
         if crate::fetch::guards::is_binary(&o.body, &ct) {
+            if o.body.len() <= crate::search::images::MAX_DIRECT_IMAGE_BYTES
+                && let Some((mime, dims)) =
+                    crate::search::images::inspect_raster_image(&o.body, &ct)
+            {
+                if view.is_projection() {
+                    return tool_error_structured(
+                        format!(
+                            "binary image: {url} returned {mime} ({} bytes) : text views (focus/toc/section/must_contain) do not apply to raw images",
+                            o.body.len()
+                        ),
+                        "permanent",
+                        Some(json!({
+                            "url": o.url,
+                            "mime_type": mime,
+                            "next_action": "re-fetch this image URL without focus, toc, section, or must_contain to receive the inline image",
+                        })),
+                    );
+                }
+                use base64::Engine as _;
+                use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+                let dim_text = match dims {
+                    Some((w, h)) => format!(", {w}x{h}"),
+                    None => String::new(),
+                };
+                let mut sc = json!({
+                    "ok": true,
+                    "url": o.url,
+                    "read_status": "image",
+                    "mime_type": mime,
+                    "bytes": o.body.len(),
+                });
+                if let Some((w, h)) = dims {
+                    sc["width"] = json!(w);
+                    sc["height"] = json!(h);
+                }
+                return json!({
+                    "content": [
+                        {
+                            "type": "image",
+                            "data": BASE64_STANDARD.encode(&o.body),
+                            "mimeType": mime,
+                        },
+                        {
+                            "type": "text",
+                            "text": format!(
+                                "Fetched image {} ({mime}{dim_text}, {} bytes)\n",
+                                o.url,
+                                o.body.len()
+                            ),
+                        },
+                    ],
+                    "structuredContent": sc,
+                });
+            }
             let kind = ct
                 .split(';')
                 .next()
@@ -1295,7 +1351,7 @@ async fn fetch_single_inner(
                 "permanent",
                 Some(json!({
                     "url": url,
-                    "next_action": "this URL is a raw file, not a page : if it is a PDF, fetch it directly (DonSeTch parses PDFs); otherwise look for an HTML landing page via web_search",
+                    "next_action": "this URL is a raw file, not a page : if it is a PDF or raster image (<=8 MiB), fetch it directly; otherwise look for an HTML landing page via web_search",
                 })),
             );
         }

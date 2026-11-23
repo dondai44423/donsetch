@@ -45,7 +45,9 @@ dirs = "6"
 unicode-bidi = "0.3"
 # OCR tier (Tier B) — PP-OCR via ONNX Runtime, lazy model cache.
 oar-ocr = { version = "0.9", default-features = false, features = ["download-binaries", "simd"], optional = true }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+# Pure-Rust JPEG/PNG/WebP/GIF decoding & contact-sheet encoding (shared by
+# image search, direct image fetch inspection, and OCR).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 sha2 = "0.11"
 base64 = "0.23"
@@ -96,17 +98,13 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dy
 # `--features ocr,http` where supported, fewer or none elsewhere (see the
 # matrices in .github/workflows/ci.yml).
 default = []
-ocr = ["dep:oar-ocr", "dep:image", "dep:ort", "dep:tokenizers", "reqwest/blocking"]
+ocr = ["dep:oar-ocr", "dep:ort", "dep:tokenizers", "reqwest/blocking"]
 http = ["dep:axum", "dep:tower-http"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Foundation", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Pipes"] }
 
 [dev-dependencies]
-# The owned-browser pixel test decodes a PNG; the optional runtime dep
-# rides the ocr feature, and no-feature test builds (CI linux-aarch64,
-# windows) must still compile the test.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

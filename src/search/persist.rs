@@ -120,6 +120,7 @@ pub(crate) fn load_cache_disk() -> CacheMap {
                 "Code" => Intent::Code,
                 "Paper" => Intent::Paper,
                 "Entity" => Intent::Entity,
+                "Image" => Intent::Image,
                 _ => Intent::Web,
             }
         };
