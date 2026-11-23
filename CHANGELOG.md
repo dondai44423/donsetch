@@ -1,5 +1,19 @@
 # Changelog
 
+## [5.5.10] - 2026-11-23
+
+### Security
+
+- **Patched `url` stack-overflow advisory (`RUSTSEC-2026-0592`).** Upgraded `url` from `2.5.8` to `2.5.9` (and `form_urlencoded` to `1.2.3`) to prevent stack overflow in `Url::origin()` on deeply nested `blob:` URLs.
+
+### Fixed
+
+- **OS trust store, `SSL_CERT_FILE`/`SSL_CERT_DIR`, and `[tls]` CA roots honored across every outbound client (#467, #468).** Added `egress::trust::with_trusted_roots` (plus a blocking counterpart and divide-and-conquer vetting for malformed OS/bundle certificates) and wired it into `keenable`, `exa-mcp`, `parallel-mcp`, BYOK search and `/goto` resolution, `donsetch update` downloads, Bright Data Web Unlocker, `donsetch doctor` zone probes, OCR model downloads, and HTTPS external `browser.cdp_url` discovery so DonSeTch works end-to-end behind TLS-inspecting corporate proxies.
+- **`donsetch doctor` reports `[tls]` and multi-directory `SSL_CERT_DIR` trust roots.** `doctor` now splits multi-path `SSL_CERT_DIR` entries cross-platform, surfaces `[tls] cert_file`/`cert_dir` certificate counts, and warns when a configured CA path yields no parseable certificates; unreadable `[tls] cert_dir` paths also emit diagnostics.
+- **Loopback Chromium DevTools discovery bypasses `HTTP_PROXY`.** `browser::page_ws` now sets `.no_proxy()` on `http://127.0.0.1:<port>/json/list` so `web_screenshot` no longer routes local DevTools polling through an ambient HTTP proxy when `NO_PROXY` omits `127.0.0.1`.
+- **Self-update range download resilience.** `cli/download.rs` now bounds `request.send()` with timeouts on ranged probes, range segments, and streaming fallbacks, retries transient socket resets and `5xx`/`429` responses within each segment instead of aborting on the first blip, and percent-encodes pool proxy credentials via `wire_url()`.
+- **Proactive Keenable low-quota benching and RFC 9110 `Retry-After` parsing.** When Keenable's `X-RateLimit-Remaining` triggers soft cooling, the search planner now benches `keenable` before wave selection so three healthy engines take the initial active slots immediately without stalling until the soft mark. `keenable`, `exa-mcp`, and `parallel-mcp` also share an RFC 9110 `Retry-After` parser supporting both delta-seconds and HTTP-date headers, and `exa-mcp` accepts BOM- and comment-prefixed SSE responses.
+
 ## [5.5.9] - 2026-11-21
 
 ### Added
