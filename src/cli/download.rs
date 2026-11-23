@@ -140,7 +140,7 @@ pub(crate) fn configured_routes() -> Vec<Route> {
         {
             routes.push(Route {
                 label: format!("proxy lane {}", proxy.id()),
-                proxy: Some(proxy.to_url()),
+                proxy: Some(proxy.wire_url()),
                 from_environment: false,
             });
         }
@@ -153,7 +153,7 @@ fn client_for(route: &Route, policy: &Policy) -> Result<reqwest::Client, String>
     // independent TCP connections instead of multiplexing onto one HTTP/2
     // socket with hyper's 64 KiB default stream window (which caps throughput
     // at ~250 KB/s on high-RTT links).
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .user_agent(concat!("donsetch-update/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(policy.connect)
         .http1_only()
@@ -206,7 +206,7 @@ fn direct_azure_blob_url(resolved: &str) -> Option<String> {
 }
 
 fn no_redirect_client_for(route: &Route, policy: &Policy) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .user_agent(concat!("donsetch-update/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(policy.connect)
         .http1_only()
@@ -402,10 +402,15 @@ async fn fetch_segment(
     let want = (to.saturating_sub(from)) as usize;
     let mut got = 0usize;
     let mut tries = 0;
+    let mut last_err: Option<String> = None;
     while got < want {
         tries += 1;
         if tries > 4 {
-            return Err(format!("range {from}-{}: gave up at {got} bytes", to - 1));
+            let reason = last_err.map(|e| format!(" ({e})")).unwrap_or_default();
+            return Err(format!(
+                "range {from}-{}: gave up at {got} bytes{reason}",
+                to - 1
+            ));
         }
         let at = from + got as u64;
         let mut request = client
@@ -414,13 +419,25 @@ async fn fetch_segment(
         if let Some(accept) = accept {
             request = request.header("Accept", accept);
         }
-        let mut response = request.send().await.map_err(|e| e.to_string())?;
-        if response.status().as_u16() != 206 {
-            return Err(format!(
-                "range {from}-{}: HTTP {}",
-                to - 1,
-                response.status().as_u16()
-            ));
+        let mut response = match tokio::time::timeout(stall, request.send()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                last_err = Some(e.to_string());
+                continue;
+            }
+            Err(_) => {
+                last_err = Some("send timeout".into());
+                continue;
+            }
+        };
+        let status = response.status().as_u16();
+        if (500..600).contains(&status) || status == 429 {
+            last_err = Some(format!("HTTP {status}"));
+            tokio::time::sleep(Duration::from_millis(150 * tries as u64)).await;
+            continue;
+        }
+        if status != 206 {
+            return Err(format!("range {from}-{}: HTTP {status}", to - 1));
         }
         while let Ok(Ok(Some(chunk))) = tokio::time::timeout(stall, response.chunk()).await {
             let take = chunk.len().min(want - got);
@@ -505,7 +522,11 @@ async fn attempt_parallel(
         if let Some(accept) = accept {
             probe = probe.header("Accept", accept);
         }
-        let response = probe.send().await.map_err(|e| e.to_string())?;
+        let probe_timeout = policy.connect.min(policy.stall);
+        let response = tokio::time::timeout(probe_timeout, probe.send())
+            .await
+            .map_err(|_| "ranged probe timed out".to_string())?
+            .map_err(|e| e.to_string())?;
         let resolved_url = response.url().to_string();
         let total = match response.status().as_u16() {
             206 => response
@@ -759,7 +780,10 @@ async fn attempt(
     if resumed_from > 0 {
         request = request.header("Range", format!("bytes={resumed_from}-"));
     }
-    let mut response = request.send().await.map_err(|e| e.to_string())?;
+    let mut response = tokio::time::timeout(policy.connect.min(policy.stall), request.send())
+        .await
+        .map_err(|_| "download request timed out".to_string())?
+        .map_err(|e| e.to_string())?;
     let total = match response.status().as_u16() {
         206 => response
             .headers()
@@ -1303,5 +1327,70 @@ mod tests {
         assert_eq!(total, Some(body.len() as u64));
         assert_eq!(bytes.len(), 256 * 1024);
         assert_eq!(&bytes[..], &body[..256 * 1024]);
+    }
+
+    #[tokio::test]
+    async fn fetch_segment_retries_transient_reset_and_503() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/asset.tar.gz", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+        let payload = b"0123456789abcdef".to_vec();
+        let payload_srv = payload.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut req = [0u8; 1024];
+                let _ = sock.read(&mut req).await;
+                if n == 0 {
+                    // Immediate socket close before any HTTP response (transient reset).
+                    drop(sock);
+                } else if n == 1 {
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload_srv.len() - 1,
+                        payload_srv.len(),
+                        payload_srv.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&payload_srv).await;
+                }
+            }
+        });
+
+        let policy = fast_policy();
+        let client = client_for(&direct(), &policy).unwrap();
+        let slot = Arc::new(Mutex::new(Vec::new()));
+        let delivered = Arc::new(AtomicU64::new(0));
+        let lane_got = Arc::new(AtomicU64::new(0));
+        fetch_segment(
+            &client,
+            &url,
+            None,
+            (0, payload.len() as u64),
+            Duration::from_secs(2),
+            Arc::clone(&slot),
+            (Arc::clone(&delivered), Arc::clone(&lane_got)),
+        )
+        .await
+        .expect("segment survives reset + 503 and completes");
+        server.await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(*slot.lock().unwrap(), payload);
+        assert_eq!(delivered.load(Ordering::Relaxed), payload.len() as u64);
     }
 }
