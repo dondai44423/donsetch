@@ -1028,7 +1028,7 @@ async fn resolve_remote_ws_url(cdp_url: &str) -> Result<String, String> {
             if !path.ends_with("/json/version") {
                 version_url.set_path(&format!("{path}/json/version"));
             }
-            let client = reqwest::Client::builder()
+            let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
                 .timeout(std::time::Duration::from_secs(5))
                 .no_proxy()
                 .build()
@@ -1199,6 +1199,7 @@ async fn page_ws(
 ) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
     let endpoint = format!("http://127.0.0.1:{port}/json/list");

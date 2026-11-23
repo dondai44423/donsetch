@@ -467,24 +467,31 @@ fn add_configured_roots() {
 
 pub(crate) fn configured_roots(file: &str, dir: &str) -> Vec<Vec<u8>> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let file = file.trim();
     if !file.is_empty() {
         paths.push(file.into());
     }
-    if !dir.is_empty()
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        let mut found: Vec<std::path::PathBuf> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| {
-                        matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer")
+    let dir = dir.trim();
+    if !dir.is_empty() {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut found: Vec<std::path::PathBuf> = entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| {
+                                matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer")
+                            })
                     })
-            })
-            .collect();
-        found.sort();
-        paths.extend(found);
+                    .collect();
+                found.sort();
+                paths.extend(found);
+            }
+            Err(error) => {
+                crate::diag!("[tls] cannot read directory {dir}: {error}");
+            }
+        }
     }
     paths
         .into_iter()

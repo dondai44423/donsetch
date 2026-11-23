@@ -168,11 +168,13 @@ mod imp {
             }
             let tmp = dst.with_extension("tmp");
             let url = format!("{BASE}/{}", m.name);
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
-                .user_agent("donsetch/0.1 (+https://github.com/dondai44423/donsetch)")
-                .build()
-                .map_err(|e| e.to_string())?;
+            let client = crate::egress::trust::with_trusted_roots_blocking(
+                reqwest::blocking::Client::builder(),
+            )
+            .timeout(std::time::Duration::from_secs(600))
+            .user_agent("donsetch/0.1 (+https://github.com/dondai44423/donsetch)")
+            .build()
+            .map_err(|e| e.to_string())?;
             let mut r = client
                 .get(&url)
                 .send()

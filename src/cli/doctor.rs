@@ -664,7 +664,19 @@ fn check_fetch_egress() -> CheckResult {
         }
     };
     let (sys_roots, env_roots) = crate::egress::trust::trust_store_report();
-    let cert_bundle = std::env::var_os("SSL_CERT_FILE").map(|p| p.to_string_lossy().into_owned());
+    let cert_bundle = std::env::var_os("SSL_CERT_FILE")
+        .filter(|v| !v.is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+    let cert_dir_env = std::env::var_os("SSL_CERT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(|p| p.to_string_lossy().into_owned());
+    let tls = &crate::config::cfg().tls;
+    let tls_configured = !tls.cert_file.trim().is_empty() || !tls.cert_dir.trim().is_empty();
+    let tls_roots = if tls_configured {
+        crate::egress::trust::configured_root_count()
+    } else {
+        0
+    };
 
     let mut bits = Vec::new();
     if let Some(p) = resolved {
@@ -678,24 +690,55 @@ fn check_fetch_egress() -> CheckResult {
                 .into()
         });
     }
-    match cert_bundle {
-        Some(b) => {
+    let mut warn = false;
+    let mut trust = match (cert_bundle, cert_dir_env) {
+        (Some(b), Some(d)) => {
             if env_roots > 0 {
-                bits.push(format!(
-                    "trust: {sys_roots} system roots + {env_roots} from {b}"
-                ));
-                CheckResult::Pass(bits.join(" · "))
+                format!("trust: {sys_roots} system roots + {env_roots} from {b} / {d}")
             } else {
-                bits.push(format!("trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"));
-                CheckResult::Warn(bits.join(" · "))
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {b} / {d} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
             }
         }
-        None => {
-            bits.push(format!(
-                "trust: {sys_roots} system roots; SSL_CERT_FILE unset"
-            ));
-            CheckResult::Pass(bits.join(" · "))
+        (Some(b), None) => {
+            if env_roots > 0 {
+                format!("trust: {sys_roots} system roots + {env_roots} from {b}")
+            } else {
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {b} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
+            }
         }
+        (None, Some(d)) => {
+            if env_roots > 0 {
+                format!("trust: {sys_roots} system roots + {env_roots} from {d}")
+            } else {
+                warn = true;
+                format!(
+                    "trust: {sys_roots} system roots; {d} set but yielded no parseable certs (the interception CA will NOT be trusted)"
+                )
+            }
+        }
+        (None, None) => format!("trust: {sys_roots} system roots; SSL_CERT_FILE unset"),
+    };
+    if tls_configured {
+        if tls_roots > 0 {
+            trust.push_str(&format!(" + {tls_roots} from [tls]"));
+        } else {
+            warn = true;
+            trust.push_str(
+                "; [tls] cert_file/cert_dir set but yielded no parseable certs (configured CA will NOT be trusted)",
+            );
+        }
+    }
+    bits.push(trust);
+    if warn {
+        CheckResult::Warn(bits.join(" · "))
+    } else {
+        CheckResult::Pass(bits.join(" · "))
     }
 }
 
@@ -2057,7 +2100,7 @@ async fn bright_zone_probe_async(
     zone: &str,
     product: &str,
 ) -> ZoneProbeOut {
-    let client = match reqwest::Client::builder()
+    let client = match crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -3015,6 +3058,44 @@ mod bright_probe_tests {
     fn json_escape_handles_windows_paths() {
         let path = r#"C:\Users\A "B"\donsetch.exe"#;
         assert_eq!(json_escape(path), serde_json::to_string(path).unwrap());
+    }
+
+    #[test]
+    fn check_fetch_egress_reports_valid_tls_cert_file() {
+        let cert = rcgen::generate_simple_self_signed(vec!["corp.example".into()]).unwrap();
+        let bundle = crate::paths::cache_dir().join("doctor-tls-valid.pem");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, cert.cert.pem()).unwrap();
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.tls.cert_file = bundle.to_string_lossy().into_owned();
+        crate::config::install(config).unwrap();
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+        match super::check_fetch_egress() {
+            super::CheckResult::Pass(msg) => assert!(msg.contains("+ 1 from [tls]"), "{msg}"),
+            other => panic!("expected Pass with [tls] count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_fetch_egress_warns_on_unreadable_tls_cert_file() {
+        let mut config = crate::config::DonsetchConfig::default();
+        config.proxy.from_environment = false;
+        config.tls.cert_file = "/nonexistent/donsetch-missing-ca.pem".into();
+        crate::config::install(config).unwrap();
+        unsafe {
+            std::env::remove_var("SSL_CERT_FILE");
+            std::env::remove_var("SSL_CERT_DIR");
+        }
+        match super::check_fetch_egress() {
+            super::CheckResult::Warn(msg) => {
+                assert!(msg.contains("[tls] cert_file/cert_dir set"), "{msg}")
+            }
+            other => panic!("expected Warn on unreadable [tls] cert_file, got {other:?}"),
+        }
     }
 }
 

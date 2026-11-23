@@ -822,7 +822,7 @@ async fn unlock_inner(
             cfg.max_daily
         )));
     }
-    let client = reqwest::Client::builder()
+    let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .timeout(cfg.timeout)
         .no_gzip()
         .no_deflate()
