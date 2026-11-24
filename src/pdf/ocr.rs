@@ -177,7 +177,7 @@ mod cache {
         }
 
         pub(super) fn get_or_init<F>(
-            self: &'static Self,
+            &'static self,
             idx: usize,
             ttl: Duration,
             build: F,
@@ -254,6 +254,7 @@ mod cache {
             }
         }
 
+        #[cfg(feature = "ocr")]
         pub(super) fn touch(&self, idx: usize) {
             let mut g = self
                 .inner
@@ -331,7 +332,9 @@ mod cache {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = self.cvar.wait_timeout(g, wait.max(Duration::from_millis(10)));
+                let _ = self
+                    .cvar
+                    .wait_timeout(g, wait.max(Duration::from_millis(10)));
             }
         }
     }
