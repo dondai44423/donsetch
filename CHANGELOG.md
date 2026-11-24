@@ -1,5 +1,31 @@
 # Changelog
 
+## [5.5.11] - 2026-11-24
+
+### Security
+
+- **Patched `cookie` fork-nonce advisory (`RUSTSEC-2026-0594`).** Upgraded `cookie` from `0.18.2` to `0.18.3` to unblock `cargo-deny` and obtain private cookie nonces directly from the OS RNG.
+
+### Added
+
+- **Keyless image search, rank-badged contact sheets, and direct raster image fetch (#471).**
+  - `web_search` with explicit `intent: "image"` (`--intent image`, never auto-detected) now queries Bing Images, DuckDuckGo Images, and Wikimedia Commons concurrently using DonSeTch's trusted TLS roots, configured proxies/timeouts, and explicit `lang` / `query_variants`, fusing hits with cross-source RRF consensus, canonical URL deduplication, pixel-dimension extraction, resolution/aspect quality scoring, and watermarked stock-preview demotion.
+  - Pair with `contact_sheet: true` (`--sheet` / CLI `--out PATH` or `--out=PATH`) to composite up to 9 thumbnails (per-hop SSRF-guarded, streaming-capped at 4 MiB, `CatmullRom` resampling, 360×240 framed cells with `#1`–`#9` badges preserving list rank) into an inline MCP `image/png` block, with MCP `S`-handles bound to the returned image URLs.
+  - `web_fetch` now returns direct PNG, JPEG, WebP, and GIF URLs up to 8 MiB (verified strictly by magic bytes so mislabeled HTML errors never slip through) as native MCP `image` content blocks with pixel dimensions (`read_status: "image"`), rejects text-only projections (`focus`/`toc`/`section`/`must_contain`) and oversized images honestly, and supports CLI `--out PATH`.
+- **Configurable search fan-out timeout (#470).** Added `[search] timeout_ms` (`DONSETCH_SEARCH__TIMEOUT_MS`, default `4000`, range `1000..=120000`), scaling soft/late fan-out marks, per-lane budgets, and reqwest search connect timeouts coherently for high-RTT or proxied links.
+- **Official multi-arch GHCR container publishing (#469).** Added `.github/workflows/docker-publish.yml` (dispatched alongside `npm-publish.yml` on every release) to package the gated, SHA-256-verified `linux-x64` and `linux-arm64` release binaries into multi-arch `ghcr.io/dondai44423/donsetch` images.
+
+### Performance
+
+- **Bounded OCR thread pools and idle ONNX session eviction (#475).** PP-OCRv5 ONNX Runtime sessions now cap intra-op threads to `min(cores, 4)` by default (`[fetch] ocr_threads`), set `inter_threads = 1`, disable parallel execution, memory-pattern retention, and worker spinning, and unload idle engines after `[fetch] ocr_idle_secs` (default `120` s; `0` disables) via a lazily spawned reaper thread that trims glibc arenas on Linux and exits once all slots are empty.
+
+### Fixed
+
+- **Self-hosted proof-of-work bot checks classified as walls (#473).** Recognized go-away (`"Checking you are not a bot"`) and Anubis (`"Making sure you're not a bot!"`, including typographic apostrophes and `anubis_challenge`) in both `donsetch-fetch`'s generic content contract and `src/detect/walls.rs` while keeping substantive articles unaffected.
+- **DataDome walls behind Cloudflare CDN classified as DataDome (#474).** Checked explicit `cf-mitigated: challenge` first and `x-datadome` / `x-datadome-cid` (and active `captcha-delivery.com` markers) ahead of generic Cloudflare CDN markers so DataDome 403s behind Cloudflare report `Challenge(DataDome)` instead of `Challenge(Cloudflare)`.
+- **Explicit `lang` BYOK bypass disclosure, fallback guard, and provider metadata parity (#472).** A configured BYOK-first provider skipped because of explicit `lang` is now recorded as `{"id": "byok", "status": "skipped: explicit lang", "state": "not asked"}` in `sources` and surfaced in the Markdown census; local-first last-resort BYOK fallback now honors explicit `lang`; CLI `--lang` help documents the bypass; and `_meta["com.donsetch/search-debug"].provider` now emits `"keyless"` to match `structuredContent.provider`.
+- **Minor config-show polish.** Corrected `[search] serp_instant`'s `config show` default label from `true` to `false`.
+
 ## [5.5.10] - 2026-11-23
 
 ### Security
