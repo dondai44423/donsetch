@@ -739,7 +739,14 @@ mod tests {
             <p>Preparing verification. This is taking longer than expected. Your browser is still working.</p>\
             <p>I'm sorry, JavaScript is required to complete this browser check.</p></body></html>";
         assert_eq!(refusal_page(go_away), Some("checking you are not a bot"));
-        assert!(!verify(go_away, "https://redlib.r4fo.com/r/nyc/new", &Contract::generic()).passed);
+        assert!(
+            !verify(
+                go_away,
+                "https://redlib.r4fo.com/r/nyc/new",
+                &Contract::generic()
+            )
+            .passed
+        );
 
         let anubis = "<html><head><title>Making sure you\u{2019}re not a bot!</title></head>\
             <body><h1>Making sure you\u{2019}re not a bot!</h1>\
@@ -755,6 +762,13 @@ mod tests {
                 .repeat(30)
         );
         assert_eq!(refusal_page(&article), None);
-        assert!(verify(&article, "https://blog.example.org/pow", &Contract::generic()).passed);
+        assert!(
+            verify(
+                &article,
+                "https://blog.example.org/pow",
+                &Contract::generic()
+            )
+            .passed
+        );
     }
 }
