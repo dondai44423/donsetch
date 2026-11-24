@@ -72,20 +72,46 @@ use egress::EgressPool;
 use intent::Intent;
 use rank::Merged;
 
-/// How long the fan-out may run before the call commits to what has answered.
-/// Sources answer in 0.8–1.4 s on this network, so this is a cap on the tail,
-/// not a target: a lane still running at the mark is reported `late` and
-/// cancelled. A caller's `deadline_ms` shrinks it further.
+/// Default fan-out soft/hard/late marks (used at default `[search] timeout_ms = 4000`).
 const FANOUT_SOFT_MARK: Duration = Duration::from_millis(1200);
-
-/// Never wait past this, however slow the sources are: a search with no answer
-/// after four seconds is answered by `late`, not by a longer wait.
 const FANOUT_HARD_MARK: Duration = Duration::from_millis(4000);
-/// How long past the soft mark the call still listens for a straggler: the
-/// third source is usually a few hundred milliseconds behind, not absent, and
-/// waiting for it is what makes three sources agree. Past that, the answer is
-/// what it is.
 const FANOUT_LATE_MARK: Duration = Duration::from_millis(600);
+
+/// Effective `(soft, hard, late)` fan-out marks derived from `[search] timeout_ms`.
+/// At the default 4000 ms these equal `(1200 ms, 4000 ms, 600 ms)`; raising
+/// `timeout_ms` for slow links or proxies scales all three proportionally so
+/// lanes are not cut off mid-handshake (#470).
+pub(crate) fn fanout_marks_for(timeout_ms: u64) -> (Duration, Duration, Duration) {
+    if timeout_ms == FANOUT_HARD_MARK.as_millis() as u64 {
+        return (FANOUT_SOFT_MARK, FANOUT_HARD_MARK, FANOUT_LATE_MARK);
+    }
+    let hard_ms = timeout_ms.clamp(1_000, 120_000);
+    let soft_ms = ((hard_ms * 3) / 10).clamp(300, hard_ms.saturating_sub(300).max(300));
+    let late_ms = ((hard_ms * 3) / 20).clamp(200, 5_000);
+    (
+        Duration::from_millis(soft_ms),
+        Duration::from_millis(hard_ms),
+        Duration::from_millis(late_ms),
+    )
+}
+
+pub(crate) fn fanout_soft_mark() -> Duration {
+    fanout_marks_for(crate::config::cfg().search.timeout_ms).0
+}
+
+pub(crate) fn fanout_hard_mark() -> Duration {
+    fanout_marks_for(crate::config::cfg().search.timeout_ms).1
+}
+
+pub(crate) fn fanout_late_mark() -> Duration {
+    fanout_marks_for(crate::config::cfg().search.timeout_ms).2
+}
+
+/// TCP/TLS connect timeout for reqwest-based search lanes, scaling up from 3 s
+/// when `[search] timeout_ms` is raised for high-RTT or proxied links (#470).
+pub(crate) fn search_connect_timeout() -> Duration {
+    (fanout_hard_mark() * 3 / 4).clamp(Duration::from_secs(3), Duration::from_secs(15))
+}
 
 /// The longest a call waits for a lane's own pace before deciding the lane is
 /// not worth planning. A token bucket refills in seconds; a four-second wait is
@@ -100,7 +126,7 @@ const PACE_WAIT_MAX: Duration = Duration::from_millis(1200);
 /// makes the mark real.
 fn lane_budget() -> Duration {
     stage_budget(
-        FANOUT_HARD_MARK + Duration::from_millis(400),
+        fanout_hard_mark() + Duration::from_millis(400),
         Duration::from_millis(200),
     )
 }

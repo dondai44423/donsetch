@@ -163,7 +163,7 @@ impl Client {
         let mut builder = crate::egress::trust::with_trusted_roots(HttpClient::builder())
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(3))
+            .connect_timeout(super::search_connect_timeout())
             .pool_max_idle_per_host(2)
             .no_proxy();
         if let Some(proxy) = proxy {

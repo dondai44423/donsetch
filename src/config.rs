@@ -166,6 +166,10 @@ section!(SearchSection {
     /// D5: the most lanes one search may ask. A lane past the budget is
     /// reported `not-asked`, never silently dropped.
     request_budget: usize = 6,
+    /// Search fan-out hard timeout in milliseconds (1000..=120000, default
+    /// 4000). Soft/late marks, per-lane budgets, and engine connect timeouts
+    /// scale coherently from this value for high-RTT or proxied links (#470).
+    timeout_ms: u64 = 4000,
     /// How much of the top family vote the lexical evidence may move a result
     /// by, 0..=1. **0 ships**: a hand-set share was measured against the vote and
     /// lost (`entity` −0.12, `paper` −0.12 hit@1 over 86 rows), because BM25
@@ -1788,9 +1792,16 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
+            "timeout_ms",
+            FieldKind::Int,
+            "4000",
+            "search fan-out timeout in ms (1000..=120000); scales soft/late marks and per-lane budgets",
+        ),
+        (
+            "search",
             "serp_instant",
             FieldKind::Bool,
-            "true",
+            "false",
             "extract byte-derived featured/instant/knowledge answers from SERP HTML",
         ),
         // browser
@@ -2207,6 +2218,9 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.fetch.shadow_deadline_ms == 0 || c.fetch.shadow_deadline_ms > 60_000 {
         return err("fetch.shadow_deadline_ms must be 1..=60_000".into());
+    }
+    if !(1_000..=120_000).contains(&c.search.timeout_ms) {
+        return err("search.timeout_ms must be 1000..=120000".into());
     }
     if c.browser.probe_scan_secs == 0 || c.browser.probe_scan_secs > 3600 {
         return err("browser.probe_scan_secs must be 1..=3600".into());
@@ -4346,5 +4360,33 @@ mod tests {
         );
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn issue_470_search_timeout_ms_defaults_loads_and_validates() {
+        let def = DonsetchConfig::default();
+        assert_eq!(def.search.timeout_ms, 4000);
+        assert!(validate(&def).is_ok());
+
+        let mut custom = def.clone();
+        custom.search.timeout_ms = 12_000;
+        assert!(validate(&custom).is_ok());
+
+        let mut too_low = def.clone();
+        too_low.search.timeout_ms = 500;
+        assert!(validate(&too_low).is_err());
+
+        let mut too_high = def;
+        too_high.search.timeout_ms = 300_000;
+        assert!(validate(&too_high).is_err());
+
+        // Typed env override DONSETCH_SEARCH__TIMEOUT_MS.
+        let (map, warnings, errors) = new_env_layer_from(vec![(
+            std::ffi::OsString::from("DONSETCH_SEARCH__TIMEOUT_MS"),
+            std::ffi::OsString::from("15000"),
+        )]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(map.contains_key("search"));
     }
 }

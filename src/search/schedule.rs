@@ -115,10 +115,12 @@ pub(super) async fn run<'a>(
     let mut reserves_launched = 0usize;
     let mut soft_hedged = false;
     let start = tokio::time::Instant::now();
-    let soft = start + super::stage_budget(super::FANOUT_SOFT_MARK, Duration::from_millis(300));
-    let hard = start + super::stage_budget(super::FANOUT_HARD_MARK, Duration::from_millis(200));
-    let news_mark = (start + Duration::from_millis(1800)).min(hard);
-    let priority_mark = (start + Duration::from_millis(2200)).min(hard);
+    let soft_dur = super::stage_budget(super::fanout_soft_mark(), Duration::from_millis(300));
+    let hard_dur = super::stage_budget(super::fanout_hard_mark(), Duration::from_millis(200));
+    let soft = start + soft_dur;
+    let hard = start + hard_dur;
+    let news_mark = (start + (hard_dur * 9 / 20).max(Duration::from_millis(1800))).min(hard);
+    let priority_mark = (start + (hard_dur * 11 / 20).max(Duration::from_millis(2200))).min(hard);
     let mut pending: HashMap<String, usize> = HashMap::new();
     let mut futures: FuturesUnordered<TaskFut<'a>> = FuturesUnordered::new();
     for (name, future) in lanes {
@@ -192,7 +194,7 @@ pub(super) async fn run<'a>(
         } else if news_pending {
             news_mark
         } else {
-            (soft + super::FANOUT_LATE_MARK).min(hard)
+            (soft + super::fanout_late_mark()).min(hard)
         };
         if now >= until {
             break;
@@ -476,5 +478,23 @@ mod tests {
         );
         assert!(starts["bing"] < Duration::from_millis(100), "{starts:?}");
         assert!(starts["parallel-mcp"] <= starts["bing"], "{starts:?}");
+    }
+
+    #[test]
+    fn issue_470_fanout_marks_preserve_defaults_and_scale_up() {
+        let (soft, hard, late) = super::super::fanout_marks_for(4000);
+        assert_eq!(soft, Duration::from_millis(1200));
+        assert_eq!(hard, Duration::from_millis(4000));
+        assert_eq!(late, Duration::from_millis(600));
+
+        let (soft, hard, late) = super::super::fanout_marks_for(12_000);
+        assert_eq!(soft, Duration::from_millis(3600));
+        assert_eq!(hard, Duration::from_millis(12_000));
+        assert_eq!(late, Duration::from_millis(1800));
+
+        // Clamped extremes remain sane (soft < hard).
+        let (soft, hard, late) = super::super::fanout_marks_for(1000);
+        assert_eq!(hard, Duration::from_millis(1000));
+        assert!(soft < hard && late > Duration::ZERO);
     }
 }
