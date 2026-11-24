@@ -59,6 +59,7 @@ The first `donsetch` command downloads a SHA256-verified release binary. No inst
 | Install | Command |
 |---|---|
 | Homebrew · macOS/Linux | `brew tap dondai44423/donsetch && brew install donsetch` |
+| Docker · GHCR | `docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest` |
 | Pi native extension | `pi install npm:donsetch` |
 | DeepSeek Harness plugin | `dsh plugin --profile web add github:dondai44423/donsetch-dsh` |
 

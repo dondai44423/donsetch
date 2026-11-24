@@ -3,6 +3,8 @@
 # stdio mode (default), for MCP clients that launch the server as a
 # subprocess (Claude Code, Cursor, etc.):
 #
+#   docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest   (prebuilt GHCR image)
+#   or build locally:
 #   docker compose build
 #   docker compose run --rm donsetch
 #
