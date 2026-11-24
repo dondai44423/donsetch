@@ -450,11 +450,13 @@ jobs:
       # Its own run, not a job of this one. `workflow_dispatch` is the one event
       # GITHUB_TOKEN may raise, and a top-level run gets its own conclusion: the
       # release above is already published, and a red npm run stays red alone.
-      - name: Dispatch the npm publish
+      - name: Dispatch the npm and Docker publishes
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ needs.plan.outputs.version }}
-        run: gh workflow run npm-publish.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG"
+        run: |
+          gh workflow run npm-publish.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG"
+          gh workflow run docker-publish.yml -R "$GITHUB_REPOSITORY" -f tag="$TAG"
 
   # ── The one required check ─────────────────────────────────────────────────
   gate:

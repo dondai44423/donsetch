@@ -151,7 +151,19 @@ For host policies, use [local rules](rules.md). For egress configuration, use th
 
 ## Docker
 
-From a checkout:
+Prebuilt multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub Container Registry on each release:
+
+```bash
+# Stdio process for an MCP client.
+docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest
+
+# Or start the streamable HTTP service.
+docker run -d -p 127.0.0.1:8765:8765 \
+  -e DONSETCH_TRANSPORT=http -e DONSETCH_HTTP_HOST=0.0.0.0 \
+  ghcr.io/dondai44423/donsetch:latest
+```
+
+To build locally from a checkout instead:
 
 ```bash
 docker build -t donsetch-mcp .

@@ -1,0 +1,165 @@
+# Publish multi-arch container images (linux/amd64, linux/arm64) to GitHub
+# Container Registry (ghcr.io/dondai44423/donsetch).
+#
+# Runs as its own workflow, matching npm-publish.yml: ci.yml's publish job
+# dispatches it (`gh workflow run`) once the GitHub release and its gated
+# Linux tarballs exist, so a registry failure never reddens the release run.
+# Packages the exact sha256-verified binaries already built and gated by CI
+# instead of recompiling Rust/V8/BoringSSL under QEMU.
+
+name: Docker publish (GHCR)
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  release:
+    types: [released, prereleased]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (default: the newest published release)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    name: publish ghcr.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          TAG="$RAW_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/${{ github.repository }}/releases" \
+              --jq '[.[] | select(.draft == false)][0].tag_name')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::could not resolve a release tag"
+            exit 1
+          fi
+          VER="${TAG#v}"
+          CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$VER" != "$CARGO_VER" ]; then
+            echo "::error::Cargo.toml ($CARGO_VER) does not match release tag ($VER)"
+            exit 1
+          fi
+          IS_PRE=false
+          case "$VER" in *-*) IS_PRE=true ;; esac
+          MAJOR="${VER%%.*}"
+          MINOR="${VER%.*}"
+          IMAGE="${REGISTRY}/$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "tag=$TAG"
+            echo "version=$VER"
+            echo "tags<<EOF"
+            echo "${IMAGE}:${VER}"
+            if [ "$IS_PRE" = false ]; then
+              echo "${IMAGE}:${MINOR}"
+              echo "${IMAGE}:${MAJOR}"
+              echo "${IMAGE}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $TAG (version=$VER prerelease=$IS_PRE image=$IMAGE)"
+
+      - name: Download and verify gated Linux release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          mkdir -p _docker/dl _docker/dist/amd64 _docker/dist/arm64
+          gh release download "$TAG" -D _docker/dl \
+            -p 'donsetch-linux-x64.tar.gz' \
+            -p 'donsetch-linux-x64.tar.gz.sha256' \
+            -p 'donsetch-linux-arm64.tar.gz' \
+            -p 'donsetch-linux-arm64.tar.gz.sha256'
+          (cd _docker/dl && sha256sum -c donsetch-linux-x64.tar.gz.sha256)
+          (cd _docker/dl && sha256sum -c donsetch-linux-arm64.tar.gz.sha256)
+          tar -xzf _docker/dl/donsetch-linux-x64.tar.gz -C _docker/dist/amd64
+          tar -xzf _docker/dl/donsetch-linux-arm64.tar.gz -C _docker/dist/arm64
+          chmod +x _docker/dist/amd64/donsetch _docker/dist/arm64/donsetch
+          ls -la _docker/dist/amd64 _docker/dist/arm64
+
+      - name: Generate release Dockerfile
+        run: |
+          cat > _docker/Dockerfile <<'DOCKERFILE'
+          # syntax=docker/dockerfile:1
+          FROM debian:trixie-slim
+
+          ARG TARGETARCH
+          ARG VERSION
+          ARG REVISION
+
+          LABEL org.opencontainers.image.title="DonSeTch" \
+                org.opencontainers.image.description="Local browserless web fetch, keyless search, site-model crawl, and screenshot MCP server" \
+                org.opencontainers.image.url="https://github.com/dondai44423/donsetch" \
+                org.opencontainers.image.source="https://github.com/dondai44423/donsetch" \
+                org.opencontainers.image.licenses="AGPL-3.0-only" \
+                org.opencontainers.image.version="${VERSION}" \
+                org.opencontainers.image.revision="${REVISION}"
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                  ca-certificates \
+                  libgcc-s1 \
+              && rm -rf /var/lib/apt/lists/*
+
+          COPY dist/${TARGETARCH}/ /usr/local/bin/
+
+          RUN donsetch --version
+
+          RUN useradd -m -u 1000 donsetch \
+              && mkdir -p /home/donsetch/.cache/donsetch \
+              && chown -R donsetch:donsetch /home/donsetch/.cache
+
+          USER donsetch
+          WORKDIR /home/donsetch
+
+          VOLUME /home/donsetch/.cache/donsetch
+
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+              CMD donsetch --version || exit 1
+
+          EXPOSE 8765
+
+          CMD ["donsetch", "mcp", "--supervised"]
+          DOCKERFILE
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: _docker
+          file: _docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
