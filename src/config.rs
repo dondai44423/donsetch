@@ -116,6 +116,14 @@ section!(FetchSection {
     pdf_max_mb: usize = 100,
     ocr: bool = true,
     ocr_max_pages: u32 = 25,
+    /// Intra-op threads per ONNX OCR session (0 = auto, capped at 4).
+    /// Bounding this avoids spawning 2x-core thread pools in long-lived MCP
+    /// daemons (#475).
+    ocr_threads: u32 = 0,
+    /// Idle seconds before cached OCR ONNX sessions are dropped to release
+    /// CPU memory arenas and worker threads (0 = keep loaded for process life,
+    /// default 120s, #475).
+    ocr_idle_secs: u64 = 120,
     resume_ttl_secs: u64 = 7200,
     host_pace_file: bool = true,
     /// How long a resolved name is reused in-process, in seconds. The
@@ -1622,6 +1630,20 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "fetch",
+            "ocr_threads",
+            FieldKind::Int,
+            "0",
+            "intra-op threads per OCR ONNX session (0 = auto capped at 4, max 64)",
+        ),
+        (
+            "fetch",
+            "ocr_idle_secs",
+            FieldKind::Int,
+            "120",
+            "idle seconds before unloading OCR ONNX sessions to reclaim memory and threads (0..=86400; 0 disables)",
+        ),
+        (
+            "fetch",
             "resume_ttl_secs",
             FieldKind::Int,
             "7200",
@@ -2215,6 +2237,12 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if c.fetch.ocr_max_pages == 0 || c.fetch.ocr_max_pages > 500 {
         return err("fetch.ocr_max_pages must be 1..=500".into());
+    }
+    if c.fetch.ocr_threads > 64 {
+        return err("fetch.ocr_threads must be 0..=64".into());
+    }
+    if c.fetch.ocr_idle_secs > 86_400 {
+        return err("fetch.ocr_idle_secs must be 0..=86400".into());
     }
     if c.fetch.shadow_deadline_ms == 0 || c.fetch.shadow_deadline_ms > 60_000 {
         return err("fetch.shadow_deadline_ms must be 1..=60_000".into());

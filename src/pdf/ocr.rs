@@ -122,27 +122,284 @@ pub fn ready(script_hint: &str) -> Result<(), String> {
     }
 }
 
+/// Effective intra-op thread count per ONNX Runtime OCR session.
+///
+/// OCR runs serially behind `ENGINE_MUTEX` one page at a time, so letting each
+/// ONNX model spin up a full-core pool (e.g. 24 threads × 2 models = 48+ idle
+/// threads) bloats long-lived MCP daemons without improving throughput (#475).
+#[cfg(any(feature = "ocr", test))]
+fn ocr_intra_threads_for(configured: u32, available_cores: usize) -> usize {
+    if configured > 0 {
+        return (configured as usize).min(64);
+    }
+    available_cores.clamp(1, 4)
+}
+
+#[cfg(any(feature = "ocr", test))]
+mod cache {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct CachedSlot<T> {
+        engine: Arc<T>,
+        last_used: Instant,
+    }
+
+    struct Inner<T> {
+        slots: [Option<CachedSlot<T>>; 3],
+        fatal: [Option<String>; 3],
+        reaper_active: bool,
+    }
+
+    /// Idle-evicting cache for the three OCR recognizers (En, Zh, Deva).
+    ///
+    /// Keeps an active engine warm across pages and back-to-back PDFs, then
+    /// drops its ONNX Runtime sessions once idle for `ttl` so CPU memory arenas
+    /// and worker threads are returned to the OS (#475). The background reaper
+    /// thread spawns lazily and exits as soon as all slots are empty.
+    pub(super) struct IdleEngineCache<T: Send + Sync + 'static> {
+        inner: Mutex<Inner<T>>,
+        cvar: Condvar,
+        init_lock: Mutex<()>,
+    }
+
+    impl<T: Send + Sync + 'static> IdleEngineCache<T> {
+        pub(super) const fn new() -> Self {
+            Self {
+                inner: Mutex::new(Inner {
+                    slots: [None, None, None],
+                    fatal: [None, None, None],
+                    reaper_active: false,
+                }),
+                cvar: Condvar::new(),
+                init_lock: Mutex::new(()),
+            }
+        }
+
+        pub(super) fn get_or_init<F>(
+            self: &'static Self,
+            idx: usize,
+            ttl: Duration,
+            build: F,
+        ) -> Result<Arc<T>, String>
+        where
+            F: FnOnce() -> Result<T, String>,
+        {
+            {
+                let mut g = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(slot) = g.slots[idx].as_mut() {
+                    slot.last_used = Instant::now();
+                    return Ok(Arc::clone(&slot.engine));
+                }
+                if let Some(err) = g.fatal[idx].as_ref() {
+                    return Err(err.clone());
+                }
+            }
+
+            // Serialize cold engine builds without holding the cache lock
+            // across model downloads or ONNX session creation.
+            let _init = self
+                .init_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            {
+                let mut g = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(slot) = g.slots[idx].as_mut() {
+                    slot.last_used = Instant::now();
+                    return Ok(Arc::clone(&slot.engine));
+                }
+                if let Some(err) = g.fatal[idx].as_ref() {
+                    return Err(err.clone());
+                }
+            }
+
+            match build() {
+                Ok(engine) => {
+                    let arc = Arc::new(engine);
+                    let mut g = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    g.slots[idx] = Some(CachedSlot {
+                        engine: Arc::clone(&arc),
+                        last_used: Instant::now(),
+                    });
+                    if !ttl.is_zero() && !g.reaper_active {
+                        g.reaper_active = true;
+                        let spawned = std::thread::Builder::new()
+                            .name("ocr-idle-reaper".into())
+                            .spawn(move || self.reap_loop(ttl));
+                        if spawned.is_err() {
+                            g.reaper_active = false;
+                        }
+                    } else if !ttl.is_zero() {
+                        self.cvar.notify_one();
+                    }
+                    Ok(arc)
+                }
+                Err(err) => {
+                    let mut g = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    g.fatal[idx] = Some(err.clone());
+                    Err(err)
+                }
+            }
+        }
+
+        pub(super) fn touch(&self, idx: usize) {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(slot) = g.slots[idx].as_mut() {
+                slot.last_used = Instant::now();
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn loaded_count(&self) -> usize {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .slots
+                .iter()
+                .filter(|s| s.is_some())
+                .count()
+        }
+
+        #[cfg(test)]
+        pub(super) fn reaper_active(&self) -> bool {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reaper_active
+        }
+
+        fn reap_loop(&self, ttl: Duration) {
+            loop {
+                let mut evicted: Vec<Arc<T>> = Vec::new();
+                let wait = {
+                    let mut g = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let now = Instant::now();
+                    let mut next_wait: Option<Duration> = None;
+                    for slot in &mut g.slots {
+                        if let Some(cached) = slot {
+                            let elapsed = now.saturating_duration_since(cached.last_used);
+                            if elapsed >= ttl {
+                                if let Some(removed) = slot.take() {
+                                    evicted.push(removed.engine);
+                                }
+                            } else {
+                                let rem = ttl.saturating_sub(elapsed);
+                                next_wait = Some(match next_wait {
+                                    Some(cur) => cur.min(rem),
+                                    None => rem,
+                                });
+                            }
+                        }
+                    }
+                    match next_wait {
+                        Some(w) => w,
+                        None => {
+                            g.reaper_active = false;
+                            // Drop evicted engines outside the lock before exiting.
+                            drop(g);
+                            if !evicted.is_empty() {
+                                drop(evicted);
+                                trim_allocator_after_evict();
+                            }
+                            return;
+                        }
+                    }
+                };
+                if !evicted.is_empty() {
+                    drop(evicted);
+                    trim_allocator_after_evict();
+                }
+                let g = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = self.cvar.wait_timeout(g, wait.max(Duration::from_millis(10)));
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn trim_allocator_after_evict() {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: glibc `malloc_trim(0)` is thread-safe and asks the allocator
+        // to return freed ONNX Runtime arena heap pages back to the kernel.
+        unsafe {
+            let _ = malloc_trim(0);
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn trim_allocator_after_evict() {}
+}
+
 #[cfg(feature = "ocr")]
 mod imp {
     use super::*;
     use sha2::Digest;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
 
     #[allow(clippy::upper_case_acronyms)]
     type OAROCR = oar_ocr::oarocr::OAROCR;
 
-    static ENGINE_EN: OnceLock<Result<OAROCR, String>> = OnceLock::new();
-    static ENGINE_ZH: OnceLock<Result<OAROCR, String>> = OnceLock::new();
-    static ENGINE_DEVA: OnceLock<Result<OAROCR, String>> = OnceLock::new();
+    static ENGINE_CACHE: cache::IdleEngineCache<OAROCR> = cache::IdleEngineCache::new();
     static DL_LOCK: Mutex<()> = Mutex::new(());
     static ENGINE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     /// Recognition space: Latin-dominant docs use the EN recognizer,
     /// CJK-heavy pages the universal recognizer.
+    #[derive(Clone, Copy)]
     pub enum RecKind {
         En,
         Zh,
         Deva,
+    }
+
+    impl RecKind {
+        fn index(self) -> usize {
+            match self {
+                RecKind::En => 0,
+                RecKind::Zh => 1,
+                RecKind::Deva => 2,
+            }
+        }
+    }
+
+    fn ort_session_config() -> oar_ocr::core::config::OrtSessionConfig {
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(2);
+        let threads = ocr_intra_threads_for(crate::config::cfg().fetch.ocr_threads, cores);
+        // Bound thread pools and disable memory-pattern scratchpad retention
+        // and busy-spinning so OCR sessions stay lean inside a long-lived
+        // MCP daemon (#475).
+        oar_ocr::core::config::OrtSessionConfig::new()
+            .with_intra_threads(threads)
+            .with_inter_threads(1)
+            .with_parallel_execution(false)
+            .with_memory_pattern(false)
+            .add_config_entry("session.intra_op.allow_spinning", "0")
+            .add_config_entry("session.inter_op.allow_spinning", "0")
     }
 
     fn sha256_file(path: &std::path::Path) -> Result<String, String> {
@@ -235,13 +492,9 @@ mod imp {
         Ok((det, rec, dict))
     }
 
-    fn engine(kind: &RecKind) -> Result<&'static OAROCR, String> {
-        let cell = match kind {
-            RecKind::En => &ENGINE_EN,
-            RecKind::Zh => &ENGINE_ZH,
-            RecKind::Deva => &ENGINE_DEVA,
-        };
-        cell.get_or_init(|| {
+    fn engine(kind: &RecKind) -> Result<Arc<OAROCR>, String> {
+        let ttl = Duration::from_secs(crate::config::cfg().fetch.ocr_idle_secs);
+        ENGINE_CACHE.get_or_init(kind.index(), ttl, || {
             // Gate: ensure ONNX Runtime is loaded (AVX check + dlopen).
             // If the runtime library is missing or fails to init, return an error;
             // OCR falls back to the glyph stream.
@@ -255,9 +508,11 @@ mod imp {
             let det_s = det.to_string_lossy().to_string();
             let rec_s = rec.to_string_lossy().to_string();
             let dict_s = dict.to_string_lossy().to_string();
+            let session_cfg = ort_session_config();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let result = oar_ocr::oarocr::OAROCRBuilder::new(det_s, rec_s, dict_s)
+                    .ort_session(session_cfg)
                     .build()
                     .map_err(|e| format!("ocr engine init failed: {e}"));
                 let _ = tx.send(result);
@@ -270,8 +525,6 @@ mod imp {
                 ),
             }
         })
-        .as_ref()
-        .map_err(|e| e.clone())
     }
 
     pub fn run_ocr(bitmap: &PageBitmap, kind: &RecKind) -> Result<Vec<super::OcrLine>, String> {
@@ -294,6 +547,9 @@ mod imp {
         let mut results = eng
             .predict(vec![dynimg])
             .map_err(|e| format!("ocr predict failed: {e}"))?;
+        // Refresh the idle clock after inference completes so a long scan
+        // never triggers eviction mid-document.
+        ENGINE_CACHE.touch(kind.index());
         let Some(result) = results.pop() else {
             return Ok(Vec::new());
         };
@@ -498,5 +754,72 @@ pub(crate) mod test_ocr {
                 Err(why) => Err(why.clone()),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cache::IdleEngineCache, ocr_intra_threads_for};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn issue_475_auto_ocr_threads_are_bounded_for_daemons() {
+        assert_eq!(ocr_intra_threads_for(0, 24), 4);
+        assert_eq!(ocr_intra_threads_for(0, 8), 4);
+        assert_eq!(ocr_intra_threads_for(0, 2), 2);
+        assert_eq!(ocr_intra_threads_for(0, 0), 1);
+        // Explicit override is honored up to 64.
+        assert_eq!(ocr_intra_threads_for(6, 24), 6);
+        assert_eq!(ocr_intra_threads_for(128, 24), 64);
+    }
+
+    #[test]
+    fn issue_475_idle_engine_cache_evicts_and_stops_reaper_when_empty() {
+        static CACHE: IdleEngineCache<DropProbe> = IdleEngineCache::new();
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DropProbe;
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let ttl = Duration::from_millis(60);
+        let first = CACHE
+            .get_or_init(0, ttl, || Ok(DropProbe))
+            .expect("initial load");
+        assert_eq!(CACHE.loaded_count(), 1);
+        assert!(CACHE.reaper_active());
+        // Repeat hit reuses the cached engine without rebuilding.
+        let second = CACHE
+            .get_or_init(0, ttl, || Err("should not rebuild while warm".into()))
+            .expect("warm hit");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        drop(first);
+        drop(second);
+
+        // Wait for idle eviction + reaper exit.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (CACHE.loaded_count() > 0 || CACHE.reaper_active()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(CACHE.loaded_count(), 0, "engine should be evicted on idle");
+        assert!(
+            !CACHE.reaper_active(),
+            "reaper thread should exit once all slots are empty"
+        );
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1, "engine must be dropped");
+
+        // Reload after eviction works cleanly.
+        let _reloaded = CACHE
+            .get_or_init(0, Duration::ZERO, || Ok(DropProbe))
+            .expect("reload after eviction");
+        assert_eq!(CACHE.loaded_count(), 1);
+        assert!(
+            !CACHE.reaper_active(),
+            "ttl=0 keeps engine without spawning a reaper"
+        );
     }
 }
