@@ -69,6 +69,10 @@ const REFUSAL_TITLE_PREFIXES: &[&str] = &[
     "security check",
     "one more step",
     "checking your browser",
+    "checking you are not a bot",
+    "making sure you're not a bot",
+    "making sure you are not a bot",
+    "verifying you are not a bot",
     "403 forbidden",
     "error 403",
     "429 too many requests",
@@ -726,5 +730,31 @@ mod tests {
         let verified = verify(body, "https://example.com/", &contract);
         assert!(!verified.passed);
         assert!(verified.failures[0].contains("matched 1 < 2"));
+    }
+
+    #[test]
+    fn self_hosted_pow_bot_checks_fail_generic_content_contract() {
+        let go_away = "<html><head><title>Checking you are not a bot</title></head>\
+            <body><h1 id=\"title\">Checking you are not a bot</h1>\
+            <p>Preparing verification. This is taking longer than expected. Your browser is still working.</p>\
+            <p>I'm sorry, JavaScript is required to complete this browser check.</p></body></html>";
+        assert_eq!(refusal_page(go_away), Some("checking you are not a bot"));
+        assert!(!verify(go_away, "https://redlib.r4fo.com/r/nyc/new", &Contract::generic()).passed);
+
+        let anubis = "<html><head><title>Making sure you\u{2019}re not a bot!</title></head>\
+            <body><h1>Making sure you\u{2019}re not a bot!</h1>\
+            <p>Why am I seeing this? You are seeing this because the administrator of this website has set up Anubis.</p></body></html>";
+        assert_eq!(refusal_page(anubis), Some("making sure you're not a bot"));
+        assert!(!verify(anubis, "https://git.example.org/repo", &Contract::generic()).passed);
+
+        // Substantive article with the same title passes.
+        let article = format!(
+            "<html><head><title>Checking you are not a bot</title></head>\
+            <body><article><h1>Checking you are not a bot</h1><p>{}</p></article></body></html>",
+            "An architectural analysis of proof-of-work gateways for open-source web services. "
+                .repeat(30)
+        );
+        assert_eq!(refusal_page(&article), None);
+        assert!(verify(&article, "https://blog.example.org/pow", &Contract::generic()).passed);
     }
 }

@@ -550,6 +550,10 @@ const INTERSTITIAL_TITLES: &[&str] = &[
     "performing security verification",
     "checking your browser",
     "verifying your browser",
+    "checking you are not a bot",
+    "making sure you're not a bot",
+    "making sure you are not a bot",
+    "verifying you are not a bot",
     "attention required",
     "verify you are human",
     "verify that you are human",
@@ -570,6 +574,7 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
     "captcha-delivery.com",
     "px-captcha",
     "_Incapsula_Resource",
+    "anubis_challenge",
 ];
 
 /// Strong interstitial detection: a page whose TITLE or first H1 is
@@ -803,11 +808,15 @@ pub fn js_micro_shell(body: &[u8], markdown_len: usize) -> bool {
     body.len() < 2048 && markdown_len < 150 && body.windows(7).any(|w| w == b"<script")
 }
 
+fn fold_apostrophes(s: &str) -> String {
+    s.replace(['\u{2019}', '\u{2018}', '\u{02bc}'], "'")
+}
+
 pub fn challenge_text(text: &str) -> bool {
     if text.chars().count() > 1200 {
         return false;
     }
-    let lower = text.to_lowercase();
+    let lower = fold_apostrophes(&text.to_lowercase());
     lower.lines().any(|line| {
         let line = line.trim().trim_start_matches('#').trim();
         INTERSTITIAL_TITLES.iter().any(|m| line.starts_with(m))
@@ -858,20 +867,21 @@ fn interstitial_heading(lower_text: &str, visible: usize) -> bool {
                 let t = &lower_text[from..from + end];
                 // Strip nested tags inside the title (h1 can wrap spans).
                 let mut inside_tag = false;
-                let cleaned: String = t
-                    .chars()
-                    .filter(|c| match c {
-                        '<' => {
-                            inside_tag = true;
-                            false
-                        }
-                        '>' => {
-                            inside_tag = false;
-                            false
-                        }
-                        _ => !inside_tag,
-                    })
-                    .collect();
+                let cleaned: String = fold_apostrophes(
+                    &t.chars()
+                        .filter(|c| match c {
+                            '<' => {
+                                inside_tag = true;
+                                false
+                            }
+                            '>' => {
+                                inside_tag = false;
+                                false
+                            }
+                            _ => !inside_tag,
+                        })
+                        .collect::<String>(),
+                );
                 // A PX human gate can put thousands of translated help
                 // characters inside <article>. Require the observed gate
                 // heading and a real widget element, not an inactive script.
@@ -899,6 +909,12 @@ fn interstitial_heading(lower_text: &str, visible: usize) -> bool {
 }
 
 fn vendor_from_markers(lower_text: &str) -> Option<Vendor> {
+    // Active DataDome challenge iframe before generic Cloudflare markers:
+    // sites behind Cloudflare CDN can carry passive `challenge-platform`
+    // alongside an active DataDome `captcha-delivery.com` wall (#474).
+    if lower_text.contains("captcha-delivery.com") {
+        return Some(Vendor::DataDome);
+    }
     if lower_text.contains("challenges.cloudflare.com")
         || lower_text.contains("challenge-platform")
         || lower_text.contains("cf-chl")
@@ -907,7 +923,7 @@ fn vendor_from_markers(lower_text: &str) -> Option<Vendor> {
     {
         return Some(Vendor::Cloudflare);
     }
-    if lower_text.contains("captcha-delivery.com") || lower_text.contains("datadome") {
+    if lower_text.contains("datadome") {
         return Some(Vendor::DataDome);
     }
     if lower_text.contains("px-captcha") || lower_text.contains("perimeterx") {
@@ -984,34 +1000,28 @@ fn classify_wall(
     // Header-based detection is always active: a
     // cf-mitigated / x-datadome header never lies,
     // regardless of page size.
-    if is_cf && (status == 403 || status == 503) {
-        // CF 403/503: could be a challenge page OR a
-        // WAF block / origin error. Check body for
-        // challenge markers before classifying.
-        if allow_body_markers
-            && (text.contains("just a moment")
-                || text.contains("cf-chl")
-                || text.contains("challenge-platform")
-                || text.contains("cf-turnstile")
-                || text.contains("challenges.cloudflare.com")
-                || text.contains("attention required"))
-        {
-            return Verdict::Challenge(Vendor::Cloudflare);
-        }
-        // No challenge markers : WAF block (403) or
-        // origin error (503). There is nothing to solve.
-        return Verdict::Blocked;
+    //
+    // Explicit edge challenge header (`cf-mitigated: challenge`) wins first:
+    // Cloudflare intercepted at the edge before the origin ran.
+    let cf_mitigated = header(headers, "cf-mitigated")
+        .map(|v| v.to_lowercase().contains("challenge"))
+        .unwrap_or(false);
+    if cf_mitigated && (status == 403 || status == 429 || status == 503) {
+        return Verdict::Challenge(Vendor::Cloudflare);
     }
-    // DataDome: the x-datadome header is present on ALL responses
-    // from DataDome-protected sites (200s with real content AND 403
-    // challenge pages). The header alone is NOT a wall signal :
-    // DataDome runs in monitoring mode on many sites (Forbes,
-    // Reddit), tagging every response but only blocking on
-    // actual bot detection. The wall is:
-    //   - 403/429 + x-datadome = challenge (always, regardless of body)
+    // DataDome: checked BEFORE the generic `is_cf` CDN branch so a DataDome
+    // wall behind Cloudflare CDN (`server: cloudflare`, `cf-ray`,
+    // `x-datadome: protected`, passive `challenge-platform` + active
+    // `captcha-delivery.com`) reports `Vendor::DataDome` instead of being
+    // misattributed to Cloudflare (#474).
+    //
+    // The `x-datadome` header is present on ALL responses from
+    // DataDome-protected sites (200s with real content AND 403 challenge
+    // pages). The wall is:
+    //   - 403/429/503 + x-datadome/x-datadome-cid = challenge (always)
     //   - 200 + x-datadome + small body + datadome/captcha markers = challenge
     //   - 200 + x-datadome + large body = ContentOk (monitoring mode)
-    if header(headers, "x-datadome").is_some() {
+    if header(headers, "x-datadome").is_some() || header(headers, "x-datadome-cid").is_some() {
         // On error statuses, x-datadome always means challenge.
         if status == 403 || status == 429 || status == 503 {
             return Verdict::Challenge(Vendor::DataDome);
@@ -1029,6 +1039,24 @@ fn classify_wall(
         }
         // 200 with x-datadome but no body markers = real content.
         // Fall through to other checks / ContentOk.
+    }
+    if is_cf && (status == 403 || status == 503) {
+        // CF 403/503: could be a challenge page OR a
+        // WAF block / origin error. Check body for
+        // challenge markers before classifying.
+        if allow_body_markers
+            && (text.contains("just a moment")
+                || text.contains("cf-chl")
+                || text.contains("challenge-platform")
+                || text.contains("cf-turnstile")
+                || text.contains("challenges.cloudflare.com")
+                || text.contains("attention required"))
+        {
+            return Verdict::Challenge(Vendor::Cloudflare);
+        }
+        // No challenge markers : WAF block (403) or
+        // origin error (503). There is nothing to solve.
+        return Verdict::Blocked;
     }
 
     // Body markers below. On 2xx these only run for SMALL
@@ -1923,5 +1951,92 @@ mod wave_w_honesty_tests {
             b"<html><body><script>x</script><p>word word word word word word word word word word word word</p></body></html>",
             420
         ));
+    }
+
+    #[test]
+    fn issue_473_self_hosted_pow_bot_checks_are_challenges_not_content() {
+        // go-away Forgejo theme (redlib.r4fo.com, HTTP 200).
+        let go_away = b"<html><head><title>Checking you are not a bot</title>\
+            <link rel=\"stylesheet\" href=\"/.well-known/r4fo-check/assets/static/forgejo/style.css\">\
+            </head><body><h1 id=\"title\">Checking you are not a bot</h1>\
+            <p>Preparing verification</p>\
+            <p>This is taking longer than expected. Your browser is still working.</p>\
+            <p>This browser blocks WebAssembly, which this browser check needs.</p>\
+            <p>I'm sorry, JavaScript is required to complete this browser check.</p></body></html>";
+        assert_eq!(
+            detect(200, &[("server".into(), "openresty".into())], go_away),
+            Verdict::Challenge(Vendor::Generic)
+        );
+        assert!(challenge_text(
+            "Checking you are not a bot\nPreparing verification"
+        ));
+
+        // Anubis PoW page (straight and typographic apostrophes).
+        for title in [
+            "Making sure you're not a bot!",
+            "Making sure you\u{2019}re not a bot!",
+        ] {
+            let anubis = format!(
+                "<html><head><title>{title}</title></head><body><h1>{title}</h1>\
+                <p>Protected by Anubis.</p><script id=\"anubis_challenge\" type=\"application/json\">{{}}</script></body></html>"
+            );
+            assert_eq!(
+                detect(200, &[], anubis.as_bytes()),
+                Verdict::Challenge(Vendor::Generic),
+                "title={title}"
+            );
+        }
+
+        // Negative: a substantive article discussing PoW bot checks stays ContentOk.
+        let article = format!(
+            "<html><head><title>Checking you are not a bot: how proof-of-work challenges work</title></head>\
+            <body><article><h1>Checking you are not a bot</h1><p>{}</p></article></body></html>",
+            "Self-hosted proof-of-work gateways like Anubis and go-away protect git forges from scrapers. ".repeat(25)
+        );
+        assert_eq!(detect(200, &[], article.as_bytes()), Verdict::ContentOk);
+    }
+
+    #[test]
+    fn issue_474_datadome_behind_cloudflare_cdn_is_datadome_not_cloudflare() {
+        // Exact g2.com response shape: Cloudflare CDN headers + passive
+        // `challenge-platform` script in the body, while DataDome actively
+        // issued the 403 block (`x-datadome: protected`, `x-datadome-cid`,
+        // `captcha-delivery.com` iframe).
+        let headers = vec![
+            ("server".into(), "cloudflare".into()),
+            ("cf-ray".into(), "9123456789abcdef-SIN".into()),
+            ("x-datadome".into(), "protected".into()),
+            ("x-datadome-cid".into(), "AHrlqAAAAAMA12345".into()),
+            ("set-cookie".into(), "datadome=abc123; Path=/".into()),
+        ];
+        let body = b"<html><head><title>g2.com</title></head><body>\
+            <script src=\"https://geo.captcha-delivery.com/captcha/?initialCid=abc\"></script>\
+            <iframe src=\"https://geo.captcha-delivery.com/captcha/\"></iframe>\
+            <script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script></body></html>";
+        assert_eq!(
+            detect(403, &headers, body),
+            Verdict::Challenge(Vendor::DataDome)
+        );
+
+        // Negative 1: when Cloudflare itself mitigates at the edge
+        // (`cf-mitigated: challenge`), Cloudflare wins even if x-datadome is
+        // present.
+        let mut cf_headers = headers.clone();
+        cf_headers.push(("cf-mitigated".into(), "challenge".into()));
+        assert_eq!(
+            detect(403, &cf_headers, body),
+            Verdict::Challenge(Vendor::Cloudflare)
+        );
+
+        // Negative 2: HTTP 200 with Cloudflare CDN + DataDome monitoring mode
+        // + real content remains ContentOk.
+        let ok_body = format!(
+            "<html><head><title>Slack Reviews</title></head><body><article><p>{}</p></article></body></html>",
+            "Verified user review of team messaging features. ".repeat(40)
+        );
+        assert_eq!(
+            detect(200, &headers, ok_body.as_bytes()),
+            Verdict::ContentOk
+        );
     }
 }
