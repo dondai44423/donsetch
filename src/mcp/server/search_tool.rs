@@ -523,6 +523,7 @@ pub(super) async fn search_outcome(
     // BYOK-first mode: try providers, fall back to local. An explicit `lang`
     // keeps the local language-aware path: a provider that does not accept the
     // tag must not silently answer in its own locale.
+    let byok_skipped_lang = byok_configured && !local_first && lang.is_some();
     let mut byok_fail: Option<String> = None;
     if byok_configured && !local_first && lang.is_none() {
         match byok_search_cached(daemon, query, max, intent).await {
@@ -547,30 +548,18 @@ pub(super) async fn search_outcome(
         .await
     {
         Ok(mut out) => {
-            // #285: fold the BYOK failure into the source census, so a
-            // provider that was configured and did not answer is named
-            // beside the local sources instead of vanishing.
-            if let Some(e) = byok_fail {
-                out.report.insert(
-                    0,
-                    crate::search::EngineReport {
-                        cache_age_ms: None,
-                        engine: "byok".into(),
-                        profile: None,
-                        status: crate::search::byok::compact_failure(&e),
-                        hits: 0,
-                        ms: 0,
-                        egress: "byok".into(),
-                        requests: 0,
-                    },
-                );
-            }
+            // #285 / #472: fold a BYOK failure or explicit-lang bypass into the
+            // source census so a configured provider that did not answer is
+            // named beside the local sources instead of vanishing.
+            fold_byok_census(&mut out.report, byok_fail.as_deref(), byok_skipped_lang);
             Ok(out)
         }
         Err(e) => {
-            // Local failed : if BYOK is configured and we're in
-            // local-first mode, try BYOK as a last resort.
-            if byok_configured && local_first {
+            // Local failed : if BYOK is configured and we're in local-first
+            // mode, try BYOK as a last resort — unless an explicit `lang` was
+            // requested (#472: never let a locale-unaware provider answer in
+            // its own language).
+            if byok_fallback_allowed(byok_configured, local_first, lang.is_some()) {
                 if crate::config::cfg().debug.search {
                     crate::diag!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
@@ -583,14 +572,57 @@ pub(super) async fn search_outcome(
                     }),
                 }
             } else {
+                let cause = if byok_configured && local_first && lang.is_some() {
+                    format!("{e}; byok skipped: explicit lang")
+                } else {
+                    e.to_string()
+                };
                 Err(SearchFailure {
-                    cause: e.to_string(),
+                    cause,
                     byok_tried: false,
                     kind: "transient",
                 })
             }
         }
     }
+}
+
+/// Record a configured BYOK provider that did not answer — either because it
+/// failed (#285) or because an explicit `lang` bypassed it (#472) — at the
+/// front of `report` so the receipt is distinguishable from an unconfigured
+/// keyless run.
+fn fold_byok_census(
+    report: &mut Vec<crate::search::EngineReport>,
+    byok_fail: Option<&str>,
+    byok_skipped_lang: bool,
+) {
+    let status = if let Some(e) = byok_fail {
+        crate::search::byok::compact_failure(e)
+    } else if byok_skipped_lang {
+        "skipped: explicit lang".into()
+    } else {
+        return;
+    };
+    report.insert(
+        0,
+        crate::search::EngineReport {
+            cache_age_ms: None,
+            engine: "byok".into(),
+            profile: None,
+            status,
+            hits: 0,
+            ms: 0,
+            egress: "byok".into(),
+            requests: 0,
+        },
+    );
+}
+
+/// Last-resort BYOK fallback after a local failure is only permitted when
+/// `local_first` is active, a provider is configured, and no explicit `lang`
+/// constrains the answer language (#472).
+fn byok_fallback_allowed(byok_configured: bool, local_first: bool, has_explicit_lang: bool) -> bool {
+    byok_configured && local_first && !has_explicit_lang
 }
 
 /// One BYOK acquisition with the shared search cache wrapped around
@@ -913,5 +945,52 @@ mod search_output_contract_tests {
         assert_eq!(debug["results"][0]["title"], "Visible in markdown");
         assert_eq!(debug["results"][0]["url"], "https://example.com/answer");
         assert_eq!(debug["results"][0]["snippet"], "Evidence belongs to text");
+        // #472: model metadata and debug metadata agree on `provider`.
+        assert_eq!(state["provider"], "keyless");
+        assert_eq!(debug["provider"], "keyless");
+    }
+
+    #[test]
+    fn issue_472_explicit_lang_byok_bypass_is_named_and_fallback_respects_lang() {
+        use super::{byok_fallback_allowed, fold_byok_census};
+
+        let mut report = vec![crate::search::EngineReport {
+            cache_age_ms: None,
+            engine: "bing".into(),
+            profile: None,
+            status: "ok".into(),
+            hits: 5,
+            ms: 400,
+            egress: "direct".into(),
+            requests: 1,
+        }];
+        // Regression: BYOK-first skipped because of explicit `lang` surfaces in
+        // both the JSON `sources` census (`state: "not asked"`) and the
+        // Markdown census line.
+        fold_byok_census(&mut report, None, true);
+        let states = crate::search::source_states(&report);
+        let byok = states
+            .iter()
+            .find(|s| s.id == "byok")
+            .expect("byok entry must appear in sources");
+        assert_eq!(byok.status, "skipped: explicit lang");
+        assert_eq!(byok.state, "not asked");
+        let md_census = crate::search::census(&report);
+        assert!(
+            md_census.contains("byok — skipped: explicit lang"),
+            "markdown census must disclose bypass: {md_census}"
+        );
+
+        // Negative: unconfigured BYOK emits no `byok` entry.
+        let mut unconfigured = vec![report[1].clone()];
+        fold_byok_census(&mut unconfigured, None, false);
+        assert!(!unconfigured.iter().any(|r| r.engine == "byok"));
+
+        // Regression + negative for local-first last-resort BYOK fallback:
+        // allowed without explicit lang, forbidden when explicit lang is set.
+        assert!(byok_fallback_allowed(true, true, false));
+        assert!(!byok_fallback_allowed(true, true, true));
+        assert!(!byok_fallback_allowed(false, true, false));
+        assert!(!byok_fallback_allowed(true, false, false));
     }
 }

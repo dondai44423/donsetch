@@ -114,9 +114,15 @@ pub fn census(report: &[super::EngineReport]) -> String {
     let resting = states.iter().filter(|s| s.state == "rested").count();
     let mut parts: Vec<String> = states
         .into_iter()
-        .filter(|s| !matches!(s.state, "not asked" | "rested"))
+        .filter(|s| {
+            !matches!(s.state, "not asked" | "rested")
+                || (s.id == "byok" && s.status.starts_with("skipped:"))
+        })
         .map(|s| match s.state {
             "answered" => format!("{} {}", s.id, s.items),
+            _ if s.id == "byok" && s.status.starts_with("skipped:") => {
+                format!("{} — {}", s.id, s.status)
+            }
             state if s.items > 0 => format!("{} {} {state}", s.id, s.items),
             state => format!("{} — {state}", s.id),
         })
@@ -177,7 +183,7 @@ pub fn source_states(report: &[super::EngineReport]) -> Vec<SourceLine> {
 /// How much a status says about a source, from "we never asked" to "it refused".
 pub(crate) fn rank_state(status: &str) -> u8 {
     match status.split(':').next().unwrap_or(status) {
-        "not-asked" | "pacing-timeout" | "budget-skipped" => 0,
+        "not-asked" | "pacing-timeout" | "budget-skipped" | "skipped" => 0,
         "rested" => 1,
         "paced" => 1,
         "late" => 2,
@@ -201,7 +207,7 @@ fn state_word(status: &str) -> &'static str {
         "off-query" => "off",
         "rested" | "rate-limited" => "rested",
         "paced" => "paced",
-        "not-asked" | "pacing-timeout" | "budget-skipped" => "not asked",
+        "not-asked" | "pacing-timeout" | "budget-skipped" | "skipped" => "not asked",
         "late" => "late",
         _ => "failed",
     }
@@ -628,7 +634,7 @@ pub fn render_meta(out: &SearchOutcome) -> Value {
                 })
                 .collect::<serde_json::Map<String, serde_json::Value>>())
         },
-        "provider": out.provider,
+        "provider": out.provider.as_deref().unwrap_or("keyless"),
         "filled": !out.results.is_empty(),
         "underfilled": underfilled,
         "degraded": degraded,

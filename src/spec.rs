@@ -300,7 +300,7 @@ const SEARCH_PARAMS: &[ParamSpec] = &[
         kind: ParamKind::Str,
         cli: CliKind::Flag,
         required: false,
-        help: "Optional language tag for the answer (en, uk, ne, pt-BR). It selects the language; a region subtag (uk-UA) is the only way to select a market. Omit for the English default on Latin-script queries; non-Latin queries send no language unless set.",
+        help: "Optional language tag for the answer (en, uk, ne, pt-BR). It selects the language; a region subtag (uk-UA) is the only way to select a market. Omit for the English default on Latin-script queries; non-Latin queries send no language unless set. An explicit lang uses local language-aware sources and bypasses configured BYOK providers for that call.",
         mcp_help: Some(
             "Optional BCP-47 language tag (en, uk, ne, pt-BR). It selects the answer language; a region subtag is the only way to select a market. Omit for the English default on Latin-script queries; no language or country is inferred from the query's script. An explicit lang uses the local language-aware sources; configured providers are bypassed for that call.",
         ),
