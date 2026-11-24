@@ -1283,10 +1283,29 @@ async fn fetch_single_inner(
         // agents can inspect image URLs directly. All other binaries (archives,
         // video, audio, oversized files) remain honest permanent errors.
         if crate::fetch::guards::is_binary(&o.body, &ct) {
-            if o.body.len() <= crate::search::images::MAX_DIRECT_IMAGE_BYTES
-                && let Some((mime, dims)) =
-                    crate::search::images::inspect_raster_image(&o.body, &ct)
-            {
+            if let Some((mime, dims)) = crate::search::images::inspect_raster_image(&o.body, &ct) {
+                if o.body.len() > crate::search::images::MAX_DIRECT_IMAGE_BYTES {
+                    let mut detail = json!({
+                        "url": o.url,
+                        "mime_type": mime,
+                        "bytes": o.body.len(),
+                        "max_bytes": crate::search::images::MAX_DIRECT_IMAGE_BYTES,
+                        "next_action": "this image exceeds the 8 MiB inline limit; look for a smaller thumbnail or resized asset",
+                    });
+                    if let Some((w, h)) = dims {
+                        detail["width"] = json!(w);
+                        detail["height"] = json!(h);
+                    }
+                    return tool_error_structured(
+                        format!(
+                            "binary image too large: {url} returned {mime} ({} bytes, limit {} bytes)",
+                            o.body.len(),
+                            crate::search::images::MAX_DIRECT_IMAGE_BYTES
+                        ),
+                        "permanent",
+                        Some(detail),
+                    );
+                }
                 if view.is_projection() {
                     return tool_error_structured(
                         format!(

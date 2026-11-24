@@ -31,8 +31,8 @@ Returns clean Markdown (or a requested slice) across HTML, PDFs, feeds, JSON, pl
 | `deadline_ms` | `--deadline-ms` | Hard call budget: 500–600,000 ms (per URL in batches) |
 
 - **Mutually exclusive views:** `must_contain`, `focus`, `toc`, and `since_last` cannot combine with one another (`section` narrows `must_contain`, `focus`, or full reads; `offset` paginates full/section reads).
-- **PDFs:** detected by `Content-Type` or `%PDF` magic bytes; fuses PDFium glyphs + pixels for layout, tables, and AcroForms, running PP-OCR on scanned/corrupt regions with explicit uncertainty markers.
-- **Direct raster images:** PNG, JPEG, WebP, and GIF URLs up to 8 MiB return a native MCP `image` content block plus dimensions (`read_status: "image"`); on the CLI, pass `--out photo.png` to write the image bytes directly to disk. Text views (`focus`, `toc`, `section`, `must_contain`) still fail honestly on raw images.
+- **PDFs:** detected by `Content-Type` or `%PDF` magic bytes; fuses PDFium glyphs + pixels for layout, tables, and AcroForms, running PP-OCR on scanned/corrupt regions with explicit uncertainty markers. OCR ONNX sessions bound intra-op threads (`[fetch] ocr_threads`, default auto capped at 4) and unload after idle (`[fetch] ocr_idle_secs`, default 120 s) so long-lived MCP daemons return to baseline memory and threads.
+- **Direct raster images:** PNG, JPEG, WebP, and GIF URLs up to 8 MiB (verified by magic bytes) return a native MCP `image` content block plus dimensions (`read_status: "image"`); on the CLI, pass `--out photo.png` to write the image bytes directly to disk. Text views (`focus`, `toc`, `section`, `must_contain`) still fail honestly on raw images.
 
 ## Search
 
@@ -46,13 +46,13 @@ donsetch search "中華人民共和国 人口" --lang ja
 
 | MCP argument | CLI flag | Behavior |
 |---|---|---|
-| `intent` | `--intent` | `auto` (default), `web`, `code`, `paper`, `news`, `entity`, `image` (explicit-only: Bing Images + Wikimedia Commons) |
-| `contact_sheet` | `--sheet` | With `intent="image"`, fetches top thumbnails (SSRF-guarded) and returns an inline rank-badged 3-column contact-sheet PNG (or saves via `--out PATH` on the CLI) |
-| `lang` | `--lang` | Explicit BCP-47 tag (`uk`, `ne`, `pt-BR`); only a region subtag sets a country market, and explicit `lang` uses local sources even when a paid provider is default |
+| `intent` | `--intent` | `auto` (default), `web`, `code`, `paper`, `news`, `entity`, `image` (explicit-only: Bing Images + DuckDuckGo Images + Wikimedia Commons, fused by cross-source consensus and quality) |
+| `contact_sheet` | `--sheet` | With `intent="image"`, fetches top thumbnails (per-hop SSRF-guarded, streaming-capped) and returns an inline rank-badged 3-column contact-sheet PNG (or saves via `--out PATH` on the CLI) |
+| `lang` | `--lang` | Explicit BCP-47 tag (`uk`, `ne`, `pt-BR`); only a region subtag sets a country market, and explicit `lang` uses local sources even when a paid provider is default (recorded as `byok: skipped: explicit lang` in `sources`) |
 | `max_results` | `--max-results` | Default 7, max 12 |
 | `read` | `--read` | Fetch and extract up to 3 top pages inside the deadline (`page:` snippets) |
 | `query_variants` | `--query-variant` | Up to 2 caller-written alternatives, returning a distinct set per variant |
-| `deadline_ms` | `--deadline-ms` | Hard budget: 500–600,000 ms |
+| `deadline_ms` | `--deadline-ms` | Hard budget: 500–600,000 ms (for slow/proxied networks, raise the default fan-out timeout via `[search] timeout_ms` / `DONSETCH_SEARCH__TIMEOUT_MS`, 1,000–120,000 ms) |
 
 Supports `site:`, `filetype:`, `intitle:`, `"…"`, `-term`, exact identifiers, and versions. Script never implies language: without `lang`, Latin queries default to English (`en`, no country) and non-Latin queries send no language/country.
 

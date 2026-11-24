@@ -89,6 +89,11 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
                 out_path = args.get(i + 1).cloned();
                 continue;
             }
+            if let Some(p) = a.strip_prefix("--out=") {
+                out_seen = true;
+                out_path = (!p.is_empty()).then(|| p.to_string());
+                continue;
+            }
             clean.push(a.clone());
         }
         Box::leak(clean.into_boxed_slice())
@@ -203,7 +208,13 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
                     .and_then(|b| b.get("data").and_then(|d| d.as_str()))
             });
         let Some(data) = img else {
-            crate::diag!("[{cmd}] error: response returned no image to save");
+            if cmd == "search" && base_args.get("intent").and_then(Value::as_str) != Some("image") {
+                crate::diag!(
+                    "[search] error: --out saves an image contact sheet and requires --intent image"
+                );
+            } else {
+                crate::diag!("[{cmd}] error: response returned no image to save");
+            }
             return EXIT_PERMANENT;
         };
         let Ok(bytes) = BASE64_STANDARD
@@ -499,6 +510,22 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
         .unwrap_or_default();
     match cmd {
         "fetch" => {
+            if sc.get("read_status").and_then(|v| v.as_str()) == Some("image") {
+                let mime = sc
+                    .get("mime_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image");
+                let bytes = sc.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mut parts = vec![mime.to_string()];
+                if let (Some(w), Some(h)) = (
+                    sc.get("width").and_then(|v| v.as_u64()),
+                    sc.get("height").and_then(|v| v.as_u64()),
+                ) {
+                    parts.push(format!("{w}x{h}"));
+                }
+                parts.push(format!("{bytes} bytes"));
+                return format!("[{cmd}] ok · {}", parts.join(" · "));
+            }
             let tokens_est = pick(&sc, &dbg, "tokens_est")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
@@ -546,6 +573,15 @@ fn stats_line(cmd: &str, result: &Value, content_len: usize) -> String {
                 format!("{:.1}s", ms as f64 / 1000.0),
                 format!("provider {provider}"),
             ];
+            if sc.get("intent").and_then(|v| v.as_str()) == Some("image")
+                && let (Some(tiles), Some(attempted)) = (
+                    sc.get("sheet_tiles").and_then(|v| v.as_u64()),
+                    sc.get("sheet_attempted").and_then(|v| v.as_u64()),
+                )
+                && attempted > 0
+            {
+                parts.push(format!("sheet {tiles}/{attempted}"));
+            }
             // Surface retrieval state in plain mode: the sources that did not
             // answer, and what they said. `ok` and `thin` answered; an
             // `off-query` answer is named too, because a 200 full of unrelated

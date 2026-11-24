@@ -48,7 +48,7 @@ pub(super) async fn search_tool(
             if intent == Some(Intent::Image) {
                 let query = &queries[0];
                 return run_with_budget(
-                    search_images_inner(query, max, contact_sheet),
+                    search_images_inner(daemon, &queries, max, lang.as_ref(), contact_sheet),
                     deadline,
                     ctx.as_mut(),
                     || search_deadline_error(query),
@@ -78,13 +78,36 @@ pub(super) async fn search_tool(
         .await
 }
 
-async fn search_images_inner(query: &str, max: usize, contact_sheet: bool) -> Value {
+async fn search_images_inner(
+    daemon: &Arc<Daemon>,
+    queries: &[String],
+    max: usize,
+    lang: Option<&crate::search::Lang>,
+    contact_sheet: bool,
+) -> Value {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
+    for q in queries {
+        if let Some(problem) = search::validate_query(q) {
+            return tool_error_structured(
+                format!("search: {problem}"),
+                "permanent",
+                Some(json!({
+                    "query": q,
+                    "next_action": "fix the query and search again",
+                })),
+            );
+        }
+    }
+
     let requested = max.clamp(1, 12);
-    let out = crate::search::images::search_images(query, requested, contact_sheet).await;
-    let md = crate::search::images::render_image_markdown(&out);
+    let out =
+        crate::search::images::search_images_multi(queries, requested, lang, contact_sheet).await;
+    let urls: Vec<String> = out.results.iter().map(|h| h.image_url.clone()).collect();
+    let handles = bind_search_urls(daemon, &urls).await;
+    let handles_opt = (!handles.is_empty()).then_some(handles.as_slice());
+    let md = crate::search::images::render_image_markdown_with_handles(&out, handles_opt);
 
     let mut content = Vec::new();
     if let Some(png) = &out.sheet_png {
@@ -107,6 +130,9 @@ async fn search_images_inner(query: &str, max: usize, contact_sheet: bool) -> Va
                 "image_url": h.image_url,
                 "source": h.source,
             });
+            if let Some(handle) = handles.get(i) {
+                item["handle"] = json!(handle);
+            }
             if let Some(t) = &h.thumb_url {
                 item["thumb_url"] = json!(t);
             }
@@ -123,21 +149,39 @@ async fn search_images_inner(query: &str, max: usize, contact_sheet: bool) -> Va
         })
         .collect::<Vec<_>>();
 
+    let answered_sources = out.sources.iter().filter(|s| s.state == "answered").count();
+    let degraded = answered_sources == 0 || out.results.is_empty();
+    let elapsed_ms = out.elapsed.as_millis() as u64;
+
     let mut structured = json!({
         "ok": true,
         "intent": "image",
         "query": out.query,
         "provider": "keyless-images",
+        "elapsed_ms": elapsed_ms,
         "filled": !out.results.is_empty(),
         "requested_results": requested,
         "returned_results": out.results.len(),
         "underfilled": out.results.len() < requested,
+        "answered_sources": answered_sources,
+        "degraded": degraded,
         "contact_sheet": out.sheet_png.is_some(),
         "results": results,
         "sources": out.sources,
     });
+    if contact_sheet {
+        structured["sheet_tiles"] = json!(out.sheet_tiles);
+        structured["sheet_attempted"] = json!(out.sheet_attempted);
+    }
     if let Some(note) = &out.sheet_note {
         structured["sheet_note"] = json!(note);
+    }
+    if out.results.is_empty() {
+        structured["next_action"] =
+            json!("no image source returned matching items; rephrase with visual nouns or retry");
+    } else if out.results.len() < requested.min(3) {
+        structured["next_action"] =
+            json!("thin image answer; broaden terms or add a query_variant");
     }
 
     json!({
@@ -621,7 +665,11 @@ fn fold_byok_census(
 /// Last-resort BYOK fallback after a local failure is only permitted when
 /// `local_first` is active, a provider is configured, and no explicit `lang`
 /// constrains the answer language (#472).
-fn byok_fallback_allowed(byok_configured: bool, local_first: bool, has_explicit_lang: bool) -> bool {
+fn byok_fallback_allowed(
+    byok_configured: bool,
+    local_first: bool,
+    has_explicit_lang: bool,
+) -> bool {
     byok_configured && local_first && !has_explicit_lang
 }
 
