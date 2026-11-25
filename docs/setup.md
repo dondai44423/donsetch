@@ -175,7 +175,7 @@ docker run -i --rm donsetch-mcp donsetch mcp --supervised
 docker compose --profile http up -d donsetch-http
 ```
 
-The [compose file](../docker-compose.yml) binds HTTP to `127.0.0.1:8765`, persists the cache in a volume, and gives in-flight work a 45-second shutdown grace period. The image runs as a non-root user. Set the `INSTALL_CHROME=true` build argument if screenshots need Chrome inside the container.
+The [compose file](../docker-compose.yml) binds HTTP to `127.0.0.1:8765`, persists the cache in a volume, and gives in-flight work a 45-second shutdown grace period. The image runs as a non-root user, includes a transport-aware healthcheck (`DONSETCH_TRANSPORT=http` probes the local HTTP port), and accepts `DONSETCH_SEARCH__SEARXNG_URL` (for an existing SearXNG/Degoog container) and `DONSETCH_BROWSER__CDP_URL` (for an external Chromium CDP container). Set the `INSTALL_CHROME=true` build argument if screenshots need Chrome inside the container.
 
 ## Build from source
 

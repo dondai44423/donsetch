@@ -74,6 +74,19 @@ Supports `site:`, `filetype:`, `intitle:`, `"…"`, `-term`, exact identifiers, 
 
 Manage keys with `donsetch keys add <provider> <key>` (stackable per provider), `keys default local|<provider>`, `keys list`, `keys reset <provider>`, and `keys export|import`, then restart MCP. Paid providers run their own native filters and fall back down the chain (then local) on errors or exhausted credits; Bright Data's fetch-only `unlocker` zone is configured separately ([brightdata.md](brightdata.md)).
 
+### Self-hosted SearXNG / Degoog
+
+Point DonSeTch directly at an existing SearXNG or Degoog instance over HTTP without writing or spawning a plugin executable:
+
+```toml
+[search]
+searxng_url = "http://searxng:8080" # or https://search.example.com (also DONSETCH_SEARCH__SEARXNG_URL)
+```
+
+- Make sure `json` is enabled under `search.formats` in your SearXNG `settings.yml` (`formats: [html, json]`).
+- DonSeTch appends `/search` automatically when omitted, preserves any base subpath, HTTP Basic Auth credentials, and operator query parameters (such as `?engines=google,duckduckgo&safesearch=0`), honors `[tls]` roots, `[proxy]`, `[rules.url]`, and `[search] timeout_ms`, and passes explicit `lang` (`&language=`), `intent: "news"` (`categories=news`, with automatic fallback if empty), and `intent: "image"` (`categories=images`).
+- Use `donsetch keys default searxng` to route searches to your instance first (falling back to keyless on errors), or leave `local` as default to use SearXNG as a fallback. `donsetch doctor --deep` probes the endpoint live.
+
 ### Search plugins
 
 Register any executable as a search provider (`donsetch keys add plugin searxng --cmd 'python3 /path/adapter.py' --test`). DonSeTch spawns it directly without a shell (default 30 s `--timeout`, 8 MiB stdout cap), pipes one JSON request to `stdin`, and reads one JSON response from `stdout`:

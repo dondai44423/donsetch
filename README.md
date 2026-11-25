@@ -227,7 +227,7 @@ donsetch keys default local           # Keyless first; paid search as fallback.
 
 To use a provider for search first, run `donsetch keys default tavily` (or your chosen provider), then restart MCP. Search queries go to that service; fetch and crawl keep their local engine. An explicit search `lang` uses the keyless path instead. The comparison above tested keyless search only.
 
-Native search providers: Tavily, Exa, Serper, SerpApi, SerpBase, Brave Search, TinyFish, Parallel, and Bright Data. Other providers can use the [executable plugin interface](docs/tools.md#search-plugins).
+Native search providers: Tavily, Exa, Serper, SerpApi, SerpBase, Brave Search, TinyFish, Parallel, Bright Data, and direct HTTP self-hosted [SearXNG / Degoog](docs/tools.md#self-hosted-searxng--degoog) (`search.searxng_url` / `DONSETCH_SEARCH__SEARXNG_URL`). Other providers can use the [executable plugin interface](docs/tools.md#search-plugins).
 
 Bright Data uses separate zones for SERP search and Web Unlocker:
 
