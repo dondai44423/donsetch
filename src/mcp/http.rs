@@ -143,7 +143,10 @@ pub async fn run(host: String, port: u16) -> Result<(), Box<dyn std::error::Erro
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_headers(Any)
+                .expose_headers([axum::http::header::HeaderName::from_static(
+                    "mcp-session-id",
+                )]),
         )
     } else {
         app

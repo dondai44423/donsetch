@@ -623,9 +623,8 @@ fn crawl_options(args: &Value) -> CrawlOptions {
     {
         opts.force_fresh_map = true;
     }
-    // A run asked to be incremental is the delta mode; the old full
-    // path keeps its own since_last semantics until M6.
-    if opts.mode == CrawlMode::Run
+    // A run or full crawl asked to be incremental switches to delta mode.
+    if matches!(opts.mode, CrawlMode::Run | CrawlMode::Full)
         && args
             .get("since_last")
             .and_then(Value::as_bool)

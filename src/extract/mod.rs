@@ -91,7 +91,7 @@ pub struct ExtractOptions {
 
 #[derive(Clone, serde::Serialize)]
 pub struct PartialContent {
-    pub reason: &'static str,
+    pub reason: std::borrow::Cow<'static, str>,
     pub items_found: usize,
     pub items_total: Option<usize>,
 }

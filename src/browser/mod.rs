@@ -697,6 +697,18 @@ const STDERR_LINE_BYTES: usize = 4096;
 /// stderr.
 const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Throwaway browser profile directory removed on drop even if a session is
+/// abandoned without an explicit [`HeadlessSession::close`] call.
+struct TempProfile(PathBuf);
+
+impl Drop for TempProfile {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 // On Windows `tokio::process::Child` alone makes `Local` 320+ bytes against
 // `Remote`'s 48, which trips `large_enum_variant`; the Linux lint does not
 // fire. One value lives per browser session, so boxing buys nothing.
@@ -704,7 +716,7 @@ const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(500)
 enum SessionBackend {
     Local {
         child: tokio::process::Child,
-        profile: PathBuf,
+        profile: TempProfile,
         /// Keeps the browser's stderr drained until the session ends.
         _stderr: StderrTail,
     },
@@ -879,7 +891,7 @@ impl HeadlessSession {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                 }
-                let _ = std::fs::remove_dir_all(&profile);
+                drop(profile);
             }
             SessionBackend::Remote {
                 browser_context_id,
@@ -977,7 +989,7 @@ async fn launch_headless_within(
     Ok(HeadlessSession {
         backend: SessionBackend::Local {
             child,
-            profile,
+            profile: TempProfile(profile),
             _stderr: stderr,
         },
         cdp,
@@ -987,9 +999,9 @@ async fn launch_headless_within(
 }
 
 /// Rewrite a Chrome-reported `webSocketDebuggerUrl` (which often advertises
-/// `ws://127.0.0.1:9222/...` or `ws://localhost/...` inside Docker/NAS
-/// containers) onto the operator-configured `http(s)://` CDP endpoint's host,
-/// port, and WebSocket scheme.
+/// `ws://127.0.0.1:9222/...`, `ws://localhost/...`, or a Docker/k8s internal
+/// container IP) onto the operator-configured `http(s)://` CDP endpoint's
+/// scheme, host, port, credentials, proxy path prefix, and auth query params.
 fn rewrite_remote_ws_url(discovered_ws: &str, base_http: &url::Url) -> Result<String, String> {
     let mut ws = url::Url::parse(discovered_ws)
         .map_err(|e| format!("external CDP returned invalid webSocketDebuggerUrl: {e}"))?;
@@ -999,20 +1011,50 @@ fn rewrite_remote_ws_url(discovered_ws: &str, base_http: &url::Url) -> Result<St
         "ws"
     };
     let _ = ws.set_scheme(ws_scheme);
-    let reported_host = ws.host_str().unwrap_or("").to_ascii_lowercase();
-    let is_loopback = matches!(
-        reported_host.as_str(),
-        "" | "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"
-    );
-    if is_loopback || ws.port_or_known_default() != base_http.port_or_known_default() {
-        if let Some(host) = base_http.host_str() {
-            ws.set_host(Some(host))
-                .map_err(|e| format!("external CDP host rewrite failed: {e}"))?;
-        }
-        ws.set_port(base_http.port())
-            .map_err(|_| "external CDP port rewrite failed".to_string())?;
+    if let Some(host) = base_http.host_str() {
+        ws.set_host(Some(host))
+            .map_err(|e| format!("external CDP host rewrite failed: {e}"))?;
+    }
+    ws.set_port(base_http.port())
+        .map_err(|_| "external CDP port rewrite failed".to_string())?;
+    if !base_http.username().is_empty() && ws.username().is_empty() {
+        let _ = ws.set_username(base_http.username());
+    }
+    if base_http.password().is_some() && ws.password().is_none() {
+        let _ = ws.set_password(base_http.password());
+    }
+    // Preserve reverse-proxy subpath (e.g. `https://host/cdp` + `/devtools/...`
+    // -> `wss://host/cdp/devtools/...`) without duplicating `/json/version`.
+    let base_prefix = base_http
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix("/json/version")
+        .unwrap_or_else(|| base_http.path().trim_end_matches('/'));
+    if !base_prefix.is_empty() && !ws.path().starts_with(base_prefix) {
+        let joined = format!("{base_prefix}/{}", ws.path().trim_start_matches('/'));
+        ws.set_path(&joined);
+    }
+    if let Some(base_query) = base_http.query()
+        && ws.query().is_none()
+    {
+        ws.set_query(Some(base_query));
     }
     Ok(ws.to_string())
+}
+
+fn cdp_http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
+                .timeout(std::time::Duration::from_secs(5))
+                .no_proxy()
+                .build()
+                .map_err(|e| format!("external CDP client: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Resolve an operator-configured `browser.cdp_url` (`http(s)://host:port` or
@@ -1028,11 +1070,7 @@ async fn resolve_remote_ws_url(cdp_url: &str) -> Result<String, String> {
             if !path.ends_with("/json/version") {
                 version_url.set_path(&format!("{path}/json/version"));
             }
-            let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
-                .timeout(std::time::Duration::from_secs(5))
-                .no_proxy()
-                .build()
-                .map_err(|e| format!("external CDP client: {e}"))?;
+            let client = cdp_http_client()?;
             let resp =
                 client.get(version_url.as_str()).send().await.map_err(|e| {
                     format!("external CDP /json/version failed: {}", e.without_url())
@@ -1197,11 +1235,18 @@ async fn page_ws(
     stderr: &mut StderrTail,
     deadline: std::time::Duration,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
+    static LOCAL_CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    let client = LOCAL_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .no_proxy()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
     let endpoint = format!("http://127.0.0.1:{port}/json/list");
     let start = std::time::Instant::now();
     loop {
@@ -1748,7 +1793,7 @@ mod session_tests {
         let session = HeadlessSession {
             backend: SessionBackend::Local {
                 child,
-                profile: PathBuf::new(),
+                profile: TempProfile(PathBuf::new()),
                 _stderr: StderrTail::spawn(tokio::io::empty()),
             },
             cdp,
@@ -2006,5 +2051,17 @@ mod launch_tests {
         assert!(methods.contains(&"Target.closeTarget".to_string()));
         assert!(methods.contains(&"Target.disposeBrowserContext".to_string()));
         assert!(!methods.contains(&"Browser.close".to_string()));
+    }
+
+    #[test]
+    fn rewrite_remote_ws_url_handles_container_ip_tls_subpath_and_token() {
+        let base =
+            url::Url::parse("https://user:pass@cdp.example.com:8443/chrome?token=abc").unwrap();
+        let rewritten =
+            rewrite_remote_ws_url("ws://172.18.0.3:9222/devtools/browser/uuid-1", &base).unwrap();
+        assert_eq!(
+            rewritten,
+            "wss://user:pass@cdp.example.com:8443/chrome/devtools/browser/uuid-1?token=abc"
+        );
     }
 }

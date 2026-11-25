@@ -713,8 +713,10 @@ fn cache_put(cache_dir: &Path, url: &str, render: bool, outcome: &BypassOutcome,
         content_type: outcome.content_type.clone(),
         body: base64::engine::general_purpose::STANDARD.encode(&outcome.body),
     };
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("{key}.json"));
-    let tmp = dir.join(format!("{key}.tmp"));
+    let tmp = dir.join(format!("{key}.{}.{seq}.tmp", std::process::id()));
     if crate::config::write_private(
         &tmp,
         serde_json::to_string(&entry).unwrap_or_default().as_bytes(),
@@ -726,30 +728,30 @@ fn cache_put(cache_dir: &Path, url: &str, render: bool, outcome: &BypassOutcome,
     cache_prune(&dir, max_entries);
 }
 
-/// Oldest-first eviction until the entry count is within max.
+/// Oldest-first eviction until the entry count is within max. Uses file mtime
+/// instead of reading and JSON-parsing every cached HTML body on every write.
 fn cache_prune(dir: &Path, max_entries: u32) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut metas: Vec<(u64, PathBuf)> = Vec::new();
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let ts = std::fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| serde_json::from_str::<CacheEntry>(&s).ok())
-            .map(|c| c.ts)
-            .unwrap_or(0);
-        metas.push((ts, p));
+        let modified = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        entries.push((modified, p));
     }
-    if metas.len() <= max_entries as usize {
+    if entries.len() <= max_entries as usize {
         return;
     }
-    metas.sort_by_key(|(ts, _)| *ts);
-    let drop = metas.len() - max_entries as usize;
-    for (_, p) in metas.iter().take(drop) {
+    entries.sort_by_key(|(mtime, _)| *mtime);
+    let drop = entries.len() - max_entries as usize;
+    for (_, p) in entries.iter().take(drop) {
         let _ = std::fs::remove_file(p);
     }
 }
@@ -772,6 +774,50 @@ fn in_flight_lock(url: &str, render: bool) -> Arc<tokio::sync::Mutex<()>> {
         .entry(cache_key(url, render))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Route-cached HTTP client for the unlocker endpoint, honoring DonSeTch's
+/// `[proxy]` config (`from_environment`, bypass lists) and `[tls]` trusted roots.
+fn bypass_http_client(endpoint: &str) -> Result<reqwest::Client, BypassFail> {
+    static CLIENTS: OnceLock<Mutex<HashMap<Option<String>, reqwest::Client>>> = OnceLock::new();
+    let proxy_url = crate::egress::proxy::from_env_for(endpoint)
+        .map_err(|e| BypassFail::Config(e.to_string()))?
+        .map(|p| p.to_url());
+    if let Some(ref p) = proxy_url
+        && (p.starts_with("socks5://") || p.starts_with("socks5h://"))
+    {
+        return Err(BypassFail::Config(
+            "SOCKS5 proxy is not supported by the unlocker client; configure an http(s) proxy or add the unlocker host to NO_PROXY".into(),
+        ));
+    }
+    let cache = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(existing) = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&proxy_url)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+    let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
+        .no_proxy()
+        .no_gzip()
+        .no_deflate()
+        .no_brotli();
+    if let Some(ref p) = proxy_url {
+        let rp = reqwest::Proxy::all(p)
+            .map_err(|e| BypassFail::Internal(format!("bypass proxy init failed ({e})")))?;
+        builder = builder.proxy(rp);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| BypassFail::Internal(format!("bypass client init failed ({e})")))?;
+    let mut map = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if map.len() > 16 {
+        map.clear();
+    }
+    map.insert(proxy_url, client.clone());
+    Ok(client)
 }
 
 /// Perform one unlock request. Cache-first: a fresh solve-cache hit
@@ -822,13 +868,7 @@ async fn unlock_inner(
             cfg.max_daily
         )));
     }
-    let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
-        .timeout(cfg.timeout)
-        .no_gzip()
-        .no_deflate()
-        .no_brotli()
-        .build()
-        .map_err(|e| BypassFail::Internal(format!("bypass client init failed ({e})")))?;
+    let client = bypass_http_client(&cfg.endpoint)?;
     let mut payload = serde_json::json!({
         "zone": zone,
         "url": url,
@@ -842,9 +882,11 @@ async fn unlock_inner(
         let payload = &payload;
         let endpoint = &cfg.endpoint;
         let token = &token;
+        let timeout = cfg.timeout;
         async move {
             client
                 .post(endpoint)
+                .timeout(timeout)
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/json")
                 .json(payload)

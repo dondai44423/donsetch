@@ -140,15 +140,30 @@ mod cache {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    /// Cooldown before retrying a transient OCR model download failure.
+    const TRANSIENT_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+
     struct CachedSlot<T> {
         engine: Arc<T>,
         last_used: Instant,
     }
 
+    struct FatalEntry {
+        message: String,
+        /// `Some(deadline)` for transient network/download failures (retriable
+        /// after cooldown); `None` for permanent runtime/load failures.
+        retry_after: Option<Instant>,
+    }
+
     struct Inner<T> {
         slots: [Option<CachedSlot<T>>; 3],
-        fatal: [Option<String>; 3],
+        fatal: [Option<FatalEntry>; 3],
         reaper_active: bool,
+    }
+
+    fn is_transient_ocr_error(err: &str) -> bool {
+        err.starts_with("model download failed")
+            || (err.starts_with("model ") && err.contains("truncated"))
     }
 
     /// Idle-evicting cache for the three OCR recognizers (En, Zh, Deva).
@@ -194,8 +209,11 @@ mod cache {
                     slot.last_used = Instant::now();
                     return Ok(Arc::clone(&slot.engine));
                 }
-                if let Some(err) = g.fatal[idx].as_ref() {
-                    return Err(err.clone());
+                if let Some(entry) = g.fatal[idx].as_ref() {
+                    if entry.retry_after.is_none_or(|until| Instant::now() < until) {
+                        return Err(entry.message.clone());
+                    }
+                    g.fatal[idx] = None;
                 }
             }
 
@@ -214,8 +232,11 @@ mod cache {
                     slot.last_used = Instant::now();
                     return Ok(Arc::clone(&slot.engine));
                 }
-                if let Some(err) = g.fatal[idx].as_ref() {
-                    return Err(err.clone());
+                if let Some(entry) = g.fatal[idx].as_ref() {
+                    if entry.retry_after.is_none_or(|until| Instant::now() < until) {
+                        return Err(entry.message.clone());
+                    }
+                    g.fatal[idx] = None;
                 }
             }
 
@@ -244,11 +265,16 @@ mod cache {
                     Ok(arc)
                 }
                 Err(err) => {
+                    let retry_after = is_transient_ocr_error(&err)
+                        .then(|| Instant::now() + TRANSIENT_RETRY_COOLDOWN);
                     let mut g = self
                         .inner
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    g.fatal[idx] = Some(err.clone());
+                    g.fatal[idx] = Some(FatalEntry {
+                        message: err.clone(),
+                        retry_after,
+                    });
                     Err(err)
                 }
             }
@@ -426,15 +452,24 @@ mod imp {
                 }
                 let _ = std::fs::remove_file(&dst);
             }
-            let tmp = dst.with_extension("tmp");
+            static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = dst.with_extension(format!("{}.{seq}.tmp", std::process::id()));
             let url = format!("{BASE}/{}", m.name);
-            let client = crate::egress::trust::with_trusted_roots_blocking(
+            let mut builder = crate::egress::trust::with_trusted_roots_blocking(
                 reqwest::blocking::Client::builder(),
             )
             .timeout(std::time::Duration::from_secs(600))
             .user_agent("donsetch/0.1 (+https://github.com/dondai44423/donsetch)")
-            .build()
-            .map_err(|e| e.to_string())?;
+            .no_proxy();
+            if let Some(proxy) = crate::egress::proxy::from_env_for(&url)
+                .map_err(|e| format!("model download proxy failed: {e}"))?
+            {
+                let p = reqwest::Proxy::all(proxy.to_url())
+                    .map_err(|e| format!("model download proxy failed: {e}"))?;
+                builder = builder.proxy(p);
+            }
+            let client = builder.build().map_err(|e| e.to_string())?;
             let mut r = client
                 .get(&url)
                 .send()

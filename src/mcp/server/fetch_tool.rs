@@ -226,16 +226,17 @@ pub(super) async fn fetch_multi(
     // client had already moved on. Each sub-fetch watches a clone
     // of the same cancel channel.
     let cancel_rx = ctx.as_ref().map(|c| c.cancel_receiver());
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let n_total = urls.len();
     let futs: Vec<_> = urls
         .iter()
-        .enumerate()
-        .map(|(i, u)| {
+        .map(|u| {
             let a = call_args.clone();
             let d = Arc::clone(daemon);
             let requested = u.clone();
             let dl = deadline;
             let prog = progress_parts.clone();
+            let done_counter = Arc::clone(&completed);
             let mut cancel = cancel_rx.clone();
             async move {
                 let url = match resolve_fetch_url(&d, &requested).await {
@@ -245,6 +246,7 @@ pub(super) async fn fetch_multi(
                     }
                 };
                 let v = match cancel.as_mut() {
+                    Some(rx) if *rx.borrow() => tool_error("cancelled"),
                     Some(rx) => tokio::select! {
                         v = fetch_with_budget(&d, &a, &url, dl, None) => v,
                         _ = rx.changed() => tool_error("cancelled"),
@@ -252,11 +254,12 @@ pub(super) async fn fetch_multi(
                     None => fetch_with_budget(&d, &a, &url, dl, None).await,
                 };
                 if let Some(p) = &prog {
+                    let done = done_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     emit_progress(
                         p,
-                        (i + 1) as u64,
+                        done as u64,
                         Some(n_total as u64),
-                        &format!("{}/{} done", i + 1, n_total),
+                        &format!("{done}/{n_total} done"),
                     );
                 }
                 (url, v)
@@ -270,8 +273,15 @@ pub(super) async fn fetch_multi(
 
     let is_err = is_failure;
     let md_of = |v: &Value| {
-        v.pointer("/content/0/text")
-            .and_then(Value::as_str)
+        v.get("content")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    (item.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| item.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
             .unwrap_or("")
             .to_string()
     };

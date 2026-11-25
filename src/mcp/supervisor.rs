@@ -511,10 +511,11 @@ impl ReplayState {
     /// Everything still open, as one replay buffer: held lines in
     /// arrival order, then the partial tail (it came last).
     fn take_replay(&mut self) -> Vec<u8> {
-        let mut out = std::mem::take(&mut self.partial);
+        let mut out = Vec::with_capacity(self.total);
         for h in self.held.drain(..) {
             out.extend_from_slice(&h.bytes);
         }
+        out.extend_from_slice(&std::mem::take(&mut self.partial));
         self.total = 0;
         out
     }
@@ -1307,5 +1308,18 @@ mod tests {
         // Five crashes spread over a long session are not a loop.
         assert_eq!(next_restart_count(4, RAPID_WINDOW), 1);
         assert_eq!(next_restart_count(4, Duration::from_secs(3600)), 1);
+    }
+
+    #[test]
+    fn replay_preserves_held_lines_before_partial_tail() {
+        let mut r = ReplayState::default();
+        r.feed(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2",
+        );
+        let replayed = r.take_replay();
+        assert_eq!(
+            String::from_utf8(replayed).unwrap(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2"
+        );
     }
 }

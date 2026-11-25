@@ -279,7 +279,7 @@ pub fn extract_api(body: &[u8], url: &str, opts: &ExtractOptions) -> Option<Extr
         .and_then(|n| usize::try_from(n).ok());
     if total.is_none_or(|n| found < n) {
         ex.partial = Some(crate::extract::PartialContent {
-            reason: "public API returned a subset of answers",
+            reason: std::borrow::Cow::Borrowed("public API returned a subset of answers"),
             items_found: found + 1,
             items_total: total.and_then(|n| n.checked_add(1)),
         });

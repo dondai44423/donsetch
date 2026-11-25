@@ -174,9 +174,7 @@ impl StoredPage {
             chars: self.chars,
             next_offset: self.next_offset,
             partial: self.partial.map(|p| PartialContent {
-                // Bounded to one small string per stored page; the job file
-                // itself is bounded to 200 pages and 50 jobs.
-                reason: Box::leak(p.reason.into_boxed_str()),
+                reason: std::borrow::Cow::Owned(p.reason),
                 items_found: p.items_found,
                 items_total: p.items_total,
             }),
@@ -340,15 +338,31 @@ impl JobStore {
     }
 
     pub fn save(&self, job: &Job) -> Result<(), String> {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST_SWEEP_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::fs::create_dir_all(&self.root).map_err(|e| format!("run job dir: {e}"))?;
         let path = self.path(&job.id);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = self
             .root
-            .join(format!("{}.{}.tmp", job.id, std::process::id()));
+            .join(format!("{}.{}.{seq}.tmp", job.id, std::process::id()));
         let bytes = serde_json::to_vec(job).map_err(|e| format!("run job encode: {e}"))?;
         crate::config::write_private(&tmp, &bytes).map_err(|e| format!("run job write: {e}"))?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("run job rename: {e}"))?;
-        self.sweep();
+        let now = unix_now();
+        let last = LAST_SWEEP_UNIX.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 60
+            && LAST_SWEEP_UNIX
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            self.sweep();
+        }
         Ok(())
     }
 
@@ -770,6 +784,15 @@ pub async fn execute(
                 fetched_at: unix_now(),
                 fingerprint: r.fingerprint,
             };
+            if let Some(on_page) = &opts.on_page {
+                let title = (!page.title.is_empty()).then_some(page.title.as_str());
+                on_page(
+                    &page.url,
+                    page.fingerprint.as_deref(),
+                    &page.markdown,
+                    title,
+                );
+            }
             job.pages.push(StoredPage::from_page(&page));
             done += 1;
             job.stop = None;

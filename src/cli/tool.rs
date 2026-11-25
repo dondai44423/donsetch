@@ -190,6 +190,7 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
     if matches!(cmd, "screenshot" | "search" | "fetch") && out_seen {
         let Some(path) = out_path else {
             crate::diag!("[{cmd}] error: --out given without a path; nothing saved");
+            daemon.shutdown().await;
             return EXIT_PERMANENT;
         };
         let img = result
@@ -215,18 +216,21 @@ pub async fn run(cmd: &str, args: &[String]) -> u8 {
             } else {
                 crate::diag!("[{cmd}] error: response returned no image to save");
             }
+            daemon.shutdown().await;
             return EXIT_PERMANENT;
         };
         let Ok(bytes) = BASE64_STANDARD
             .decode(data)
             .map_err(|er| crate::diag!("[{cmd}] error: bad image payload: {er}"))
         else {
+            daemon.shutdown().await;
             return EXIT_PERMANENT;
         };
         match std::fs::write(&path, &bytes) {
             Ok(()) => crate::diag!("[{cmd}] saved {} bytes to {}", bytes.len(), path),
             Err(er) => {
                 crate::diag!("[{cmd}] error: could not write {path}: {er}");
+                daemon.shutdown().await;
                 return EXIT_PERMANENT;
             }
         }
@@ -294,7 +298,7 @@ async fn run_bulk_fetch(
                     out.push(render_json_envelope(v, &urls[i]));
                 }
                 Err((code, msg)) => {
-                    rank(*code as u8, &mut worst);
+                    rank(EXIT_PERMANENT, &mut worst);
                     out.push(json!({
                         "ok": false,
                         "url": urls[i],

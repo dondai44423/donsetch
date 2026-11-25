@@ -188,9 +188,9 @@ RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         echo "web_screenshot finds it without DONGHOST_CHROME"; \
     fi
 
-# Healthcheck: verify binary responds to version check
+# Healthcheck: verify the HTTP listener in HTTP mode, or binary version in stdio mode.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD donsetch --version || exit 1
+    CMD bash -c 'if [ "${DONSETCH_TRANSPORT:-stdio}" = "http" ]; then </dev/tcp/127.0.0.1/${DONSETCH_HTTP_PORT:-8765}; else donsetch --version >/dev/null; fi' || exit 1
 
 # Port for the HTTP transport (compose activates it via
 # DONSETCH_TRANSPORT=http in the http profile).

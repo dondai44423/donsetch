@@ -81,6 +81,16 @@ impl Drop for PendingCall<'_> {
 /// is tens of MB, well over tungstenite's 16 MiB default frame.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Aborts the background CDP demux reader task when the last [`Cdp`] clone is
+/// dropped so closed remote/local sessions do not leak WebSockets or tasks.
+struct ReaderAbort(tokio::task::JoinHandle<()>);
+
+impl Drop for ReaderAbort {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct Cdp {
     write: Arc<Mutex<futures_util::stream::SplitSink<Ws, Message>>>,
     pending: Arc<Pending>,
@@ -91,6 +101,7 @@ pub struct Cdp {
     dead: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<&'static str>>>,
     guard_queue: Arc<GuardQueue>,
+    _reader: Arc<ReaderAbort>,
 }
 
 impl Clone for Cdp {
@@ -102,6 +113,7 @@ impl Clone for Cdp {
             dead: Arc::clone(&self.dead),
             failure: Arc::clone(&self.failure),
             guard_queue: Arc::clone(&self.guard_queue),
+            _reader: Arc::clone(&self._reader),
         }
     }
 }
@@ -165,7 +177,7 @@ impl Cdp {
         let failure_task = Arc::clone(&failure);
         let guard_queue = Arc::new(GuardQueue::new(None));
         let guard_task = Arc::clone(&guard_queue);
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             let cause = loop {
                 let msg = match read.next().await {
                     Some(Ok(msg)) => msg,
@@ -267,6 +279,7 @@ impl Cdp {
             dead,
             failure,
             guard_queue,
+            _reader: Arc::new(ReaderAbort(reader_handle)),
         })
     }
 

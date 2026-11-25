@@ -61,7 +61,9 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
                 n,
                 html.contains("/svc/shreddit/community-more-posts")
                     .then_some(PartialContent {
-                        reason: "additional posts require client-side loading",
+                        reason: std::borrow::Cow::Borrowed(
+                            "additional posts require client-side loading",
+                        ),
                         items_found: n,
                         items_total: None,
                     }),
@@ -202,7 +204,7 @@ fn render_thread(
     }
     let total = usize::try_from(comments_n).ok();
     let partial = total.filter(|n| rendered < *n).map(|n| PartialContent {
-        reason: "additional comments require client-side loading",
+        reason: std::borrow::Cow::Borrowed("additional comments require client-side loading"),
         items_found: rendered,
         items_total: Some(n),
     });
