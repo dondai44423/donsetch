@@ -451,28 +451,50 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
     {
         return None;
     }
+    static SEL_TITLE: std::sync::LazyLock<scraper::Selector> =
+        std::sync::LazyLock::new(|| scraper::Selector::parse("title").expect("title"));
+    static SEL_H1: std::sync::LazyLock<scraper::Selector> =
+        std::sync::LazyLock::new(|| scraper::Selector::parse("h1").expect("h1"));
+    static SEL_H2: std::sync::LazyLock<scraper::Selector> =
+        std::sync::LazyLock::new(|| scraper::Selector::parse("h2").expect("h2"));
+    static SEL_CAPTCHA: std::sync::LazyLock<scraper::Selector> = std::sync::LazyLock::new(|| {
+        scraper::Selector::parse(
+            ".g-recaptcha, .h-captcha, #px-captcha, iframe[src*='recaptcha'], \
+             iframe[src*='hcaptcha'], iframe[src*='captcha-delivery'], \
+             script[src*='recaptcha'], script[src*='hcaptcha']",
+        )
+        .expect("static captcha selectors")
+    });
+    static SEL_LOGIN_FORM: std::sync::LazyLock<scraper::Selector> = std::sync::LazyLock::new(
+        || {
+            scraper::Selector::parse(
+            "form#login_form input[type='password'], form[name='login-form'] input[type='password']",
+        )
+        .expect("login form selector")
+        },
+    );
+    static SEL_ARTICLE: std::sync::LazyLock<scraper::Selector> =
+        std::sync::LazyLock::new(|| scraper::Selector::parse("article").expect("article"));
+    static SEL_FORM: std::sync::LazyLock<scraper::Selector> =
+        std::sync::LazyLock::new(|| scraper::Selector::parse("form").expect("form"));
+
     let doc = scraper::Html::parse_document(&text);
     let title = doc
-        .select(&scraper::Selector::parse("title").unwrap())
+        .select(&SEL_TITLE)
         .next()
         .map(crate::extract::inline::visible_text)
         .unwrap_or_default()
         .to_lowercase();
-    let h1 = doc
-        .select(&scraper::Selector::parse("h1").unwrap())
-        .next()
+    let first_h1 = doc.select(&SEL_H1).next();
+    let h1 = first_h1
         .map(crate::extract::inline::visible_text)
         .unwrap_or_default()
         .to_lowercase();
     // A page without an `h1` leads with its first `h2` (Medium's missing
     // post: title "Medium", then `<h2>404</h2>`). Only the not-found check
     // reads it; sign-in headings keep to the title and `h1`.
-    let lead = if doc
-        .select(&scraper::Selector::parse("h1").unwrap())
-        .next()
-        .is_none()
-    {
-        doc.select(&scraper::Selector::parse("h2").unwrap())
+    let lead = if first_h1.is_none() {
+        doc.select(&SEL_H2)
             .next()
             .map(crate::extract::inline::visible_text)
             .unwrap_or_default()
@@ -494,17 +516,10 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
     // read as an auth gate, which is a declared outcome and hid a wall whose
     // ask is a human step. The widget is the fact; a page that merely mentions
     // a vendor in its text is not one.
-    let captcha = scraper::Selector::parse(
-        ".g-recaptcha, .h-captcha, #px-captcha, iframe[src*='recaptcha'], \
-         iframe[src*='hcaptcha'], iframe[src*='captcha-delivery'], \
-         script[src*='recaptcha'], script[src*='hcaptcha']",
-    )
-    .expect("static captcha selectors");
-    if doc.select(&captcha).next().is_some() {
+    if doc.select(&SEL_CAPTCHA).next().is_some() {
         return Some(Verdict::Challenge(Vendor::Generic));
     }
-    if doc.select(&scraper::Selector::parse("form#login_form input[type='password'], form[name='login-form'] input[type='password']").unwrap()).next().is_some()
-        && doc.select(&scraper::Selector::parse("article").unwrap()).next().is_none() {
+    if doc.select(&SEL_LOGIN_FORM).next().is_some() && doc.select(&SEL_ARTICLE).next().is_none() {
         return Some(Verdict::AuthWall);
     }
     let auth_heading = [
@@ -525,14 +540,8 @@ pub fn content_gate(body: &[u8]) -> Option<Verdict> {
         || (["sign in to ", "log in to ", "login to "]
             .iter()
             .any(|prefix| h1.starts_with(prefix))
-            && doc
-                .select(&scraper::Selector::parse("article").unwrap())
-                .next()
-                .is_none()
-            && doc
-                .select(&scraper::Selector::parse("form").unwrap())
-                .next()
-                .is_some())
+            && doc.select(&SEL_ARTICLE).next().is_none()
+            && doc.select(&SEL_FORM).next().is_some())
     {
         return Some(Verdict::AuthWall);
     }
@@ -573,7 +582,7 @@ const INTERSTITIAL_MARKERS: &[&str] = &[
     "cf-chl",
     "captcha-delivery.com",
     "px-captcha",
-    "_Incapsula_Resource",
+    "_incapsula_resource",
     "anubis_challenge",
 ];
 
@@ -716,15 +725,22 @@ pub fn auth_shell(body: &[u8]) -> bool {
     // strip script/style blocks: markers there are code, not CTA
     let mut clean = String::with_capacity(text.len());
     let mut rest = text.as_str();
-    while let Some(pos) = rest.find("<script").or_else(|| rest.find("<style")) {
+    while let Some((pos, close)) = match (rest.find("<script"), rest.find("<style")) {
+        (Some(a), Some(b)) if a <= b => Some((a, "</script")),
+        (Some(_), Some(b)) => Some((b, "</style")),
+        (Some(a), None) => Some((a, "</script")),
+        (None, Some(b)) => Some((b, "</style")),
+        (None, None) => None,
+    } {
         clean.push_str(&rest[..pos]);
-        let close = if rest[pos..].starts_with("<script") {
-            "</script"
-        } else {
-            "</style"
-        };
         match rest[pos..].find(close) {
-            Some(e) => rest = &rest[pos + e + close.len()..],
+            Some(e) => {
+                let after = &rest[pos + e + close.len()..];
+                rest = match after.find('>') {
+                    Some(gt) => &after[gt + 1..],
+                    None => "",
+                };
+            }
             None => {
                 rest = "";
                 break;
@@ -946,24 +962,37 @@ pub fn visible_text_count(html: &[u8]) -> usize {
     while i < b.len() {
         match b[i] {
             b'<' => {
-                // Skip script/style/noscript bodies entirely.
-                let close: &[u8] = if starts_ci(&b[i + 1..], b"script") {
-                    b"</script"
-                } else if starts_ci(&b[i + 1..], b"style") {
-                    b"</style"
-                } else if starts_ci(&b[i + 1..], b"noscript") {
-                    b"</noscript"
+                // Skip script/style/noscript bodies entirely (require a tag
+                // name boundary so `<styled-div>` is not treated as `<style>`).
+                let close: Option<&[u8]> = if starts_tag_ci(&b[i + 1..], b"script") {
+                    Some(b"</script")
+                } else if starts_tag_ci(&b[i + 1..], b"style") {
+                    Some(b"</style")
+                } else if starts_tag_ci(&b[i + 1..], b"noscript") {
+                    Some(b"</noscript")
                 } else {
-                    // Not a skipped tag : skip to end of this tag.
-                    while i < b.len() && b[i] != b'>' {
-                        i += 1;
-                    }
-                    i += 1;
-                    continue;
+                    None
                 };
-                i = find_ci(b, close, i + 8)
-                    .map(|p| p + close.len() + 1)
-                    .unwrap_or(b.len());
+                // Advance past the opening tag first so `find_ci` never skips
+                // the closing tag of an empty `<style></style>` element.
+                while i < b.len() && b[i] != b'>' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+                if let Some(close) = close {
+                    i = match find_ci(b, close, i) {
+                        Some(p) => {
+                            let mut end = p + close.len();
+                            while end < b.len() && b[end] != b'>' {
+                                end += 1;
+                            }
+                            (end + 1).min(b.len())
+                        }
+                        None => b.len(),
+                    };
+                }
             }
             c if !c.is_ascii_whitespace() => {
                 n += 1;
@@ -973,6 +1002,12 @@ pub fn visible_text_count(html: &[u8]) -> usize {
         }
     }
     n
+}
+
+fn starts_tag_ci(b: &[u8], pat: &[u8]) -> bool {
+    starts_ci(b, pat)
+        && b.get(pat.len())
+            .is_some_and(|&next| next == b'>' || next == b'/' || next.is_ascii_whitespace())
 }
 
 fn starts_ci(b: &[u8], pat: &[u8]) -> bool {
@@ -1078,6 +1113,15 @@ fn classify_wall(
         return Verdict::Challenge(Vendor::Generic);
     }
 
+    // DataDome body markers: checked before generic Cloudflare CDN body rules
+    // so a DataDome challenge behind Cloudflare CDN reports DataDome even when
+    // `x-datadome` was stripped. "captcha-delivery.com" is challenge-specific;
+    // "datadome" alone matches the monitoring script (js.datadome.co/tags.js).
+    if text.contains("captcha-delivery.com")
+        || (text.contains("datadome") && text.contains("captcha"))
+    {
+        return Verdict::Challenge(Vendor::DataDome);
+    }
     // Cloudflare
     if is_cf || text.contains("cf-chl") || text.contains("cloudflare") {
         if text.contains("attention required") {
@@ -1094,17 +1138,6 @@ fn classify_wall(
         {
             return Verdict::Challenge(Vendor::Cloudflare);
         }
-    }
-    // DataDome body markers: "captcha-delivery.com" is the
-    // challenge-specific script URL. "datadome" alone matches
-    // the monitoring script (js.datadome.co/tags.js) present on
-    // ALL DataDome-protected pages, even real content.
-    // Only trigger on the challenge marker, or "datadome" +
-    // "captcha" together.
-    if text.contains("captcha-delivery.com")
-        || (text.contains("datadome") && text.contains("captcha"))
-    {
-        return Verdict::Challenge(Vendor::DataDome);
     }
     // Akamai: block pages carry "Reference #…" +
     // edgesuite. A bare "akamai" match false-positives on
@@ -2038,5 +2071,21 @@ mod wave_w_honesty_tests {
             detect(200, &headers, ok_body.as_bytes()),
             Verdict::ContentOk
         );
+    }
+
+    #[test]
+    fn visible_text_count_handles_empty_style_and_custom_styled_tags() {
+        assert_eq!(visible_text_count(b"<style></style><p>Hello</p>"), 5);
+        assert_eq!(visible_text_count(b"<styled-div>Hello</styled-div>"), 5);
+        assert_eq!(
+            visible_text_count(b"<style>body{color:red}</style><p>World</p>"),
+            5
+        );
+    }
+
+    #[test]
+    fn detect_interstitial_matches_incapsula_resource_marker() {
+        let body = b"<html><head></head><body><iframe src=\"/_Incapsula_Resource?SWJIYLWA=1\"></iframe></body></html>";
+        assert_eq!(detect_interstitial(body), Some(Vendor::Imperva));
     }
 }

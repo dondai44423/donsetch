@@ -571,12 +571,59 @@ fn trust_roots() -> Option<wreq::tls::trust::CertStore> {
                 if base().add_stack_pem_certs(pem).build().is_ok() {
                     builder = builder.add_stack_pem_certs(pem);
                 } else {
-                    eprintln!("[trust] an added CA bundle is not PEM certificates; left out");
+                    use std::io::Write;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[trust] an added CA bundle is not PEM certificates; left out"
+                    );
                 }
             }
             builder.build().ok().or_else(|| base().build().ok())
         });
     ROOTS.clone()
+}
+
+/// Returns true when headers or magic bytes indicate a binary media payload
+/// (PDF, raster image, archive, audio/video, font, octet-stream) so we skip
+/// allocating a multi-megabyte lossy UTF-8 string copy of the bytes.
+fn is_binary_payload(headers: &[(String, String)], bytes: &[u8]) -> bool {
+    if let Some((_, ct)) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
+        let media = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if media.starts_with("image/")
+            || media.starts_with("audio/")
+            || media.starts_with("video/")
+            || media.starts_with("font/")
+            || matches!(
+                media.as_str(),
+                "application/pdf"
+                    | "application/octet-stream"
+                    | "application/zip"
+                    | "application/gzip"
+                    | "application/x-gzip"
+                    | "application/wasm"
+            )
+        {
+            // SVG is XML text, not binary.
+            if media != "image/svg+xml" {
+                return true;
+            }
+        }
+    }
+    bytes.starts_with(b"%PDF-")
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        || bytes.starts_with(b"PK\x03\x04")
 }
 
 /// The proxy schemes the transport dials.
@@ -756,7 +803,13 @@ impl Wire {
         Ok(Self {
             client,
             runtime: Some(runtime),
-            max_body: guard.map(|guard| guard.limits.response_body_max),
+            // Only the engine's subresource wire enforces the 8 MiB per-op
+            // response cap. A document wire with a DNS resolver guard keeps the
+            // full DOCUMENT_BODY_MAX (64 MiB) so large PDFs/images are not
+            // silently truncated at 8 MiB.
+            max_body: guard_redirects
+                .then(|| guard.map(|guard| guard.limits.response_body_max))
+                .flatten(),
             // Only the engine's client follows redirects inside the client.
             // A document client with a resolver guard still returns each 3xx
             // to the caller's hop loop.
@@ -1334,11 +1387,24 @@ async fn execute_prepared_request(
             collected.extend_from_slice(&chunk);
             progress.store(collected.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        let (body, raw) = match String::from_utf8(collected) {
-            Ok(text) => (text, None),
-            Err(error) => {
-                let bytes = error.into_bytes();
-                (String::from_utf8_lossy(&bytes).into_owned(), Some(bytes))
+        let (body, raw) = if is_binary_payload(&headers, &collected) {
+            // Avoid allocating a 2–3x lossy UTF-8 string for large binary bodies
+            // (PDFs, images, archives). Keep a tiny non-empty prefix so generic
+            // contract checks see the body is present while `raw` holds the
+            // exact payload bytes.
+            let sample = &collected[..collected.len().min(256)];
+            let mut preview = String::from_utf8_lossy(sample).into_owned();
+            if !collected.is_empty() && preview.trim().is_empty() {
+                preview.push_str("binary");
+            }
+            (preview, Some(collected))
+        } else {
+            match String::from_utf8(collected) {
+                Ok(text) => (text, None),
+                Err(error) => {
+                    let bytes = error.into_bytes();
+                    (String::from_utf8_lossy(&bytes).into_owned(), Some(bytes))
+                }
             }
         };
         Ok::<_, String>((status, version, final_url, headers, body, cookies, raw))

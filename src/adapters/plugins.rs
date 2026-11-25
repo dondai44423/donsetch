@@ -228,6 +228,11 @@ fn load() -> LoadedCatalog {
         let mut reader = std::io::Read::take(&mut handle, MAX_FILE_BYTES.saturating_add(1));
         let read = std::io::Read::read_to_string(&mut reader, &mut text);
         let text = match read {
+            Ok(_) if text.len() as u64 > MAX_FILE_BYTES => {
+                crate::diag!("[adapters] skip plugins/{name}: file exceeds {MAX_FILE_BYTES} bytes");
+                skips += 1;
+                continue;
+            }
             Ok(_) => text,
             Err(e) => {
                 crate::diag!("[adapters] skip plugins/{name}: unreadable: {e}");

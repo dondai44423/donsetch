@@ -414,6 +414,7 @@ impl LayerFetcher {
                 cancel: Some(cancel.clone()),
                 ..donsetch_fetch::Policy::default()
             },
+            allow_private: crate::fetch::guards::private_egress_allowed(),
             ..donsetch_fetch::Once::new(shot.url)
         };
         let started = Instant::now();

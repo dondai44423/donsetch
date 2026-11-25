@@ -299,6 +299,20 @@ pub fn is_public(ip: IpAddr) -> bool {
     }
 }
 
+/// Public check for DNS-resolved addresses. Allows RFC 2544 `198.18.0.0/15`,
+/// which fake-IP TUN networks (Clash, mihomo, Surge) hand back from DNS for
+/// real public hostnames while routing the actual dial through the TUN device.
+/// Literal `198.18.x` URLs remain blocked by [`is_public`].
+pub fn is_public_resolved(ip: IpAddr) -> bool {
+    if let IpAddr::V4(v4) = ip {
+        let [a, b, ..] = v4.octets();
+        if a == 198 && (b == 18 || b == 19) {
+            return true;
+        }
+    }
+    is_public(ip)
+}
+
 fn public_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
     !(a == 0
@@ -309,6 +323,7 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 0 && c == 0)
         || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99) // 6to4 relay anycast (deprecated/reserved)
         || (a == 192 && b == 168)
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
@@ -321,13 +336,38 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         return public_v4(mapped);
     }
     let segments = ip.segments();
+    // IPv4-compatible ::a.b.c.d (::/96, deprecated)
+    if segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        if let Some(v4) = ip.to_ipv4() {
+            return public_v4(v4);
+        }
+    }
+    // 6to4 (2002::/16) embeds an IPv4 address in segments[1..=2]
+    if segments[0] == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            (segments[1] & 0xff) as u8,
+            (segments[2] >> 8) as u8,
+            (segments[2] & 0xff) as u8,
+        );
+        if !public_v4(v4) {
+            return false;
+        }
+    }
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
         || (segments[0] & 0xfe00) == 0xfc00 // unique local
         || (segments[0] & 0xffc0) == 0xfe80 // link local
         || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation
-        || (segments[0] == 0x0064 && segments[1] == 0xff9b)) // NAT64 can front a private v4
+        || (segments[0] == 0x0100 && segments[1] == 0x0000 && segments[2] == 0x0000 && segments[3] == 0x0000) // discard-only 0100::/64
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)) // NAT64 (well-known 64:ff9b::/96 & local-use 64:ff9b:1::/48)
 }
 
 /// What the page's own network ops may touch.
@@ -395,6 +435,14 @@ impl Guard {
         // An opted-in read may use its own page host and the loopback alias
         // localhost; it is not a licence for every private address.
         is_public(ip)
+            || (self.allow_private_page
+                && (self.is_page_host(host)
+                    || (host.eq_ignore_ascii_case("localhost")
+                        && self.page_host.starts_with("127."))))
+    }
+
+    fn address_allowed_resolved(&self, host: &str, ip: IpAddr) -> bool {
+        is_public_resolved(ip)
             || (self.allow_private_page
                 && (self.is_page_host(host)
                     || (host.eq_ignore_ascii_case("localhost")
@@ -481,7 +529,7 @@ impl wreq::dns::Resolve for GuardedResolver {
             };
             let kept: Vec<SocketAddr> = resolved
                 .into_iter()
-                .filter(|addr| guard.address_allowed(&host, addr.ip()))
+                .filter(|addr| guard.address_allowed_resolved(&host, addr.ip()))
                 .collect();
             if kept.is_empty() {
                 let error = io::Error::new(
@@ -746,5 +794,26 @@ mod tests {
         meter.release(600);
         assert!(meter.reserve(1000));
         assert_eq!(meter.peak(), 1000);
+    }
+
+    #[test]
+    fn resolved_allows_fake_ip_tun_while_blocking_6to4_compat_and_discard() {
+        let fake_ip: IpAddr = "198.18.0.25".parse().unwrap();
+        assert!(!is_public(fake_ip), "literal 198.18.x stays blocked");
+        assert!(
+            is_public_resolved(fake_ip),
+            "DNS-resolved 198.18.x allowed for fake-IP TUN"
+        );
+        for blocked in [
+            "192.88.99.1",
+            "2002:7f00:0001::1",
+            "2002:0a00:0001::1",
+            "::10.0.0.1",
+            "0100::1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(!is_public(ip), "{blocked} must be non-public");
+            assert!(!is_public_resolved(ip), "{blocked} must stay blocked");
+        }
     }
 }

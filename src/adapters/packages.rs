@@ -269,13 +269,22 @@ fn npm_repo(packument: &Value, manifest: &Value) -> Option<String> {
         Value::Object(_) => r.get("url").and_then(Value::as_str)?.to_string(),
         _ => return None,
     };
-    Some(
-        url.trim_start_matches("git+")
-            .trim_start_matches("git://")
-            .replace("git@", "github.com:")
-            .trim_end_matches(".git")
-            .to_string(),
-    )
+    let trimmed = url
+        .trim_start_matches("git+")
+        .trim_start_matches("git://")
+        .trim_start_matches("ssh://")
+        .trim_end_matches(".git");
+    let normalized = if let Some(rest) = trimmed.strip_prefix("git@") {
+        // `git@github.com:org/repo` -> `https://github.com/org/repo`
+        if let Some((host, path)) = rest.split_once(':') {
+            format!("https://{host}/{path}")
+        } else {
+            format!("https://{rest}")
+        }
+    } else {
+        trimmed.to_string()
+    };
+    Some(normalized)
 }
 
 fn deps_map(deps: Option<&Value>) -> Vec<String> {
@@ -847,5 +856,17 @@ mod tests {
     #[test]
     fn wrong_host_rejected() {
         assert!(extract(NPM.as_bytes(), "https://example.com/react", &opts()).is_none());
+    }
+
+    #[test]
+    fn npm_repo_normalizes_ssh_url_without_duplicating_host() {
+        let pack = serde_json::json!({
+            "repository": { "url": "git+ssh://git@github.com:org/repo.git" }
+        });
+        let empty = serde_json::json!({});
+        assert_eq!(
+            npm_repo(&pack, &empty).as_deref(),
+            Some("https://github.com/org/repo")
+        );
     }
 }

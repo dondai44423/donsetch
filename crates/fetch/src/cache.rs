@@ -755,6 +755,14 @@ pub fn http_date(value: &str) -> Option<i64> {
     let [hour, minute, second] = clock.as_slice() else {
         return None;
     };
+    if !(1970..=9999).contains(&year)
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(hour)
+        || !(0..60).contains(minute)
+        || !(0..=60).contains(second)
+    {
+        return None;
+    }
     // Days from the civil date (Howard Hinnant's algorithm).
     let shifted = if month <= 2 { year - 1 } else { year };
     let era = shifted.div_euclid(400);
@@ -1249,5 +1257,18 @@ mod tests {
         );
         assert!(!proxied.contains("secret"));
         assert_ne!(proxied, key("chrome", None, "https://a.test/"));
+    }
+
+    #[test]
+    fn http_date_rejects_out_of_range_fields_without_overflow() {
+        assert_eq!(
+            http_date("Sun, 06 Nov 99999999999999999 08:49:37 GMT"),
+            None
+        );
+        assert_eq!(http_date("Sun, 06 Nov 1969 08:49:37 GMT"), None);
+        assert_eq!(http_date("Sun, 32 Nov 2026 08:49:37 GMT"), None);
+        assert_eq!(http_date("Sun, 06 Nov 2026 25:49:37 GMT"), None);
+        assert_eq!(http_date("Sun, 06 Nov 2026 08:60:37 GMT"), None);
+        assert!(http_date("Sun, 06 Nov 1994 08:49:37 GMT").is_some());
     }
 }

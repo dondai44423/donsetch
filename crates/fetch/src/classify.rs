@@ -301,19 +301,19 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
             Class::WallProgram,
             "x-amzn-waf-action",
         ))
-    } else if header("x-datadome").is_some() || header("x-datadome-cid").is_some() {
-        Some((
-            "datadome",
-            "automated-traffic check",
-            Class::WallInteraction,
-            "x-datadome",
-        ))
     } else if header("cf-mitigated").is_some() {
         Some((
             "cloudflare",
             "managed challenge",
             Class::WallProgram,
             "cf-mitigated",
+        ))
+    } else if header("x-datadome").is_some() || header("x-datadome-cid").is_some() {
+        Some((
+            "datadome",
+            "automated-traffic check",
+            Class::WallInteraction,
+            "x-datadome",
         ))
     } else if header("x-px").is_some() || header("x-px-block").is_some() {
         Some(("perimeterx", "human check", Class::WallInteraction, "x-px"))

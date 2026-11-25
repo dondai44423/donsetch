@@ -92,21 +92,35 @@ pub struct ShellAssessment {
     pub reason: Option<&'static str>,
 }
 
+static SEL_BASE_HREF: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("base[href]").expect("base[href] selector"));
+static SEL_SCRIPT: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("script").expect("script selector"));
+static SEL_LINK_REL: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("link[rel]").expect("link[rel] selector"));
+static SEL_NOSCRIPT: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("noscript").expect("noscript selector"));
+static SEL_BODY: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("body").expect("body selector"));
+
 /// Resolve the document's effective base URL (`<base href="...">` against `page_url`,
 /// or `page_url` itself when no `<base href>` exists).
 pub fn extract_base_href(html: &str, page_url: &str) -> String {
+    let doc = Html::parse_document(html);
+    extract_base_href_doc(&doc, page_url)
+}
+
+/// Resolve the document's effective base URL from an already-parsed document.
+pub fn extract_base_href_doc(doc: &Html, page_url: &str) -> String {
     let Ok(base) = url::Url::parse(page_url) else {
         return page_url.to_string();
     };
-    let doc = Html::parse_document(html);
-    if let Ok(sel) = Selector::parse("base[href]") {
-        if let Some(el) = doc.select(&sel).next() {
-            if let Some(href) = el.value().attr("href") {
-                let trimmed = href.trim();
-                if !trimmed.is_empty() {
-                    if let Ok(resolved) = base.join(trimmed) {
-                        return resolved.to_string();
-                    }
+    if let Some(el) = doc.select(&SEL_BASE_HREF).next() {
+        if let Some(href) = el.value().attr("href") {
+            let trimmed = href.trim();
+            if !trimmed.is_empty() {
+                if let Ok(resolved) = base.join(trimmed) {
+                    return resolved.to_string();
                 }
             }
         }
@@ -116,13 +130,15 @@ pub fn extract_base_href(html: &str, page_url: &str) -> String {
 
 /// Parse `<script type="importmap">` declarations into resolved URL mappings.
 pub fn extract_import_map(html: &str, base_url: &str) -> HashMap<String, String> {
+    let doc = Html::parse_document(html);
+    extract_import_map_doc(&doc, base_url)
+}
+
+/// Parse `<script type="importmap">` declarations from an already-parsed document.
+pub fn extract_import_map_doc(doc: &Html, base_url: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let base = url::Url::parse(base_url).ok();
-    let doc = Html::parse_document(html);
-    let Ok(sel) = Selector::parse("script") else {
-        return map;
-    };
-    for script in doc.select(&sel) {
+    for script in doc.select(&SEL_SCRIPT) {
         let ty = script
             .value()
             .attr("type")
@@ -178,102 +194,98 @@ pub fn assess_html_shell(body: &str, page_url: &str) -> ShellAssessment {
         return ShellAssessment::default();
     }
     let doc = Html::parse_document(body);
-    let base = url::Url::parse(&extract_base_href(body, page_url)).ok();
+    assess_html_shell_doc(&doc, page_url)
+}
+
+/// Structural Hydration Deficit assessment over an already-parsed document.
+pub fn assess_html_shell_doc(doc: &Html, page_url: &str) -> ShellAssessment {
+    let base = url::Url::parse(&extract_base_href_doc(doc, page_url)).ok();
     let mut out = ShellAssessment::default();
 
     // 1. Detect executable first-party / app scripts and modulepreloads.
-    if let Ok(link_sel) = Selector::parse("link[rel]") {
-        for link in doc.select(&link_sel) {
-            let rel = link
-                .value()
-                .attr("rel")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if rel.split_whitespace().any(|r| r == "modulepreload")
-                && link.value().attr("href").is_some()
+    for link in doc.select(&SEL_LINK_REL) {
+        let rel = link
+            .value()
+            .attr("rel")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if rel.split_whitespace().any(|r| r == "modulepreload")
+            && link.value().attr("href").is_some()
+        {
+            out.has_app_program = true;
+            out.app_scripts += 1;
+        }
+    }
+
+    let mut next_data_unhydrated = false;
+    for script in doc.select(&SEL_SCRIPT) {
+        let id = script.value().attr("id").unwrap_or_default();
+        let ty = script
+            .value()
+            .attr("type")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+
+        if id == "__NEXT_DATA__" {
+            let raw: String = script.text().collect();
+            if is_unhydrated_next_data(&raw) {
+                next_data_unhydrated = true;
+            }
+            continue;
+        }
+
+        let is_module = ty == "module";
+        let is_classic_js = ty.is_empty()
+            || matches!(
+                ty.as_str(),
+                "text/javascript"
+                    | "application/javascript"
+                    | "text/ecmascript"
+                    | "application/ecmascript"
+            );
+        if !is_module && !is_classic_js {
+            continue;
+        }
+
+        if let Some(src) = script.value().attr("src") {
+            let resolved = base
+                .as_ref()
+                .and_then(|b| b.join(src.trim()).ok())
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| src.trim().to_string());
+            if !is_telemetry_url(&resolved)
+                && !resolved.contains("recaptcha")
+                && !resolved.contains("hcaptcha")
+                && !resolved.contains("challenges.cloudflare.com/turnstile")
             {
+                out.has_app_program = true;
+                out.app_scripts += 1;
+            }
+        } else {
+            let code: String = script.text().collect();
+            let trimmed = code.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if is_module || looks_like_inline_app_bootstrap(trimmed) {
                 out.has_app_program = true;
                 out.app_scripts += 1;
             }
         }
     }
 
-    let mut next_data_unhydrated = false;
-    if let Ok(script_sel) = Selector::parse("script") {
-        for script in doc.select(&script_sel) {
-            let id = script.value().attr("id").unwrap_or_default();
-            let ty = script
-                .value()
-                .attr("type")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-
-            if id == "__NEXT_DATA__" {
-                let raw: String = script.text().collect();
-                if is_unhydrated_next_data(&raw) {
-                    next_data_unhydrated = true;
-                }
-                continue;
-            }
-
-            let is_module = ty == "module";
-            let is_classic_js = ty.is_empty()
-                || matches!(
-                    ty.as_str(),
-                    "text/javascript"
-                        | "application/javascript"
-                        | "text/ecmascript"
-                        | "application/ecmascript"
-                );
-            if !is_module && !is_classic_js {
-                continue;
-            }
-
-            if let Some(src) = script.value().attr("src") {
-                let resolved = base
-                    .as_ref()
-                    .and_then(|b| b.join(src.trim()).ok())
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|| src.trim().to_string());
-                if !is_telemetry_url(&resolved)
-                    && !resolved.contains("recaptcha")
-                    && !resolved.contains("hcaptcha")
-                    && !resolved.contains("challenges.cloudflare.com/turnstile")
-                {
-                    out.has_app_program = true;
-                    out.app_scripts += 1;
-                }
-            } else {
-                let code: String = script.text().collect();
-                let trimmed = code.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if is_module || looks_like_inline_app_bootstrap(trimmed) {
-                    out.has_app_program = true;
-                    out.app_scripts += 1;
-                }
-            }
-        }
-    }
-
     // 2. Inspect <noscript> for explicit JS-required notices.
-    if let Ok(noscript_sel) = Selector::parse("noscript") {
-        for ns in doc.select(&noscript_sel) {
-            let raw: String = ns.text().collect::<Vec<_>>().join(" ");
-            let lower = crate::contract::fold_quotes(&raw.to_ascii_lowercase());
-            if JS_REQUIRED_PHRASES.iter().any(|p| lower.contains(p)) {
-                out.js_required_noscript = true;
-            }
+    for ns in doc.select(&SEL_NOSCRIPT) {
+        let raw: String = ns.text().collect::<Vec<_>>().join(" ");
+        let lower = crate::contract::fold_quotes(&raw.to_ascii_lowercase());
+        if JS_REQUIRED_PHRASES.iter().any(|p| lower.contains(p)) {
+            out.js_required_noscript = true;
         }
     }
 
     // 3. Separate Frame Chrome from Main Body substance.
-    let body_root = Selector::parse("body")
-        .ok()
-        .and_then(|s| doc.select(&s).next())
-        .map(|el| el.id());
+    let body_root = doc.select(&SEL_BODY).next().map(|el| el.id());
 
     if let Some(body_id) = body_root {
         if let Some(body_node) = doc.tree.get(body_id) {
@@ -669,9 +681,14 @@ fn inline_document_has_substance(html: &str) -> bool {
 /// Scan inline JS for `window.X = {...}`, `globalThis.X = {...}`, `self.X = {...}`,
 /// or `JSON.parse("...")` assignments, balancing JSON braces/brackets accurately.
 fn scan_global_json_assignments(script: &str, out: &mut Vec<(String, Value)>) {
+    let base_ptr = script.as_ptr() as usize;
+    let offset_of = |sub: &str| -> usize { sub.as_ptr() as usize - base_ptr };
     for prefix in ["window.", "globalThis.", "self."] {
         let mut cursor = 0usize;
-        while let Some(rel) = script[cursor..].find(prefix) {
+        while cursor < script.len() {
+            let Some(rel) = script[cursor..].find(prefix) else {
+                break;
+            };
             let start = cursor + rel + prefix.len();
             let rest = &script[start..];
             let ident_len = rest
@@ -680,7 +697,10 @@ fn scan_global_json_assignments(script: &str, out: &mut Vec<(String, Value)>) {
                 .map(char::len_utf8)
                 .sum::<usize>();
             if ident_len == 0 {
-                cursor = start + 1;
+                let Some(ch) = rest.chars().next() else {
+                    break;
+                };
+                cursor = start + ch.len_utf8();
                 continue;
             }
             let ident = &rest[..ident_len];
@@ -690,8 +710,8 @@ fn scan_global_json_assignments(script: &str, out: &mut Vec<(String, Value)>) {
                 continue;
             };
             // Reject `==` / `===`.
-            if after_eq.starts_with('=') {
-                cursor = start + ident_len + 2;
+            if let Some(after_second_eq) = after_eq.strip_prefix('=') {
+                cursor = offset_of(after_second_eq);
                 continue;
             }
             let rhs = after_eq.trim_start();
@@ -703,7 +723,7 @@ fn scan_global_json_assignments(script: &str, out: &mut Vec<(String, Value)>) {
                             out.push((format!("{prefix}{ident}"), val));
                         }
                     }
-                    cursor = start + ident_len + consumed;
+                    cursor = (offset_of(arg) + consumed).min(script.len());
                     continue;
                 }
             } else if rhs.starts_with('{') || rhs.starts_with('[') {
@@ -713,7 +733,7 @@ fn scan_global_json_assignments(script: &str, out: &mut Vec<(String, Value)>) {
                             out.push((format!("{prefix}{ident}"), val));
                         }
                     }
-                    cursor = start + ident_len + slice.len();
+                    cursor = (offset_of(rhs) + slice.len()).min(script.len());
                     continue;
                 }
             }
@@ -1447,5 +1467,18 @@ mod tests {
         assert_eq!(m.items, 3);
         assert!(m.html.contains("Ripgrep"));
         assert!(m.html.contains("https://tools.example.com/tools/ripgrep"));
+    }
+
+    #[test]
+    fn scan_global_json_assignments_handles_utf8_and_eof_without_panic() {
+        let mut out = Vec::new();
+        for script in [
+            "window.",
+            "window.😀",
+            "window.x\u{2003}=== 1; globalThis.y == 2;",
+            "self.data =   JSON.parse(\"{\\\"k\\\":\\\"😀\\\"}\"); window.z =   {\"a\":\"é\"}",
+        ] {
+            scan_global_json_assignments(script, &mut out);
+        }
     }
 }

@@ -193,8 +193,11 @@ fn number_pattern(x: f64) -> String {
 }
 
 /// The value as the page may write it: each magnitude it is a round number
-/// of, with that magnitude's words.
-fn value_pattern(value: f64, with_currency: bool, percent: bool) -> String {
+/// of, with that magnitude's words. Returns `None` when the value is too large
+/// for exact f64 digit formatting and has no round-magnitude representation
+/// (e.g. a 16+ digit identifier), so callers fall back to literal matching
+/// instead of emitting an empty `(?:)` pattern that matches everything.
+fn value_pattern(value: f64, with_currency: bool, percent: bool) -> Option<String> {
     let mut forms: Vec<String> = Vec::new();
     if value < 1e15 {
         forms.push(number_pattern(value));
@@ -203,7 +206,7 @@ fn value_pattern(value: f64, with_currency: bool, percent: bool) -> String {
         for (times, words, letter, bare) in MAGNITUDES {
             let x = value / times;
             let thousandths = x * 1000.0;
-            if x < 0.1 || (thousandths - thousandths.round()).abs() > 1e-6 * thousandths.max(1.0) {
+            if x < 0.1 || x >= 1e12 || (thousandths - thousandths.round()).abs() > 1e-6 {
                 continue;
             }
             let mut names: Vec<String> = words.iter().map(|word| word.to_string()).collect();
@@ -220,9 +223,12 @@ fn value_pattern(value: f64, with_currency: bool, percent: bool) -> String {
             ));
         }
     }
+    if forms.is_empty() {
+        return None;
+    }
     // Longest spellings first, so a magnitude is taken whole.
     forms.reverse();
-    format!("(?:{})", forms.join("|"))
+    Some(format!("(?:{})", forms.join("|")))
 }
 
 /// The quantities in `phrase` that are matched by value, in order.
@@ -259,7 +265,9 @@ pub(super) fn amounts(phrase: &str) -> Vec<Found> {
             continue;
         }
         let value = number * magnitude.unwrap_or(1.0);
-        let mut pattern = value_pattern(value, currency.is_some(), percent);
+        let Some(mut pattern) = value_pattern(value, currency.is_some(), percent) else {
+            continue;
+        };
         if percent {
             pattern.push_str(r"\s*(?:%|percent\b|per\s+cent\b|pct\b)");
         }
@@ -409,5 +417,14 @@ mod tests {
         assert_eq!(number_value("1.234,56"), Some(1234.56));
         assert_eq!(number_value("1,234.56"), Some(1234.56));
         assert_eq!(number_value("12\u{a0}000"), Some(12000.0));
+    }
+
+    #[test]
+    fn huge_identifiers_do_not_produce_empty_wildcard_pattern() {
+        // 16+ digit non-round IDs (>= 1e15) must fall back to literal matching,
+        // never emit `(?:)` which would falsely match every page.
+        assert!(amounts("order 1234567890123456").is_empty());
+        assert_eq!(value_pattern(1_234_567_890_123_456.0, false, false), None);
+        assert_eq!(value_pattern(1e16, false, true), None);
     }
 }

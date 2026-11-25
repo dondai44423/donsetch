@@ -138,6 +138,10 @@ pub struct Once {
     /// Refuse a body larger than this (default: [`DOCUMENT_BODY_MAX`]).
     pub cap: Option<usize>,
     pub policy: Policy,
+    /// Allow dialing private/loopback addresses on direct connections.
+    /// Production leaves this `false`; explicit private-egress opt-ins and
+    /// local test fixtures set `true`.
+    pub allow_private: bool,
 }
 
 impl Once {
@@ -156,6 +160,7 @@ impl Once {
                 request_max: Duration::MAX,
                 ..Policy::default()
             },
+            allow_private: false,
         }
     }
 }

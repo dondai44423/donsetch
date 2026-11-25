@@ -312,8 +312,9 @@ pub fn is_document(headers: &[(String, String)], body: &str) -> bool {
     {
         Some(media) => media.contains("html"),
         None => {
-            let head = body.trim_start().get(..256).unwrap_or(body.trim_start());
-            let head = head.to_ascii_lowercase();
+            let trimmed = body.trim_start();
+            let end = trimmed.floor_char_boundary(trimmed.len().min(256));
+            let head = trimmed[..end].to_ascii_lowercase();
             head.starts_with('<') && !head.starts_with("<?xml") || head.contains("<html")
         }
     }
@@ -367,6 +368,11 @@ pub fn verify_response(
     content
 }
 
+static SEL_TITLE: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("title").expect("title selector"));
+static SEL_H1: std::sync::LazyLock<Selector> =
+    std::sync::LazyLock::new(|| Selector::parse("h1").expect("h1 selector"));
+
 /// Verify a document against a contract.
 pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
     // Script and style bodies are not text a reader sees; leaving them in both
@@ -374,7 +380,7 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
     let cleaned = strip_noise(body);
     let document = Html::parse_document(&cleaned);
     let title = document
-        .select(&Selector::parse("title").expect("title selector"))
+        .select(&SEL_TITLE)
         .next()
         .map(|node| node.text().collect::<String>())
         .unwrap_or_default()
@@ -413,7 +419,7 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
             // few hundred characters of text (Akamai's "Access Denied" with its
             // reference number): long enough for the minimum, and not the page.
             let heading = document
-                .select(&Selector::parse("h1").expect("h1 selector"))
+                .select(&SEL_H1)
                 .next()
                 .map(|node| node.text().collect::<String>())
                 .unwrap_or_default();

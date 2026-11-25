@@ -66,6 +66,8 @@ pub fn extract(html: &str, url: &str, opts: &ExtractOptions) -> Option<Extracted
     let mut md = String::from("## Infobox\n\n");
     md.push_str("| field | value |\n| --- | --- |\n");
     for (k, v) in &fields {
+        let k = escape_table_cell(k);
+        let v = escape_table_cell(v);
         md.push_str(&format!("| {k} | {v} |\n"));
     }
     md.push_str("\n*(article body below)*\n\n");
@@ -316,6 +318,13 @@ pub(crate) fn render_markdown_blocks(root: ElementRef, url: &str, opts: &Extract
     out
 }
 
+fn escape_table_cell(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .to_string()
+}
+
 fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &mut String) {
     let row_sel = Selector::parse("tr").unwrap();
     let cell_sel = Selector::parse("th, td").unwrap();
@@ -325,7 +334,7 @@ fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &
             .select(&cell_sel)
             .map(|c| {
                 let (m, _) = crate::extract::inline::markdown(c, url, opts);
-                m.trim().to_string()
+                escape_table_cell(&m)
             })
             .collect();
         if cells.is_empty() {
@@ -334,7 +343,7 @@ fn render_wiki_table(table: ElementRef, url: &str, opts: &ExtractOptions, out: &
         out.push_str(&format!("| {} |\n", cells.join(" | ")));
         rows += 1;
         if rows == 1 {
-            out.push_str(&format!("|{} \n", "| --- ".repeat(cells.len())));
+            out.push_str(&format!("{}|\n", "| --- ".repeat(cells.len())));
         }
         if rows >= 12 {
             out.push_str("*(table truncated)*\n");

@@ -199,11 +199,28 @@ fn is_hydration_comment(text: &str) -> bool {
         || text.starts_with("ng-container")
 }
 
+/// Maximum DOM depth serialized by `parse_tree`. Guards against stack overflow
+/// on pathologically nested adversarial HTML (512 is well past any real page).
+const PARSE_TREE_MAX_DEPTH: usize = 512;
+
 /// One parsed node, in the host's tree format: an element is
 /// `[tag, {attributes}, ...children]`, a text node is a JSON string, and in
 /// template mode (or framework hydration anchors) a comment node is `["#comment", {}, text]`.
-fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep_comments: bool) {
+/// Returns `false` once `out` exceeds [`PARSE_TREE_CAP`].
+fn write_node(
+    out: &mut String,
+    node: ego_tree::NodeRef<'_, scraper::Node>,
+    keep_comments: bool,
+    depth: usize,
+) -> bool {
     use scraper::Node;
+    if out.len() > PARSE_TREE_CAP {
+        return false;
+    }
+    if depth >= PARSE_TREE_MAX_DEPTH {
+        out.push_str("[\"span\",{}]");
+        return true;
+    }
     match node.value() {
         Node::Element(element) => {
             out.push('[');
@@ -223,6 +240,9 @@ fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep
                 }
                 out.push(':');
                 write_json_string(out, value);
+                if out.len() > PARSE_TREE_CAP {
+                    return false;
+                }
             }
             out.push('}');
             let in_template = keep_comments || element.name().eq_ignore_ascii_case("template");
@@ -238,7 +258,9 @@ fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep
                             continue;
                         }
                         out.push(',');
-                        write_node(out, frag_child, in_template);
+                        if !write_node(out, frag_child, in_template, depth + 1) {
+                            return false;
+                        }
                     }
                     continue;
                 }
@@ -251,7 +273,9 @@ fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep
                     continue;
                 }
                 out.push(',');
-                write_node(out, child, in_template);
+                if !write_node(out, child, in_template, depth + 1) {
+                    return false;
+                }
             }
             out.push(']');
         }
@@ -263,20 +287,24 @@ fn write_node(out: &mut String, node: ego_tree::NodeRef<'_, scraper::Node>, keep
         }
         _ => {}
     }
+    out.len() <= PARSE_TREE_CAP
 }
 
 fn find_element<'a>(
-    node: ego_tree::NodeRef<'a, scraper::Node>,
+    root: ego_tree::NodeRef<'a, scraper::Node>,
     name: &str,
 ) -> Option<ego_tree::NodeRef<'a, scraper::Node>> {
-    if let scraper::Node::Element(element) = node.value() {
-        if element.name() == name {
-            return Some(node);
+    // Iterative DFS so deeply nested documents cannot overflow the stack.
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let scraper::Node::Element(element) = node.value() {
+            if element.name() == name {
+                return Some(node);
+            }
         }
-    }
-    for child in node.children() {
-        if let Some(hit) = find_element(child, name) {
-            return Some(hit);
+        let children: Vec<_> = node.children().collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
     None
@@ -291,7 +319,7 @@ const PARSE_TREE_CAP: usize = 24 * 1024 * 1024;
 /// into the host's tree format.
 fn parse_tree(html: &str, mode: &str) -> String {
     use scraper::{Html, Node};
-    let mut out = String::with_capacity(html.len() + html.len() / 2);
+    let mut out = String::with_capacity((html.len() + html.len() / 2).min(PARSE_TREE_CAP));
     if mode == "template" {
         let fragment = Html::parse_fragment(html);
         let root = fragment.root_element();
@@ -306,7 +334,9 @@ fn parse_tree(html: &str, mode: &str) -> String {
                     out.push(',');
                 }
                 first = false;
-                write_node(&mut out, child, true);
+                if !write_node(&mut out, child, true, 0) {
+                    return "{\"error\":\"parsed tree exceeds the lane cap\"}".to_string();
+                }
             }
         }
         out.push(']');
@@ -328,13 +358,19 @@ fn parse_tree(html: &str, mode: &str) -> String {
                     out.push(',');
                 }
                 first = false;
-                write_node(&mut out, child, false);
+                if !write_node(&mut out, child, false, 0) {
+                    return "{\"error\":\"parsed tree exceeds the lane cap\"}".to_string();
+                }
             }
         }
         out.push(']');
     } else {
         match find_element(root, "html") {
-            Some(html_node) => write_node(&mut out, html_node, false),
+            Some(html_node) => {
+                if !write_node(&mut out, html_node, false, 0) {
+                    return "{\"error\":\"parsed tree exceeds the lane cap\"}".to_string();
+                }
+            }
             None => {
                 out.push_str("[[\"html\",{},");
                 out.push_str("[\"head\",{},");
@@ -342,7 +378,9 @@ fn parse_tree(html: &str, mode: &str) -> String {
                 for child in root.children() {
                     if matches!(child.value(), Node::Element(_) | Node::Text(_)) {
                         out.push(',');
-                        write_node(&mut out, child, false);
+                        if !write_node(&mut out, child, false, 0) {
+                            return "{\"error\":\"parsed tree exceeds the lane cap\"}".to_string();
+                        }
                     }
                 }
                 out.push_str("]]]");
@@ -1160,12 +1198,10 @@ impl ModuleLoader for ContentModuleLoader {
         match self.resolve_specifier(specifier, referrer) {
             Ok(resolved) => Ok(resolved),
             Err(err) => {
+                let end = specifier.floor_char_boundary(specifier.len().min(80));
                 Self::push_log(
                     &self.logs,
-                    format!(
-                        "module specifier {}: {err}",
-                        &specifier[..specifier.len().min(80)]
-                    ),
+                    format!("module specifier {}: {err}", &specifier[..end]),
                 );
                 Err(ModuleLoaderError::type_error(err))
             }
@@ -1829,12 +1865,19 @@ fn run_within(
     let wire = Wire::guarded(identity, &guard, proxy).map_err(MintError::Runtime)?;
     let wire_handle = wire.handle();
 
-    let (base_url, is_shell) = if mode == Mode::Content {
-        let base = crate::hydrate::extract_base_href(html, url);
-        let shell = crate::hydrate::assess_html_shell(html, url).is_unhydrated_shell;
-        (base, shell)
+    let content_doc = if mode == Mode::Content {
+        Some(scraper::Html::parse_document(html))
     } else {
-        (url.to_string(), false)
+        None
+    };
+    let (base_url, is_shell) = match &content_doc {
+        Some(doc) => {
+            let base = crate::hydrate::extract_base_href_doc(doc, url);
+            let shell = html.len() <= 2 * 1024 * 1024
+                && crate::hydrate::assess_html_shell_doc(doc, url).is_unhydrated_shell;
+            (base, shell)
+        }
+        None => (url.to_string(), false),
     };
 
     let should_run_content =
@@ -1854,6 +1897,15 @@ fn run_within(
     } else {
         None
     };
+    struct ClosePrefetchOnDrop<'a>(Option<&'a Arc<PrefetchBoard>>);
+    impl Drop for ClosePrefetchOnDrop<'_> {
+        fn drop(&mut self) {
+            if let Some(board) = self.0 {
+                board.close();
+            }
+        }
+    }
+    let _prefetch_close_guard = ClosePrefetchOnDrop(prefetch.as_ref());
 
     let debug = std::env::var("V5_ENGINE_LOG").is_ok();
     let page = match mode {
@@ -1892,25 +1944,26 @@ fn run_within(
     let inline_modules = Arc::new(Mutex::new(HashMap::new()));
     let active_loads = Arc::new(AtomicUsize::new(0));
     let loader_logs = Arc::new(Mutex::new(Vec::new()));
-    let module_loader: Option<Rc<dyn ModuleLoader>> = if mode == Mode::Content {
-        let import_map = crate::hydrate::extract_import_map(html, &base_url);
-        Some(Rc::new(ContentModuleLoader::new(
-            base_url,
-            url.to_string(),
-            import_map,
-            Arc::clone(&inline_modules),
-            Arc::clone(&active_loads),
-            prefetch.clone(),
-            wire_handle.clone(),
-            identity,
-            Arc::clone(&guard),
-            cookie_header.map(str::to_string),
-            deadline,
-            limits.op_timeout,
-            Arc::clone(&loader_logs),
-        )))
-    } else {
-        None
+    let module_loader: Option<Rc<dyn ModuleLoader>> = match &content_doc {
+        Some(doc) => {
+            let import_map = crate::hydrate::extract_import_map_doc(doc, &base_url);
+            Some(Rc::new(ContentModuleLoader::new(
+                base_url,
+                url.to_string(),
+                import_map,
+                Arc::clone(&inline_modules),
+                Arc::clone(&active_loads),
+                prefetch.clone(),
+                wire_handle.clone(),
+                identity,
+                Arc::clone(&guard),
+                cookie_header.map(str::to_string),
+                deadline,
+                limits.op_timeout,
+                Arc::clone(&loader_logs),
+            )))
+        }
+        None => None,
     };
 
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
@@ -2133,10 +2186,17 @@ fn mint_from(value: serde_json::Value, cost: Cost) -> Result<Mint, MintError> {
     mint.surfaces = string_list(&value["surfaces"]);
     mint.logs = string_list(&value["logs"]);
     if std::env::var("V5_ENGINE_LOG").is_ok() {
+        use std::io::Write;
+        let mut stderr = std::io::stderr();
         for line in &mint.logs {
-            eprintln!("[engine] {}", line.replace('\n', "\\n").replace('\r', ""));
+            let _ = writeln!(
+                stderr,
+                "[engine] {}",
+                line.replace('\n', "\\n").replace('\r', "")
+            );
         }
-        eprintln!(
+        let _ = writeln!(
+            stderr,
             "[engine] cost: heap {} KB used / {} KB committed, buffers peak {} KB, {} ops, {} KB read",
             mint.cost.heap_used / 1024,
             mint.cost.heap_total / 1024,
@@ -2196,10 +2256,17 @@ fn content_from(
         });
     }
     if std::env::var("V5_ENGINE_LOG").is_ok() {
+        use std::io::Write;
+        let mut stderr = std::io::stderr();
         for line in &content.logs {
-            eprintln!("[engine] {}", line.replace('\n', "\\n").replace('\r', ""));
+            let _ = writeln!(
+                stderr,
+                "[engine] {}",
+                line.replace('\n', "\\n").replace('\r', "")
+            );
         }
-        eprintln!(
+        let _ = writeln!(
+            stderr,
             "[engine] content: stop={} {} text chars, {} requests, cost: heap {} KB used, {} ops, {} KB read",
             content.stop,
             content.text_chars,

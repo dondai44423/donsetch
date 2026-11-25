@@ -1443,8 +1443,21 @@ impl Worker {
             .ok_or_else(|| format!("request: not a URL: {}", once.url))?;
         self.proxy = once.proxy.clone();
         self.policy = once.policy.clone();
-        self.guard = None;
-        self.guard_key = WireGuardKey::None;
+        if self.proxy.is_none() {
+            self.guard_key = if once.allow_private {
+                WireGuardKey::PrivateHost(host.clone())
+            } else {
+                WireGuardKey::PublicOnly
+            };
+            self.guard = Some(crate::envelope::Guard::with_policy(
+                crate::envelope::Limits::default(),
+                if once.allow_private { &host } else { "" },
+                once.allow_private,
+            ));
+        } else {
+            self.guard = None;
+            self.guard_key = WireGuardKey::None;
+        }
         let stateless_redirect = is_stateless_redirect_url(&once.url);
         let cookie = if once.cookies && !stateless_redirect {
             self.state.cookie_header_for(&once.url, identity.name)

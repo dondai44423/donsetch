@@ -66,8 +66,8 @@ fn digest_of(name: &str) -> Result<MessageDigest, CryptoError> {
 }
 
 fn hex(raw: &str) -> Result<Vec<u8>, CryptoError> {
-    if !raw.len().is_multiple_of(2) {
-        return Err(CryptoError::Operation("odd hex length".into()));
+    if !raw.is_ascii() || !raw.len().is_multiple_of(2) {
+        return Err(CryptoError::Operation("odd or non-ascii hex".into()));
     }
     (0..raw.len())
         .step_by(2)
@@ -428,5 +428,12 @@ mod tests {
             run("digest", &params(r#"{"name":"MD5"}"#), &[], b"x"),
             Err(CryptoError::NotSupported(_))
         ));
+    }
+
+    #[test]
+    fn non_ascii_even_byte_length_hex_returns_error_without_panic() {
+        // 4 bytes (even), multi-byte UTF-8: slicing at byte 2 used to panic.
+        assert!(matches!(hex("😀"), Err(CryptoError::Operation(_))));
+        assert!(matches!(hex("éé"), Err(CryptoError::Operation(_))));
     }
 }
