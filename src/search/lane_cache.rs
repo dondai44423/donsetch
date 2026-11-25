@@ -77,9 +77,15 @@ impl LaneCache {
         self.entries.clear();
     }
 
-    pub fn contains(&self, source: &str, query: &str, intent: super::intent::Intent) -> bool {
+    pub fn contains(
+        &self,
+        source: &str,
+        query: &str,
+        intent: super::intent::Intent,
+        lang: &str,
+    ) -> bool {
         self.entries
-            .get(&format!("{source}|{}|{query}", intent.code()))
+            .get(&lane_key(source, intent, lang, query))
             .is_some_and(|entry| valid(entry, now()))
     }
 
@@ -91,6 +97,10 @@ impl LaneCache {
     }
 }
 
+fn lane_key(source: &str, intent: super::intent::Intent, lang: &str, query: &str) -> String {
+    format!("{source}|{}|lang={lang}|{query}", intent.code())
+}
+
 fn valid(entry: &Entry, time: u64) -> bool {
     entry.quality == AnswerClass::Answered
         && !entry.hits.is_empty()
@@ -99,16 +109,18 @@ fn valid(entry: &Entry, time: u64) -> bool {
             .is_some_and(|age| age < entry.ttl)
 }
 
-/// The exact query is part of the key: scoped, excluded and quoted queries
-/// never borrow a different question's answer. TTL follows the source class.
+/// The exact query and effective language are part of the key: scoped,
+/// excluded, quoted, and cross-language queries never borrow another
+/// question's answer. TTL follows the source class.
 pub(super) async fn run(
     cache: &std::sync::Mutex<LaneCache>,
     source: String,
     query: String,
     intent: super::intent::Intent,
+    lang: String,
     future: TaskFut<'_>,
 ) -> (String, EngineResult) {
-    let key = format!("{source}|{}|{query}", intent.code());
+    let key = lane_key(&source, intent, &lang, &query);
     {
         let guard = cache
             .lock()
@@ -204,10 +216,17 @@ mod tests {
             .lock()
             .unwrap()
             .entries
-            .insert(format!("bing|{}|{query}", intent.code()), entry);
+            .insert(lane_key("bing", intent, "en", query), entry);
         assert!(
-            cache.lock().unwrap().contains("bing", query, intent),
+            cache.lock().unwrap().contains("bing", query, intent, "en"),
             "an answered entry is replayable regardless of the script of its hits"
+        );
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .contains("bing", query, intent, "fr-FR"),
+            "different languages must never cross-poison lane_cache"
         );
     }
 }

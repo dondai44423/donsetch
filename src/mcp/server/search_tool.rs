@@ -102,8 +102,16 @@ async fn search_images_inner(
     }
 
     let requested = max.clamp(1, 12);
-    let out =
-        crate::search::images::search_images_multi(queries, requested, lang, contact_sheet).await;
+    daemon.byok.reload();
+    let prefer_searxng = daemon.byok.has_searxng() && !daemon.byok.is_local_default();
+    let out = crate::search::images::search_images_multi_with_searxng(
+        queries,
+        requested,
+        lang,
+        contact_sheet,
+        prefer_searxng,
+    )
+    .await;
     let urls: Vec<String> = out.results.iter().map(|h| h.image_url.clone()).collect();
     let handles = bind_search_urls(daemon, &urls).await;
     let handles_opt = (!handles.is_empty()).then_some(handles.as_slice());
@@ -563,14 +571,15 @@ pub(super) async fn search_outcome(
     daemon.byok.reload();
     let byok_configured = daemon.byok.is_configured();
     let local_first = daemon.byok.is_local_default();
+    let can_handle_lang = daemon.byok.can_handle_explicit_lang();
 
     // BYOK-first mode: try providers, fall back to local. An explicit `lang`
-    // keeps the local language-aware path: a provider that does not accept the
-    // tag must not silently answer in its own locale.
-    let byok_skipped_lang = byok_configured && !local_first && lang.is_some();
+    // keeps the local language-aware path unless a language-aware provider
+    // (such as SearXNG via `[search] searxng_url`) is configured.
+    let byok_skipped_lang = byok_configured && !local_first && lang.is_some() && !can_handle_lang;
     let mut byok_fail: Option<String> = None;
-    if byok_configured && !local_first && lang.is_none() {
-        match byok_search_cached(daemon, query, max, intent).await {
+    if byok_configured && !local_first && (lang.is_none() || can_handle_lang) {
+        match byok_search_cached(daemon, query, max, intent, lang).await {
             Ok(out) => return Ok(out),
             Err(e) => {
                 if crate::config::cfg().debug.search {
@@ -601,13 +610,16 @@ pub(super) async fn search_outcome(
         Err(e) => {
             // Local failed : if BYOK is configured and we're in local-first
             // mode, try BYOK as a last resort — unless an explicit `lang` was
-            // requested (#472: never let a locale-unaware provider answer in
-            // its own language).
-            if byok_fallback_allowed(byok_configured, local_first, lang.is_some()) {
+            // requested and no language-aware provider is configured (#472).
+            if byok_fallback_allowed(
+                byok_configured,
+                local_first,
+                lang.is_some() && !can_handle_lang,
+            ) {
                 if crate::config::cfg().debug.search {
                     crate::diag!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
-                match byok_search_cached(daemon, query, max, intent).await {
+                match byok_search_cached(daemon, query, max, intent, lang).await {
                     Ok(out) => Ok(out),
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
@@ -616,7 +628,8 @@ pub(super) async fn search_outcome(
                     }),
                 }
             } else {
-                let cause = if byok_configured && local_first && lang.is_some() {
+                let cause = if byok_configured && local_first && lang.is_some() && !can_handle_lang
+                {
                     format!("{e}; byok skipped: explicit lang")
                 } else {
                     e.to_string()
@@ -685,36 +698,46 @@ async fn byok_search_cached(
     query: &str,
     max: usize,
     intent: Option<Intent>,
+    lang: Option<&crate::search::Lang>,
 ) -> Result<crate::search::SearchOutcome, String> {
     let resolved = intent.unwrap_or_else(|| crate::search::intent::detect(query));
-    if let Some(hit) = daemon.searcher.byok_cache_get(query, resolved, max) {
+    if let Some(hit) = daemon
+        .searcher
+        .byok_cache_get_with_lang(query, resolved, max, lang)
+    {
         return Ok(hit);
     }
     // Single-flight on the byok cache key: two concurrent identical
     // queries share one provider round-trip instead of both missing
     // the cache and both billing the metered provider.
-    let key = daemon.searcher.byok_flight_key(query, resolved);
+    let key = daemon
+        .searcher
+        .byok_flight_key_with_lang(query, resolved, lang);
     let d2 = Arc::clone(daemon);
     let q2 = query.to_string();
+    let lang_owned = lang.cloned();
     daemon
         .searcher
-        .byok_flight(key, query, resolved, max, async move {
+        .byok_flight(key, query, resolved, max, lang, async move {
             let daemon = d2;
             let query = q2.as_str();
+            let lang_ref = lang_owned.as_ref();
             // Fetch the provider's FULL top slice (12) regardless of
-            // the caller's ask, cache that, then truncate: caching
-            // the truncated outcome meant a first search at max=2
-            // served every later larger request a 2-row slice as
-            // cached: true (the local path fixed this same bug).
-            let mut out = daemon.byok.search(query, 12, intent).await?;
-            // Store the provider's own top slice before site:
-            // filtering, so a later hit filters on serve exactly as
-            // the miss path does.
-            daemon.searcher.byok_cache_put(query, &out);
-            // Issue #190: site: queries reach BYOK results too, and
-            // prewarm only the rows that survive the filter (law 5:
-            // zero added latency).
+            // the caller's ask, cache that, then filter & truncate.
+            let mut out = daemon
+                .byok
+                .search_with_lang(query, 12, intent, lang_ref)
+                .await?;
+            // Store the provider's own top slice before operator
+            // filtering, so a later cache hit filters on serve identically.
+            daemon
+                .searcher
+                .byok_cache_put_with_lang(query, &out, lang_ref);
+            // Issue #190 + filter parity: apply site:/intitle:/filetype:
+            // BEFORE truncating to `max`, matching the cache-hit path.
             crate::search::site_filter(query, &mut out.results);
+            crate::search::query::intitle_filter(query, &mut out.results);
+            crate::search::query::filetype_filter(query, &mut out.results);
             out.results.truncate(max.clamp(1, 12));
             daemon.searcher.spawn_prewarm(&out.results);
             Ok(out)

@@ -19,6 +19,7 @@ mod brightdata;
 mod exa;
 mod parallel;
 pub mod plugin;
+pub mod searxng;
 mod serpapi;
 mod serpbase;
 mod serper;
@@ -49,6 +50,7 @@ pub(crate) struct SearchHit {
     url: String,
     snippet: String,
     score: f32,
+    published: Option<String>,
 }
 
 /// A successful provider result: hits, wall-clock ms, and the
@@ -107,6 +109,32 @@ impl KeyError {
             Self::UnknownError(format!("network: {}", e.without_url()))
         }
     }
+}
+
+/// Max bytes read from any single BYOK HTTP response so a misbehaving
+/// upstream or proxy cannot OOM the daemon.
+const MAX_BYOK_BODY: usize = 4 * 1024 * 1024;
+
+/// Stream a BYOK HTTP response body into UTF-8 text under `MAX_BYOK_BODY`.
+pub(super) async fn read_bounded_text(mut resp: reqwest::Response) -> Result<String, KeyError> {
+    if let Some(cl) = resp.content_length()
+        && cl as usize > MAX_BYOK_BODY
+    {
+        return Err(KeyError::UnknownError(
+            "provider response exceeded the 4 MiB body cap".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(KeyError::from_transport)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_BYOK_BODY {
+            return Err(KeyError::UnknownError(
+                "provider response exceeded the 4 MiB body cap".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| KeyError::UnknownError("provider response is not valid UTF-8".into()))
 }
 
 /// Cap on how much of an upstream error body is echoed into a
@@ -257,11 +285,11 @@ impl std::fmt::Display for ProviderFailure {
 /// downed provider.
 const MAX_ATTEMPTS: usize = 20;
 
-/// BYOK searcher: holds the key store, plugin store and HTTP client.
+/// BYOK searcher: holds the key store, plugin store and route-cached HTTP clients.
 pub struct ByokSearcher {
     store: ByokStore,
     plugins: PluginStore,
-    client: reqwest::Client,
+    clients: std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
 }
 
 impl Default for ByokSearcher {
@@ -270,30 +298,98 @@ impl Default for ByokSearcher {
     }
 }
 
-impl ByokSearcher {
-    /// Load from disk. If no keys or plugins are configured,
-    /// search() returns Err("not configured") and the caller
-    /// falls back to local.
-    pub fn new() -> Self {
-        let client = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(2)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+enum PickedTarget {
+    Searxng(String),
+    Plugin(PluginDef),
+    Native,
+}
 
+fn endpoint_for(provider: &str) -> &'static str {
+    match provider {
+        "tavily" => "https://api.tavily.com/search",
+        "exa" => "https://api.exa.ai/search",
+        "serper" => "https://google.serper.dev/search",
+        "serpapi" => "https://serpapi.com/search",
+        "serpbase" => "https://api.serpbase.dev/google/search",
+        "bravesearch" => "https://api.search.brave.com/res/v1/web/search",
+        "tinyfish" => "https://api.search.tinyfish.ai/",
+        "parallel" => "https://api.parallel.ai/v1/search",
+        "brightdata" => "https://api.brightdata.com/request",
+        _ => "https://example.invalid/",
+    }
+}
+
+impl ByokSearcher {
+    /// Load from disk. If no keys, plugins, or `[search] searxng_url` are
+    /// configured, search() returns Err and the caller falls back to local.
+    pub fn new() -> Self {
         Self {
             store: ByokStore::new(),
             plugins: PluginStore::new(),
-            client,
+            clients: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// True if at least one keyed provider or plugin exists.
+    fn client_for(&self, provider: &str) -> Result<reqwest::Client, KeyError> {
+        let endpoint = endpoint_for(provider);
+        let proxy = crate::egress::proxy::from_env_for(endpoint)
+            .map_err(|e| KeyError::UnknownError(format!("proxy config: {e}")))?;
+        let route_key = proxy
+            .as_ref()
+            .map(|p| p.id())
+            .unwrap_or_else(|| "direct".into());
+        if let Some(existing) = self
+            .clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&route_key)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+        let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(2)
+            .no_proxy();
+        if let Some(proxy) = proxy {
+            if proxy.scheme == crate::egress::proxy::ProxyScheme::Socks5 {
+                return Err(KeyError::UnknownError(format!(
+                    "{provider}: SOCKS5 proxy is unsupported for BYOK HTTPS APIs; use an HTTP proxy or NO_PROXY"
+                )));
+            }
+            builder = builder.proxy(reqwest::Proxy::all(proxy.wire_url()).map_err(|_| {
+                KeyError::UnknownError("unsupported proxy configuration".to_string())
+            })?);
+        }
+        let built = builder.build().map_err(KeyError::from_transport)?;
+        let mut map = self
+            .clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= 16 {
+            map.clear();
+        }
+        map.insert(route_key, built.clone());
+        Ok(built)
+    }
+
+    /// True if `[search] searxng_url` is configured.
+    pub fn has_searxng(&self) -> bool {
+        searxng::configured_url().is_some()
+    }
+
+    /// True if at least one keyed provider, plugin, or SearXNG URL exists.
     pub fn is_configured(&self) -> bool {
         // Search-scoped: a store holding only fetch-side keys
         // (unlocker) is not a configured search (#284).
-        self.store.has_search_providers() || self.plugins.is_configured()
+        self.store.has_search_providers() || self.plugins.is_configured() || self.has_searxng()
+    }
+
+    /// True if a configured provider natively accepts explicit BCP-47 `lang`
+    /// tags (currently SearXNG / Degoog via `&language=`).
+    pub fn can_handle_explicit_lang(&self) -> bool {
+        self.has_searxng()
     }
 
     /// True if "local" is the default search method.
@@ -307,13 +403,27 @@ impl ByokSearcher {
         self.plugins.reload();
     }
 
-    /// Search via the provider chain. Falls back through keys
-    /// and providers. Returns Err if all keys/providers exhausted.
+    /// Search via the provider chain without an explicit language override.
+    #[cfg(test)]
     pub(crate) async fn search(
         &self,
         query: &str,
         max_results: usize,
         forced_intent: Option<Intent>,
+    ) -> Result<SearchOutcome, String> {
+        self.search_with_lang(query, max_results, forced_intent, None)
+            .await
+    }
+
+    /// Search via the provider chain. Falls back through keys and providers.
+    /// When `lang` is `Some`, only language-aware providers (`searxng`) are
+    /// queried so locale-unaware BYOK services never ignore explicit `lang`.
+    pub(crate) async fn search_with_lang(
+        &self,
+        query: &str,
+        max_results: usize,
+        forced_intent: Option<Intent>,
+        lang: Option<&crate::search::Lang>,
     ) -> Result<SearchOutcome, String> {
         // Reload to pick up any CLI key changes since daemon start.
         self.reload();
@@ -350,20 +460,11 @@ impl ByokSearcher {
                 ));
             }
 
-            // Pick the next usable (provider, key) pair,
-            // skipping any we've already tried this call.
-            // Plugins participate with a synthetic key equal to
-            // their name: one attempt per plugin per call, like
-            // every transient-failing provider.
-            let (provider, key, plugin_def) = match self.pick_any_skipping(&tried) {
+            // Pick the next usable provider target, skipping any already tried
+            // this call. When explicit `lang` is set, only SearXNG qualifies.
+            let (provider, key, target) = match self.pick_any_skipping(&tried, lang.is_some()) {
                 Some(pk) => pk,
                 None => {
-                    // Nothing was pickable on the first pass: every
-                    // key is invalid, depleted or cooling down and
-                    // every plugin is striking. `last_error` is still
-                    // empty here, and the bare prefix rendered as an
-                    // empty engine status ("byok: ") in the degraded
-                    // trail, the one case #285 exists for.
                     if last_error.is_empty() {
                         return Err(NO_USABLE_KEY.to_string());
                     }
@@ -371,30 +472,29 @@ impl ByokSearcher {
                 }
             };
             tried.insert((provider.clone(), key.clone()));
-            let is_plugin = plugin_def.is_some();
+            let is_plugin = matches!(target, PickedTarget::Plugin(_));
+            let is_searxng = matches!(target, PickedTarget::Searxng(_));
 
-            // Dispatch to the provider adapter. Both arms
-            // normalize to `ProviderFailure`: a plugin brings its own
-            // words, a native adapter's text is what its variant
-            // already renders. Timed here rather than inside the
-            // adapter so a walked-past lane reports the wall time it
-            // cost this call, whether it failed or came back empty.
             let attempt_started = Instant::now();
-            let result: Result<ProviderOutcome, ProviderFailure> = match plugin_def {
-                Some(def) => plugin::run_plugin(&provider, &def, query, max, &intent).await,
-                None => dispatch(&self.client, &provider, &key, query, max, &intent)
-                    .await
-                    .map_err(ProviderFailure::of),
+            let result: Result<ProviderOutcome, ProviderFailure> = match target {
+                PickedTarget::Searxng(base_url) => {
+                    searxng::search(&base_url, query, max, &intent, lang).await
+                }
+                PickedTarget::Plugin(def) => {
+                    plugin::run_plugin(&provider, &def, query, max, &intent).await
+                }
+                PickedTarget::Native => match self.client_for(&provider) {
+                    Ok(client) => dispatch(&client, &provider, &key, query, max, &intent)
+                        .await
+                        .map_err(ProviderFailure::of),
+                    Err(err) => Err(ProviderFailure::of(err)),
+                },
             };
             let attempt_ms = attempt_started.elapsed().as_millis() as u64;
 
             match result {
                 Ok(outcome) => {
                     if outcome.hits.is_empty() {
-                        // Provider returned 0 results : don't
-                        // return an empty list to the agent.
-                        // Try the next provider, and if all are
-                        // empty, fall back to local search.
                         last_error = format!("{provider}: empty results");
                         if crate::config::cfg().debug.search {
                             crate::diag!("[byok] {provider} returned 0 results, trying next");
@@ -440,10 +540,7 @@ impl ByokSearcher {
                         cache_age: None,
                         elapsed: started.elapsed(),
                         provider: Some(provider),
-                        // Provider-ranked, not cross-encoder-ranked.
                         reranked: false,
-                        // Providers do not expose a byte-derived
-                        // SERP instant layer.
                         instant: None,
                         requests: None,
                         stage_ms: Vec::new(),
@@ -451,7 +548,6 @@ impl ByokSearcher {
                 }
                 Err(failure) => {
                     let shown = &failure.detail;
-                    // Log the error for debugging.
                     if crate::config::cfg().debug.search {
                         crate::diag!(
                             "[byok] {provider} key={}... {shown}",
@@ -461,10 +557,6 @@ impl ByokSearcher {
 
                     last_error = format!("{provider}: {shown}");
 
-                    // The lane this attempt occupied, named by how it
-                    // actually ended: a rate-limited key or plugin is
-                    // the transient case, everything else here is an
-                    // error the caller can see in `_meta`.
                     walk.push(EngineReport {
                         cache_age_ms: None,
                         engine: provider.clone(),
@@ -480,50 +572,75 @@ impl ByokSearcher {
                         requests: 0,
                     });
 
-                    // Update key state if this is a key-level error.
-                    // A plugin's credentials live inside the plugin,
-                    // so its state is recorded against the plugin
-                    // rather than against a key we hold.
-                    if let Some(new_state) = failure.key.to_key_state() {
+                    // Update key/plugin state on persistent auth/quota/rate errors.
+                    // SearXNG lives in config (`search.searxng_url`), not the key store.
+                    if !is_searxng && let Some(new_state) = failure.key.to_key_state() {
                         if is_plugin {
                             self.plugins.mark_state(&provider, new_state);
                         } else {
                             self.store.update_key_state(&provider, &key, new_state);
                         }
                     }
-
-                    // Transient errors (server, network) don't mark
-                    // the key dead : but we still try the next key
-                    // to avoid getting stuck on a flaky provider.
-                    // The loop continues to pick_key().
                 }
             }
         }
     }
 
-    /// Combine the two lookups: Try a plugin named as default
-    /// first (they live outside the keyed provider chain), then
-    /// fall back to keyed providers (default-first), then
-    /// remaining plugins in registration order. A plugin that
-    /// reported itself invalid, out of credit or rate-limited is
-    /// skipped, the same way pick_key_skipping skips such a key.
+    /// Combine SearXNG, plugins, and keyed providers:
+    /// - When `explicit_lang` is true, only SearXNG qualifies.
+    /// - Otherwise: respect explicit `default` first (SearXNG if default is
+    ///   `"searxng"` or empty, plugin if default matches a plugin, keyed
+    ///   providers default-first), then fall back across remaining providers.
     fn pick_any_skipping(
         &self,
         tried: &std::collections::HashSet<(String, String)>,
-    ) -> Option<(String, String, Option<PluginDef>)> {
+        explicit_lang: bool,
+    ) -> Option<(String, String, PickedTarget)> {
+        let searxng_url = searxng::configured_url();
+        let searxng_pair = (searxng::SOURCE.to_string(), searxng::SOURCE.to_string());
+        let searxng_ready = searxng_url
+            .as_ref()
+            .filter(|_| !tried.contains(&searxng_pair));
+
+        if explicit_lang {
+            return searxng_ready.map(|url| {
+                (
+                    searxng::SOURCE.to_string(),
+                    searxng::SOURCE.to_string(),
+                    PickedTarget::Searxng(url.clone()),
+                )
+            });
+        }
+
         let snap = self.plugins.snapshot();
         let default = self.store.current_default();
+        if (default == searxng::SOURCE || default.is_empty())
+            && let Some(url) = searxng_ready
+        {
+            return Some((
+                searxng::SOURCE.to_string(),
+                searxng::SOURCE.to_string(),
+                PickedTarget::Searxng(url.clone()),
+            ));
+        }
         if !default.is_empty() && default != "local" {
             let pair = (default.clone(), default.clone());
             if let Some(def) = snap.plugins.get(&default).cloned()
                 && !tried.contains(&pair)
                 && self.plugins.is_usable(&default)
             {
-                return Some((default.clone(), default, Some(def)));
+                return Some((default.clone(), default, PickedTarget::Plugin(def)));
             }
         }
         if let Some((provider, key)) = self.store.pick_key_skipping(tried) {
-            return Some((provider, key, None));
+            return Some((provider, key, PickedTarget::Native));
+        }
+        if let Some(url) = searxng_ready {
+            return Some((
+                searxng::SOURCE.to_string(),
+                searxng::SOURCE.to_string(),
+                PickedTarget::Searxng(url.clone()),
+            ));
         }
         for name in snap.names() {
             if *name == default {
@@ -536,7 +653,7 @@ impl ByokSearcher {
             if let Some(def) = snap.plugins.get(name).cloned()
                 && self.plugins.is_usable(name)
             {
-                return Some((name.clone(), name.clone(), Some(def)));
+                return Some((name.clone(), name.clone(), PickedTarget::Plugin(def)));
             }
         }
         None
@@ -739,7 +856,7 @@ fn to_merged(hits: Vec<SearchHit>, provider: &str, max: usize) -> Vec<Merged> {
             snippet: h.snippet,
             score: h.score as f64,
             sources: vec![(provider.to_string(), i + 1)],
-            published: None,
+            published: h.published,
             families: 0,
             from_page: false,
             tier: 3,
@@ -836,17 +953,20 @@ mod tests {
                 url: "https://a.com".into(),
                 snippet: "sa".into(),
                 score: 0.9,
+                published: Some("2026-11-20".into()),
             },
             SearchHit {
                 title: "B".into(),
                 url: "https://b.com".into(),
                 snippet: "sb".into(),
                 score: 0.5,
+                published: None,
             },
         ];
         let merged = to_merged(hits, "tavily", 10);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].title, "A");
+        assert_eq!(merged[0].published.as_deref(), Some("2026-11-20"));
         assert!((merged[0].score - 0.9).abs() < 0.01);
         assert_eq!(merged[0].sources.len(), 1);
         assert_eq!(merged[0].sources[0].0, "tavily");
@@ -860,18 +980,21 @@ mod tests {
                 url: "https://a.com".into(),
                 snippet: "s".into(),
                 score: 0.9,
+                published: None,
             },
             SearchHit {
                 title: "A2".into(),
                 url: "https://www.a.com/".into(),
                 snippet: "s".into(),
                 score: 0.8,
+                published: None,
             },
             SearchHit {
                 title: "B".into(),
                 url: "https://b.com".into(),
                 snippet: "s".into(),
                 score: 0.5,
+                published: None,
             },
         ];
         // a.com and www.a.com/ normalize to the same key
@@ -889,18 +1012,21 @@ mod tests {
                 url: "https://a.com".into(),
                 snippet: "s".into(),
                 score: 0.9,
+                published: None,
             },
             SearchHit {
                 title: "  \n".into(),
                 url: "https://b.com".into(),
                 snippet: "s".into(),
                 score: 0.8,
+                published: None,
             },
             SearchHit {
                 title: "Real".into(),
                 url: "https://c.com".into(),
                 snippet: "s".into(),
                 score: 0.5,
+                published: None,
             },
         ];
         let merged = to_merged(hits, "exa", 10);
@@ -916,6 +1042,7 @@ mod tests {
                 url: format!("https://t{i}.com"),
                 snippet: "s".into(),
                 score: 1.0 - i as f32 * 0.1,
+                published: None,
             })
             .collect();
         let merged = to_merged(hits, "exa", 3);
@@ -935,18 +1062,21 @@ mod tests {
                 url: "https://a.com".into(),
                 snippet: "s".into(),
                 score: 1.0,
+                published: None,
             },
             SearchHit {
                 title: "dup of a".into(),
                 url: "https://a.com/".into(), // trailing slash = same norm_key
                 snippet: "s".into(),
                 score: 0.9,
+                published: None,
             },
             SearchHit {
                 title: "b".into(),
                 url: "https://b.com".into(),
                 snippet: "s".into(),
                 score: 0.8,
+                published: None,
             },
         ];
         let merged = to_merged(hits, "exa", 2);
@@ -1276,18 +1406,21 @@ mod tests {
                 url: format!("http://{addr}/goto?url=ok1"),
                 snippet: "macro".into(),
                 score: 1.0,
+                published: None,
             },
             SearchHit {
                 title: "Duplicate via goto".into(),
                 url: format!("http://{addr}/goto?url=dup1"),
                 snippet: "dup".into(),
                 score: 0.5,
+                published: None,
             },
             SearchHit {
                 title: "Nested redirector".into(),
                 url: format!("http://{addr}/goto?url=badloc"),
                 snippet: "loop".into(),
                 score: 0.33,
+                published: None,
             },
             SearchHit {
                 title: "Wrapped /url?q=".into(),
@@ -1295,6 +1428,7 @@ mod tests {
                     .into(),
                 snippet: "local decode".into(),
                 score: 0.2,
+                published: None,
             },
         ];
 
@@ -1339,6 +1473,7 @@ mod tests {
             url: format!("http://{addr}/goto?url=rl"),
             snippet: "rl".into(),
             score: 1.0,
+            published: None,
         }];
         resolve_redirect_hits_with(&mut rl_hits, Some(client), |u| u.contains("/goto?url=")).await;
         assert_eq!(rl_hits[0].url, format!("http://{addr}/goto?url=rl"));
@@ -1365,6 +1500,7 @@ mod tests {
             url: original.clone(),
             snippet: "s".into(),
             score: 1.0,
+            published: None,
         }];
         // Would fail/hang if it attempted a live network call against a dead client;
         // validate_url_basic rejects google.com before any HTTP client is built.

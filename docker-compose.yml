@@ -35,6 +35,13 @@ services:
       # Optional: search proxy rotation (comma-separated)
       # DONSEEK_PROXIES: "http://proxy1:8080,socks5://proxy2:1080"
 
+      # Optional: point directly at an existing SearXNG (or Degoog) container
+      # without needing a script interpreter inside the DonSeTch container (#476):
+      # DONSETCH_SEARCH__SEARXNG_URL: "http://searxng:8080"
+
+      # Optional: point web_screenshot at an external Chromium CDP container:
+      # DONSETCH_BROWSER__CDP_URL: "http://chromium:9222"
+
       NO_COLOR: "1"
 
     # Time `docker compose stop` allows between SIGTERM and SIGKILL.

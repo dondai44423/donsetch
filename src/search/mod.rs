@@ -379,12 +379,51 @@ fn norm_query(q: &str) -> String {
     key.join(" ")
 }
 
-/// Cache key for BYOK provider results (issue #195). The `byok|`
-/// prefix keeps them out of the local path's `query|intent` slot, so
-/// switching the `default` between local and a provider can never
-/// serve one path's results under the other's name.
-fn byok_cache_key(query: &str, intent: Intent) -> String {
-    format!("byok|{}|{}", norm_query(query), intent.code())
+/// Cache key for BYOK provider results (issue #195, #476). The `byok|`
+/// prefix keeps them out of the local path's slot, and `|lang=` isolates
+/// explicit-language answers (e.g. SearXNG) across languages.
+fn byok_cache_key(query: &str, intent: Intent, lang: Option<&Lang>) -> String {
+    format!(
+        "byok|{}|{}|lang={}",
+        norm_query(query),
+        intent.code(),
+        lang.map(Lang::tag).unwrap_or_default()
+    )
+}
+
+/// Extract `(norm_query, intent)` from any search cache key:
+/// - `{query}|{intent}|lang={tag}` (current local)
+/// - `byok|{query}|{intent}|lang={tag}` (current BYOK)
+/// - `{query}|{intent}` / `byok|{query}|{intent}` (legacy)
+pub(super) fn parse_cache_key(key: &str) -> (&str, Intent) {
+    let body = key.strip_prefix("byok|").unwrap_or(key);
+    let without_lang = match body.rsplit_once('|') {
+        Some((head, tail)) if tail.starts_with("lang=") => head,
+        _ => body,
+    };
+    let (qpart, ipart) = without_lang.rsplit_once('|').unwrap_or((without_lang, ""));
+    let intent = if let Ok(code) = ipart.parse::<u8>() {
+        Intent::from_code(code)
+    } else {
+        match ipart {
+            "News" => Intent::News,
+            "Code" => Intent::Code,
+            "Paper" => Intent::Paper,
+            "Entity" => Intent::Entity,
+            "Image" => Intent::Image,
+            _ => Intent::Web,
+        }
+    };
+    (qpart, intent)
+}
+
+/// How long a single-flight follower waits for the leader before timing out.
+/// Scales with `[search] timeout_ms` so high-RTT configurations are never cut
+/// off prematurely at a hardcoded 12 s ceiling.
+fn single_flight_wait() -> Duration {
+    fanout_hard_mark()
+        .saturating_add(Duration::from_secs(8))
+        .max(Duration::from_secs(12))
 }
 
 /// Whether a failure `status` reflects the engine actually behaving
@@ -611,7 +650,7 @@ pub struct Searcher {
     /// BYOK single-flight: a metered provider is not re-billed by a
     /// concurrent identical query (the local fan-out has `inflight`
     /// for the same reason). Keyed on the byok cache key.
-    byok_inflight: Mutex<std::collections::HashSet<String>>,
+    byok_inflight: Mutex<HashMap<String, std::sync::Arc<LocalFlight>>>,
     /// v3 warm handoff: enrichment bodies cached for the
     /// subsequent `web_fetch` of a top result (search → fetch
     /// is THE agent pipeline). One-shot, TTL'd, bounded.
@@ -751,7 +790,7 @@ impl Searcher {
             ledger: Arc::new(Mutex::new(ledger::Ledger::load())),
             inflight: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
-            byok_inflight: Mutex::new(std::collections::HashSet::new()),
+            byok_inflight: Mutex::new(HashMap::new()),
             prewarms: std::sync::Arc::new(std::sync::Mutex::new(PrewarmCache::new())),
             quality: Mutex::new(load_quality_disk()),
             quality_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -787,7 +826,7 @@ impl Searcher {
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|k, _| k.rsplit_once('|').map(|(q, _)| q) != Some(key.as_str()));
+            .retain(|k, _| parse_cache_key(k).0 != key.as_str());
     }
 
     /// Decide whether one lane is planned: the ledger's standing first (a
@@ -869,8 +908,18 @@ impl Searcher {
         intent: Intent,
         max_results: usize,
     ) -> Option<SearchOutcome> {
+        self.byok_cache_get_with_lang(query, intent, max_results, None)
+    }
+
+    pub fn byok_cache_get_with_lang(
+        &self,
+        query: &str,
+        intent: Intent,
+        max_results: usize,
+        lang: Option<&Lang>,
+    ) -> Option<SearchOutcome> {
         let t0 = Instant::now();
-        let key = byok_cache_key(query, intent);
+        let key = byok_cache_key(query, intent, lang);
         let cache = self
             .cache
             .lock()
@@ -879,16 +928,20 @@ impl Searcher {
         if at.elapsed() >= cache_ttl(intent, query) {
             return None;
         }
-        // The provider name is the engine label the BYOK path stored.
-        let provider = report.first().map(|r| r.engine.clone());
-        let mut results: Vec<Merged> = cached
+        // The provider name is the last answering engine label in the stored report.
+        let provider = report
             .iter()
-            .take(max_results.clamp(1, 12))
-            .cloned()
-            .collect();
+            .rev()
+            .find(|r| matches!(r.status.as_str(), "ok" | "degraded"))
+            .or_else(|| report.first())
+            .map(|r| r.engine.clone());
+        // Apply operator filters BEFORE truncating to `max_results` so valid
+        // matches in slots `max_results..12` are never dropped prematurely.
+        let mut results: Vec<Merged> = cached.clone();
         site_filter(query, &mut results);
         query::intitle_filter(query, &mut results);
         query::filetype_filter(query, &mut results);
+        results.truncate(max_results.clamp(1, 12));
         Some(SearchOutcome {
             results,
             intent,
@@ -907,67 +960,103 @@ impl Searcher {
         })
     }
 
-    /// Issue #195: persist a fresh BYOK outcome under the BYOK key
-    /// namespace, TTL'd like the local cache. Skips an empty result
-    /// set (the provider path errors on empty, so this is defensive).
-    /// The single-flight key for a BYOK query: the byok cache key,
-    /// deliberately NOT carrying max_results (the leader publishes
-    /// the provider's full top-12, so a max=2 caller and a max=10
-    /// caller share one provider round-trip).
-    pub fn byok_flight_key(&self, query: &str, intent: Intent) -> String {
-        byok_cache_key(query, intent)
+    /// The single-flight key for a BYOK query, keyed by query + intent + lang.
+    pub fn byok_flight_key_with_lang(
+        &self,
+        query: &str,
+        intent: Intent,
+        lang: Option<&Lang>,
+    ) -> String {
+        byok_cache_key(query, intent, lang)
     }
 
     /// BYOK single-flight: a concurrent identical query JOINS the
     /// leader's provider round-trip instead of double-billing the
-    /// metered provider. Followers poll the byok cache (the leader
-    /// publishes there before filtering); a leader that dies or
-    /// stalls past 12s computes itself, exactly like the local
-    /// fan-out flight above.
+    /// metered provider. Uses a `LocalFlight` slot with pointer-checked
+    /// drop guard so a follower never steals or removes the leader's slot.
     pub async fn byok_flight(
         &self,
         key: String,
         query: &str,
         intent: Intent,
         max: usize,
+        lang: Option<&Lang>,
         compute: impl std::future::Future<Output = Result<SearchOutcome, String>>,
     ) -> Result<SearchOutcome, String> {
-        let leader = {
-            let mut m = self
-                .byok_inflight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            m.insert(key.clone())
-        };
-        if !leader {
-            for _ in 0..120 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Some(hit) = self.byok_cache_get(query, intent, max) {
-                    return Ok(hit);
-                }
-                let still_running = self
+        let started = Instant::now();
+        let wait_cap = Duration::from_secs(35).max(single_flight_wait());
+        let flight = loop {
+            let (leader, flight) = {
+                let mut map = self
                     .byok_inflight
                     .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match map.entry(key.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let flight = std::sync::Arc::new(LocalFlight::default());
+                        entry.insert(std::sync::Arc::clone(&flight));
+                        (true, flight)
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        (false, std::sync::Arc::clone(entry.get()))
+                    }
+                }
+            };
+            if leader {
+                break flight;
+            }
+            loop {
+                if let Some(hit) = self.byok_cache_get_with_lang(query, intent, max, lang) {
+                    return Ok(hit);
+                }
+                if let Some(mut answer) = flight
+                    .answer
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains(&key);
-                if !still_running {
+                    .clone()
+                {
+                    site_filter(query, &mut answer.results);
+                    query::intitle_filter(query, &mut answer.results);
+                    query::filetype_filter(query, &mut answer.results);
+                    answer.results.truncate(max.clamp(1, 12));
+                    answer.cached = true;
+                    answer.elapsed = started.elapsed();
+                    return Ok(answer);
+                }
+                if flight.done.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                if started.elapsed() >= wait_cap {
+                    return Err("byok single-flight timed out waiting for leader".into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            // Leader failed or stalled: compute ourselves.
-        }
-        let _guard = InflightGuard {
+        };
+        let _guard = LocalFlightGuard {
             map: &self.byok_inflight,
             key,
+            flight: std::sync::Arc::clone(&flight),
         };
-        compute.await
+        let res = compute.await;
+        if let Ok(out) = &res {
+            *flight
+                .answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out.clone());
+        }
+        res
     }
 
+    #[cfg(test)]
     pub fn byok_cache_put(&self, query: &str, out: &SearchOutcome) {
+        self.byok_cache_put_with_lang(query, out, None);
+    }
+
+    pub fn byok_cache_put_with_lang(&self, query: &str, out: &SearchOutcome, lang: Option<&Lang>) {
         if out.results.is_empty() {
             return;
         }
-        let key = byok_cache_key(query, out.intent);
+        let key = byok_cache_key(query, out.intent, lang);
         let mut cache = self
             .cache
             .lock()
@@ -1328,7 +1417,7 @@ impl Searcher {
                 if flight.done.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
-                if started.elapsed() >= Duration::from_secs(12) {
+                if started.elapsed() >= single_flight_wait() {
                     self.last_requests
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                     return Err(FetchError::Timeout);
@@ -1472,7 +1561,7 @@ impl Searcher {
                 if flight.done.load(std::sync::atomic::Ordering::Acquire) {
                     break; // Failed/cancelled leader: elect one replacement.
                 }
-                if started.elapsed() >= Duration::from_secs(12) {
+                if started.elapsed() >= single_flight_wait() {
                     return Err(FetchError::Timeout);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1521,11 +1610,11 @@ impl Searcher {
         // No script is turned into a language or a market here.
         let explicit_lang = lang.is_some();
         let lang = lang::effective(query, lang);
+        let effective_lang_tag = lang.as_ref().map(|lang| lang.tag()).unwrap_or_default();
         let cache_key = format!(
-            "{}|{}|lang={}",
+            "{}|{}|lang={effective_lang_tag}",
             norm_query(query),
             intent.code(),
-            lang.as_ref().map(|lang| lang.tag()).unwrap_or_default()
         );
 
         if let Some((at, cached, _total, reports, quality)) = self
@@ -1536,10 +1625,11 @@ impl Searcher {
             && at.elapsed() < cache_ttl(intent, query)
             && quality.confidence == quality::Confidence::High
         {
-            let mut results = cached.iter().take(max_results).cloned().collect();
+            let mut results = cached.clone();
             site_filter(query, &mut results);
             query::intitle_filter(query, &mut results);
             query::filetype_filter(query, &mut results);
+            results.truncate(max_results);
             return Ok(SearchOutcome {
                 results,
                 intent,
@@ -1776,7 +1866,7 @@ impl Searcher {
                 .lane_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&name, &q, intent);
+                .contains(&name, &q, intent, &effective_lang_tag);
             let pace = if cached {
                 Some(Duration::ZERO)
             } else {
@@ -1804,6 +1894,7 @@ impl Searcher {
                     name.clone(),
                     q.clone(),
                     intent,
+                    effective_lang_tag.clone(),
                     paced(
                         pace,
                         Box::pin(tasks::engine_task_with_budget(
@@ -1837,7 +1928,7 @@ impl Searcher {
                 .lane_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(v, query, intent)
+                .contains(v, query, intent, &effective_lang_tag)
             {
                 Some(Duration::ZERO)
             } else {
@@ -1853,6 +1944,7 @@ impl Searcher {
                     v.to_string(),
                     query.to_string(),
                     intent,
+                    effective_lang_tag.clone(),
                     paced(
                         pace,
                         Box::pin(vertical_task(
@@ -2821,22 +2913,6 @@ impl Drop for LocalFlightGuard<'_> {
         self.flight
             .done
             .store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// Removes the inflight key when the leader finishes
-/// (success or failure) so the set never grows unbounded.
-struct InflightGuard<'a> {
-    map: &'a Mutex<std::collections::HashSet<String>>,
-    key: String,
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key);
     }
 }
 

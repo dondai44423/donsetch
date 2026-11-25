@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use scraper::{Html, Selector};
@@ -17,6 +18,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Lang;
+
+static BING_CARD_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.iuscp").expect("static selector"));
+static BING_LINK_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a.iusc").expect("static selector"));
+static BING_DIM_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".img_info .nowrap, span.nowrap").expect("static selector"));
+
+/// Route-cached HTTP clients for image search and thumbnails so TLS root
+/// loading and connection pools are reused across calls.
+static IMAGE_HTTP: LazyLock<Mutex<HashMap<String, reqwest::Client>>> =
+    LazyLock::new(Default::default);
+
+/// Maximum decoded image allocation per thumbnail (defends against PNG/WebP
+/// decompression bombs across concurrent contact-sheet tiles).
+const MAX_DECODE_DIM: u32 = 8_192;
+const MAX_DECODE_ALLOC_BYTES: u64 = 32 * 1024 * 1024;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
 const MAX_API_BYTES: usize = 2 * 1024 * 1024;
@@ -131,7 +149,7 @@ fn report(id: &str, items: usize, status: impl Into<String>) -> ImageSourceRepor
 }
 
 /// Parse pixel dimensions like `1600×1067`, `1600 x 1067`, or `1600X1067`.
-fn parse_dims_text(raw: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_dims_text(raw: &str) -> Option<(u32, u32)> {
     let trimmed = raw.trim();
     let sep = trimmed.find(['\u{00d7}', 'x', 'X'])?;
     let sep_len = trimmed[sep..].chars().next()?.len_utf8();
@@ -145,15 +163,9 @@ fn parse_dims_text(raw: &str) -> Option<(u32, u32)> {
 /// present.
 pub fn parse_bing_images_html(body: &str, max: usize) -> Vec<ImageHit> {
     let doc = Html::parse_document(body);
-    let Ok(card_sel) = Selector::parse("div.iuscp") else {
-        return Vec::new();
-    };
-    let Ok(link_sel) = Selector::parse("a.iusc") else {
-        return Vec::new();
-    };
-    let Ok(dim_sel) = Selector::parse(".img_info .nowrap, span.nowrap") else {
-        return Vec::new();
-    };
+    let card_sel = &*BING_CARD_SEL;
+    let link_sel = &*BING_LINK_SEL;
+    let dim_sel = &*BING_DIM_SEL;
 
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
@@ -207,12 +219,12 @@ pub fn parse_bing_images_html(body: &str, max: usize) -> Vec<ImageHit> {
         hits.len() >= max
     };
 
-    for card in doc.select(&card_sel) {
-        let Some(link) = card.select(&link_sel).next() else {
+    for card in doc.select(card_sel) {
+        let Some(link) = card.select(link_sel).next() else {
             continue;
         };
         let dims = card
-            .select(&dim_sel)
+            .select(dim_sel)
             .find_map(|n| parse_dims_text(&n.text().collect::<String>()));
         if push_link(link, dims) {
             break;
@@ -220,7 +232,7 @@ pub fn parse_bing_images_html(body: &str, max: usize) -> Vec<ImageHit> {
     }
 
     // Fallback for bare `a.iusc` markup without `div.iuscp` wrappers.
-    for el in doc.select(&link_sel) {
+    for el in doc.select(link_sel) {
         if push_link(el, None) {
             break;
         }
@@ -611,39 +623,64 @@ fn remaining_budget(cap: Duration) -> Duration {
 }
 
 fn image_source_timeout() -> Duration {
-    let base = super::fanout_hard_mark().max(Duration::from_secs(8));
-    remaining_budget(base)
+    remaining_budget(super::fanout_hard_mark())
 }
 
-fn build_http_client(
-    timeout: Duration,
+fn cached_http_client(
     proxy: Option<&crate::egress::proxy::Proxy>,
 ) -> Result<reqwest::Client, String> {
+    let route_key = proxy.map(|p| p.id()).unwrap_or_else(|| "direct".into());
+    if let Some(existing) = IMAGE_HTTP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&route_key)
+        .cloned()
+    {
+        return Ok(existing);
+    }
     let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
         .user_agent(USER_AGENT)
         .connect_timeout(super::search_connect_timeout())
-        .timeout(timeout)
         // Redirects are followed manually via `fetch_bounded_safe` so every hop
         // passes DNS/IP SSRF validation (`ensure_url_safe`).
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(4)
         .no_proxy();
-    if let Some(p) = proxy
-        && p.scheme != crate::egress::proxy::ProxyScheme::Socks5
-        && let Ok(rp) = reqwest::Proxy::all(p.wire_url())
-    {
+    if let Some(p) = proxy {
+        // Fail closed on SOCKS5 rather than silently bypassing to the host IP.
+        if p.scheme == crate::egress::proxy::ProxyScheme::Socks5 {
+            return Err(
+                "invalid-config: image search requires an HTTP proxy or a direct route".into(),
+            );
+        }
+        let rp = reqwest::Proxy::all(p.wire_url())
+            .map_err(|_| "invalid-config: unsupported proxy configuration".to_string())?;
         builder = builder.proxy(rp);
     }
-    builder.build().map_err(|e| e.to_string())
+    let built = builder.build().map_err(|e| e.to_string())?;
+    let mut map = IMAGE_HTTP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() >= 16 {
+        map.clear();
+    }
+    map.insert(route_key, built.clone());
+    Ok(built)
 }
 
-fn pick_search_proxy(url: &str) -> Option<crate::egress::proxy::Proxy> {
+/// Returns `(proxy, from_pool)`: pool proxies only apply to search-engine
+/// queries, whereas configured/ambient forward proxies must stay active for
+/// thumbnail fetches too.
+fn pick_search_proxy(url: &str) -> Result<(Option<crate::egress::proxy::Proxy>, bool), String> {
     if let Some(pool) = super::egress::global()
         && let Some(egress) = pool.pick("bing", &[], true)
         && let Some(p) = egress.proxy
+        && p.scheme != crate::egress::proxy::ProxyScheme::Socks5
     {
-        return Some(p);
+        return Ok((Some(p), true));
     }
-    crate::egress::proxy::from_env_for(url).ok().flatten()
+    let env_proxy = crate::egress::proxy::from_env_for(url).map_err(|e| e.to_string())?;
+    Ok((env_proxy, false))
 }
 
 /// Fetch a URL following up to `MAX_REDIRECTS` redirects while enforcing
@@ -1023,6 +1060,21 @@ pub fn build_contact_sheet_png(images: &[(usize, image::DynamicImage)]) -> Resul
     Ok(out.into_inner())
 }
 
+/// Decode untrusted thumbnail bytes under strict pixel/allocation limits so a
+/// tiny compressed PNG/WebP bomb cannot exhaust daemon memory.
+fn decode_bounded_thumbnail(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    (img.width() >= 32 && img.height() >= 32).then_some(img)
+}
+
 async fn fetch_contact_sheet(
     client: &reqwest::Client,
     hits: &[ImageHit],
@@ -1070,9 +1122,10 @@ async fn fetch_contact_sheet(
                 if !(200..300).contains(&status) || bytes.is_empty() {
                     continue;
                 }
-                if let Ok(img) = image::load_from_memory(&bytes)
-                    && img.width() >= 32
-                    && img.height() >= 32
+                // Decode on a blocking worker with tight pixel/RAM limits so
+                // CPU-bound decompression never stalls Tokio async workers.
+                if let Ok(Some(img)) =
+                    tokio::task::spawn_blocking(move || decode_bounded_thumbnail(&bytes)).await
                 {
                     return Some((rank, img));
                 }
@@ -1098,13 +1151,19 @@ async fn fetch_contact_sheet(
             attempted - tiles
         )
     });
-    match build_contact_sheet_png(&decoded) {
-        Ok(png) => (Some(png), tiles, attempted, partial_note),
-        Err(e) => (
+    match tokio::task::spawn_blocking(move || build_contact_sheet_png(&decoded)).await {
+        Ok(Ok(png)) => (Some(png), tiles, attempted, partial_note),
+        Ok(Err(e)) => (
             None,
             0,
             attempted,
             Some(format!("contact_sheet encoding failed: {e}")),
+        ),
+        Err(e) => (
+            None,
+            0,
+            attempted,
+            Some(format!("contact_sheet worker failed: {e}")),
         ),
     }
 }
@@ -1124,6 +1183,19 @@ pub async fn search_images_multi(
     lang: Option<&Lang>,
     contact_sheet: bool,
 ) -> ImageSearchOutcome {
+    search_images_multi_with_searxng(queries, max, lang, contact_sheet, false).await
+}
+
+/// Run an image search across SearXNG (when `prefer_searxng` is true and
+/// `[search] searxng_url` is set, with automatic keyless fallback on empty or
+/// error) or across Bing Images, DuckDuckGo Images, and Wikimedia Commons.
+pub async fn search_images_multi_with_searxng(
+    queries: &[String],
+    max: usize,
+    lang: Option<&Lang>,
+    contact_sheet: bool,
+    prefer_searxng: bool,
+) -> ImageSearchOutcome {
     use futures_util::future::join_all;
 
     let started = Instant::now();
@@ -1131,45 +1203,27 @@ pub async fn search_images_multi(
     let primary_query = queries.first().map(String::as_str).unwrap_or("");
     let timeout = image_source_timeout();
 
-    let proxy = pick_search_proxy("https://www.bing.com/images/async");
-    let search_client = match build_http_client(timeout, proxy.as_ref()) {
-        Ok(c) => c,
-        Err(e) => {
-            return ImageSearchOutcome {
-                query: primary_query.to_string(),
-                results: Vec::new(),
-                sources: vec![report("http", 0, format!("client-error: {e}"))],
-                elapsed: started.elapsed(),
-                sheet_png: None,
-                sheet_tiles: 0,
-                sheet_attempted: 0,
-                sheet_note: None,
-            };
-        }
-    };
-
-    // Query all formulations concurrently across all three keyless sources.
-    let per_query = join_all(queries.iter().map(|q| {
-        let client = search_client.clone();
-        async move {
-            let ((bing_hits, bing_rep), (ddg_hits, ddg_rep), (wiki_hits, wiki_rep)) = tokio::join!(
-                fetch_bing_images(&client, q, max, lang, timeout),
-                fetch_ddg_images(&client, q, max, lang, timeout),
-                fetch_wikimedia_images(&client, q, max, timeout),
-            );
-            (
-                vec![bing_hits, ddg_hits, wiki_hits],
-                vec![bing_rep, ddg_rep, wiki_rep],
-            )
-        }
-    }))
-    .await;
-
     let mut all_lists: Vec<Vec<ImageHit>> = Vec::new();
     let mut merged_reports: Vec<ImageSourceReport> = Vec::new();
-    for (lists, reps) in per_query {
-        all_lists.extend(lists);
-        for rep in reps {
+    let mut searxng_answered = false;
+
+    if prefer_searxng && let Some(base_url) = super::byok::searxng::configured_url() {
+        let sx_timeout = timeout.max(Duration::from_secs(6));
+        let per_query =
+            join_all(
+                queries.iter().map(|q| {
+                    let base = base_url.clone();
+                    async move {
+                        super::byok::searxng::search_images(&base, q, max, lang, sx_timeout).await
+                    }
+                }),
+            )
+            .await;
+        for (hits, rep) in per_query {
+            if !hits.is_empty() {
+                searxng_answered = true;
+                all_lists.push(hits);
+            }
             if let Some(existing) = merged_reports.iter_mut().find(|r| r.id == rep.id) {
                 existing.items += rep.items;
                 if existing.state != "answered" && rep.state == "answered" {
@@ -1182,18 +1236,106 @@ pub async fn search_images_multi(
         }
     }
 
+    let mut thumb_env_proxy: Option<crate::egress::proxy::Proxy> = None;
+    let mut cached_search_client: Option<reqwest::Client> = None;
+    let mut search_used_pool = false;
+
+    if !searxng_answered {
+        let (proxy, from_pool) = match pick_search_proxy("https://www.bing.com/images/async") {
+            Ok(pair) => pair,
+            Err(e) => {
+                return ImageSearchOutcome {
+                    query: primary_query.to_string(),
+                    results: Vec::new(),
+                    sources: vec![report("proxy", 0, format!("invalid-config: {e}"))],
+                    elapsed: started.elapsed(),
+                    sheet_png: None,
+                    sheet_tiles: 0,
+                    sheet_attempted: 0,
+                    sheet_note: None,
+                };
+            }
+        };
+        search_used_pool = from_pool;
+        if !from_pool {
+            thumb_env_proxy = proxy.clone();
+        }
+        let search_client = match cached_http_client(proxy.as_ref()) {
+            Ok(c) => c,
+            Err(e) => {
+                return ImageSearchOutcome {
+                    query: primary_query.to_string(),
+                    results: Vec::new(),
+                    sources: vec![report("http", 0, e)],
+                    elapsed: started.elapsed(),
+                    sheet_png: None,
+                    sheet_tiles: 0,
+                    sheet_attempted: 0,
+                    sheet_note: None,
+                };
+            }
+        };
+        cached_search_client = Some(search_client.clone());
+
+        // Query all formulations concurrently across all three keyless sources.
+        let per_query = join_all(queries.iter().map(|q| {
+            let client = search_client.clone();
+            async move {
+                let ((bing_hits, bing_rep), (ddg_hits, ddg_rep), (wiki_hits, wiki_rep)) = tokio::join!(
+                    fetch_bing_images(&client, q, max, lang, timeout),
+                    fetch_ddg_images(&client, q, max, lang, timeout),
+                    fetch_wikimedia_images(&client, q, max, timeout),
+                );
+                (
+                    vec![bing_hits, ddg_hits, wiki_hits],
+                    vec![bing_rep, ddg_rep, wiki_rep],
+                )
+            }
+        }))
+        .await;
+
+        for (lists, reps) in per_query {
+            all_lists.extend(lists);
+            for rep in reps {
+                if let Some(existing) = merged_reports.iter_mut().find(|r| r.id == rep.id) {
+                    existing.items += rep.items;
+                    if existing.state != "answered" && rep.state == "answered" {
+                        existing.status = rep.status;
+                        existing.state = rep.state;
+                    }
+                } else {
+                    merged_reports.push(rep);
+                }
+            }
+        }
+    }
+
     let results = merge_and_rank_image_hits(primary_query, all_lists, max);
 
-    // Thumbnails ride direct egress by default (matching DonSeTch's fetch
-    // egress policy) with a fresh direct client if search rode a proxy.
+    // Thumbnails ride direct egress unless an explicit/ambient forward proxy is
+    // configured for the thumbnail host (never strip a mandatory corporate proxy).
     let (sheet_png, sheet_tiles, sheet_attempted, sheet_note) =
         if contact_sheet && !results.is_empty() {
-            let thumb_client = if proxy.is_some() {
-                build_http_client(THUMB_TIMEOUT, None).unwrap_or_else(|_| search_client.clone())
+            let thumb_client = if !search_used_pool && let Some(c) = cached_search_client {
+                Ok(c)
             } else {
-                search_client.clone()
+                let first_url = results[0]
+                    .thumb_url
+                    .as_deref()
+                    .unwrap_or(&results[0].image_url);
+                let env_p = thumb_env_proxy
+                    .or_else(|| crate::egress::proxy::from_env_for(first_url).ok().flatten());
+                cached_http_client(env_p.as_ref())
             };
-            fetch_contact_sheet(&thumb_client, &results).await
+            match thumb_client {
+                Ok(c) => fetch_contact_sheet(&c, &results).await,
+                Err(e) => (
+                    None,
+                    0,
+                    results.len().min(9),
+                    Some(format!("contact_sheet client error: {e}")),
+                ),
+            }
         } else {
             (None, 0, 0, None)
         };

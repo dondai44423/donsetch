@@ -55,7 +55,7 @@ pub async fn search(
     let status = resp.status().as_u16();
     // A body-read failure is a transport error, not an empty body
     // (#286): keep what reqwest saw instead of mapping it to "".
-    let text = resp.text().await.map_err(KeyError::from_transport)?;
+    let text = super::read_bounded_text(resp).await?;
 
     if status == 401 || status == 403 {
         return Err(KeyError::InvalidKey);
@@ -121,6 +121,12 @@ pub async fn search(
                                 .join(" ")
                         })
                         .unwrap_or_default();
+                    let published = r
+                        .get("publish_date")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && s.len() <= 32)
+                        .map(str::to_string);
                     // Score by position: 1st result = 1.0, decay.
                     let score = 1.0 / (arr.iter().position(|x| x == r).unwrap_or(0) as f32 + 1.0);
                     Some(SearchHit {
@@ -128,6 +134,7 @@ pub async fn search(
                         url,
                         snippet,
                         score,
+                        published,
                     })
                 })
                 .collect()

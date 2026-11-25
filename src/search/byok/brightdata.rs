@@ -263,6 +263,7 @@ fn parse_results(
                 url,
                 snippet,
                 score,
+                published: None,
             })
         })
         .take(max)

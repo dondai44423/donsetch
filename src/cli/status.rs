@@ -93,39 +93,71 @@ pub async fn run(args: &[String]) {
         _ => format!("{} (offline)", cli::green(current)),
     };
 
-    // ── Search (BYOK keys) ───────────────────────────────────
+    // ── Search (BYOK keys, plugins & SearXNG) ────────────────
 
     let cfg = ByokConfig::load();
-    let n_keys: usize = cfg.providers.iter().map(|p| p.keys.len()).sum();
-    let (search_mode, search_default, search_human) = if cfg.is_configured() {
-        let (mode, default, rendered) = if cfg.is_local_default() {
+    let plugins = crate::search::byok::plugin::PluginConfig::load();
+    let searxng_url = crate::search::byok::searxng::configured_url();
+    let searxng_masked = searxng_url
+        .as_deref()
+        .map(crate::config::mask_url_credentials);
+    let search_providers = cfg
+        .providers
+        .iter()
+        .filter(|p| !p.keys.is_empty() && !crate::search::byok::store::is_fetch_side(&p.name))
+        .count();
+    let n_keys: usize = cfg
+        .providers
+        .iter()
+        .filter(|p| !crate::search::byok::store::is_fetch_side(&p.name))
+        .map(|p| p.keys.len())
+        .sum();
+    let n_plugins = plugins.plugins.len();
+    let total_search_backends = search_providers + n_plugins + usize::from(searxng_url.is_some());
+    let (search_mode, search_default, search_human) = if total_search_backends > 0 {
+        let active_default = if cfg.is_local_default() {
+            None
+        } else if !cfg.default.is_empty() {
+            Some(cfg.default.clone())
+        } else if searxng_url.is_some() && search_providers == 0 && n_plugins == 0 {
+            Some("searxng".to_string())
+        } else {
+            None
+        };
+        let (mode, rendered) = if cfg.is_local_default() {
             (
                 "local",
-                None,
-                format!("{} (local-first, BYOK fallback)", cli::green("local")),
+                format!("{} (local-first, configured fallback)", cli::green("local")),
             )
-        } else if !cfg.default.is_empty() {
+        } else if let Some(ref def) = active_default {
             (
-                "byok_first",
-                Some(cfg.default.clone()),
-                format!("{} (BYOK-first, local fallback)", cli::green(&cfg.default)),
+                if def == "searxng" && search_providers == 0 && n_plugins == 0 {
+                    "searxng"
+                } else {
+                    "byok_first"
+                },
+                format!("{} (primary, local fallback)", cli::green(def)),
             )
         } else {
             (
                 "byok_first",
-                None,
                 format!("{} (BYOK-first, local fallback)", cli::green("auto")),
             )
         };
+        let mut parts = Vec::new();
+        if search_providers > 0 {
+            parts.push(format!("{search_providers} provider(s), {n_keys} key(s)"));
+        }
+        if n_plugins > 0 {
+            parts.push(format!("{n_plugins} plugin(s)"));
+        }
+        if let Some(ref masked) = searxng_masked {
+            parts.push(format!("searxng ({masked})"));
+        }
         (
             mode,
-            default,
-            format!(
-                "{} provider(s), {} key(s), default: {}",
-                cfg.providers.len(),
-                n_keys,
-                rendered
-            ),
+            active_default,
+            format!("{}, default: {}", parts.join(" · "), rendered),
         )
     } else {
         (
@@ -171,32 +203,43 @@ pub async fn run(args: &[String]) {
 
     // Resolution may probe a browser; keep that blocking operation off the
     // async executor. Status never triggers a public binary download.
-    let browser = tokio::task::spawn_blocking(crate::browser::resolve_browser_without_download)
-        .await
-        .unwrap_or_else(|e| Err(format!("browser resolution task failed: {e}")));
-    let browser_human = match &browser {
-        Ok(info) => info.describe(),
-        Err(error) => format!("unavailable: {error}"),
-    };
-    let browser_json = match &browser {
-        Ok(info) => json!({
-            "available": true,
-            "source": info.source,
-            "path": info.path.display().to_string(),
-            "version": info.version,
-        }),
-        Err(error) => json!({ "available": false, "detail": error.to_string() }),
-    };
-
-    let ghost_state = cache.join("ghost-state.json");
-    let has_state = ghost_state.exists();
-    let domains = if has_state {
-        crate::state::GhostState::load().profiles.len()
+    let remote_cdp =
+        crate::browser::configured_cdp_url().map(|u| crate::config::mask_url_credentials(&u));
+    let (browser_ready, browser_human, browser_json) = if let Some(ref cdp) = remote_cdp {
+        (
+            true,
+            format!("external CDP ({cdp})"),
+            json!({
+                "available": true,
+                "source": "cdp_url",
+                "cdp_url": cdp,
+            }),
+        )
     } else {
-        0
+        let browser = tokio::task::spawn_blocking(crate::browser::resolve_browser_without_download)
+            .await
+            .unwrap_or_else(|e| Err(format!("browser resolution task failed: {e}")));
+        let ready = browser.is_ok();
+        let human = match &browser {
+            Ok(info) => info.describe(),
+            Err(error) => format!("unavailable: {error}"),
+        };
+        let json = match &browser {
+            Ok(info) => json!({
+                "available": true,
+                "source": info.source,
+                "path": info.path.display().to_string(),
+                "version": info.version,
+            }),
+            Err(error) => json!({ "available": false, "detail": error.to_string() }),
+        };
+        (ready, human, json)
     };
 
-    let (health_state, health_human) = if browser.is_ok() && domains > 0 {
+    let state = crate::state::GhostState::load();
+    let domains = state.profiles.len();
+
+    let (health_state, health_human) = if browser_ready && domains > 0 {
         (
             "good",
             format!(
@@ -205,7 +248,7 @@ pub async fn run(args: &[String]) {
                 domains
             ),
         )
-    } else if browser.is_ok() {
+    } else if browser_ready {
         (
             "good",
             format!("{} browser ready, no profiles yet", cli::green("good")),
@@ -226,7 +269,6 @@ pub async fn run(args: &[String]) {
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::Off;
     let route_read_only =
         crate::config::cfg().state.route_memory == crate::config::RouteMemory::ReadOnly;
-    let state = crate::state::GhostState::load();
     let (hosts, walled, warm, cooldowns, flaky) = state.route_stats();
     let route_line = if route_memory_off {
         "off (state.route_memory = off)".to_string()
@@ -293,8 +335,10 @@ pub async fn run(args: &[String]) {
                 "update_state": update_state,
                 "search": {
                     "mode": search_mode,
-                    "providers": cfg.providers.len(),
+                    "providers": search_providers,
                     "keys": n_keys,
+                    "plugins": n_plugins,
+                    "searxng_url": searxng_masked,
                     "default": search_default,
                 },
                 "proxies": { "count": proxies.len(), "skipped_lines": skipped_proxy_lines },

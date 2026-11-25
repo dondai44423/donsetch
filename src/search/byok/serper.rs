@@ -51,7 +51,7 @@ pub async fn search(
     let status = resp.status().as_u16();
     // A body-read failure is a transport error, not an empty body
     // (#286): keep what reqwest saw instead of mapping it to "".
-    let text = resp.text().await.map_err(KeyError::from_transport)?;
+    let text = super::read_bounded_text(resp).await?;
 
     if status == 401 || status == 403 {
         return Err(KeyError::InvalidKey);
@@ -120,6 +120,7 @@ pub async fn search(
                         url,
                         snippet,
                         score,
+                        published: None,
                     })
                 })
                 .collect()

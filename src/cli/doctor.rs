@@ -132,6 +132,7 @@ fn render_checks(checks: &[(String, String, String, String)]) {
                 "Captive portal",
                 "Bright Data SERP",
                 "Bypass unlocker",
+                "SearXNG",
                 "Search plugins",
                 "Search health",
             ],
@@ -458,6 +459,9 @@ pub async fn run(args: &[String]) {
     // adds a free account-zone check (no target request).
     report!("Bright Data SERP", check_brightdata(deep));
     report!("Bypass unlocker", check_bypass(deep));
+
+    // 15.4 Direct SearXNG / SearXNG-compatible (Degoog) search endpoint (#476).
+    report!("SearXNG", check_searxng(deep).await);
 
     // 15.5 BYOK plugins (user-registered executable adapters).
     report!("Search plugins", check_plugins());
@@ -1036,7 +1040,8 @@ async fn check_tls(fetcher: &Fetcher) -> CheckResult {
 
 async fn check_chrome() -> CheckResult {
     if let Some(cdp_url) = crate::browser::configured_cdp_url() {
-        return CheckResult::Pass(format!("external CDP configured ({cdp_url})"));
+        let masked = crate::config::mask_url_credentials(&cdp_url);
+        return CheckResult::Pass(format!("external CDP configured ({masked})"));
     }
     let result = tokio::task::spawn_blocking(crate::browser::resolve_browser).await;
     match result {
@@ -1529,6 +1534,33 @@ fn check_state_store() -> CheckResult {
     let state = crate::state::GhostState::load();
     let domains = state.profiles.len();
     CheckResult::Pass(format!("{domains} domains known"))
+}
+
+/// Direct SearXNG / Degoog HTTP search config (#476). Default mode reports
+/// configuration without hitting the network; `--deep` probes `?format=json`.
+async fn check_searxng(deep: bool) -> CheckResult {
+    let Some(url) = crate::search::byok::searxng::configured_url() else {
+        return CheckResult::Pass(
+            "not configured (optional: set `[search] searxng_url` or `DONSETCH_SEARCH__SEARXNG_URL`)"
+                .to_string(),
+        );
+    };
+    let masked = crate::config::mask_url_credentials(&url);
+    if !deep {
+        return CheckResult::Pass(format!(
+            "configured ({masked}); run `doctor --deep` to probe"
+        ));
+    }
+    match crate::search::byok::searxng::probe(&url).await {
+        Ok(n) if n > 0 => CheckResult::Pass(format!("reachable at {masked} ({n} result(s))")),
+        Ok(_) => CheckResult::Warn(format!(
+            "reachable at {masked}, but probe query returned 0 results (check upstream engines in SearXNG)"
+        )),
+        Err(err) => CheckResult::Fail(
+            format!("{masked}: {err}"),
+            "Verify search.searxng_url is reachable from DonSeTch and has `json` enabled under `search.formats` in SearXNG settings.yml (or SearXNG-compatible API enabled in Degoog).".into(),
+        ),
+    }
 }
 
 /// BYOK plugins: registration state only. Never probes the

@@ -155,6 +155,11 @@ section!(SearchSection {
     /// Include Exa's keyless public MCP search endpoint for searches without
     /// a language override. Set false to disable.
     exa_mcp: bool = true,
+    /// Base URL of a self-hosted SearXNG or SearXNG-compatible (e.g. Degoog)
+    /// instance (`http(s)://host:port`, optional subpath or default query
+    /// params). Queries `/search?format=json` directly without spawning a
+    /// plugin executable (#476).
+    searxng_url: String = String::new(),
     /// Legacy mobile-protocol probe setting; default search uses native CSE.
     google_profile: String = String::new(),
     /// Deprecated no-op, kept so a config file that carries it still loads:
@@ -1772,6 +1777,13 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
+            "searxng_url",
+            FieldKind::Str,
+            "(unset)",
+            "SearXNG or SearXNG-compatible (Degoog) base URL (http(s)://host:port) for direct HTTP JSON search without a plugin executable",
+        ),
+        (
+            "search",
             "brightdata_zone",
             FieldKind::Str,
             "(unset)",
@@ -2250,6 +2262,21 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     if !(1_000..=120_000).contains(&c.search.timeout_ms) {
         return err("search.timeout_ms must be 1000..=120000".into());
     }
+    let searxng = c.search.searxng_url.trim();
+    if !searxng.is_empty() {
+        let parsed = url::Url::parse(searxng).map_err(|_| {
+            ConfigError::Validate(format!(
+                "search.searxng_url must be a valid http(s):// URL (got {:?})",
+                mask_url_credentials(searxng)
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
+            return err(format!(
+                "search.searxng_url must use http:// or https:// with a host (got {:?})",
+                mask_url_credentials(searxng)
+            ));
+        }
+    }
     if c.browser.probe_scan_secs == 0 || c.browser.probe_scan_secs > 3600 {
         return err("browser.probe_scan_secs must be 1..=3600".into());
     }
@@ -2352,13 +2379,61 @@ pub fn origins(
 }
 
 /// Knobs whose values can carry credentials. Proxy URLs embed
-/// user:password; `config show` masks the secret part so terminal
-/// scrollback and pasted bug reports never leak it.
+/// user:password and remote service URLs (`searxng_url`, `cdp_url`) can
+/// carry Basic Auth or query tokens; `config show` masks the secret part
+/// so terminal scrollback and pasted bug reports never leak it.
 fn is_secret(section: &str, key: &str) -> bool {
     matches!(
         (section, key),
-        ("transport", "token") | ("proxy", "http" | "https" | "all" | "pool")
+        ("transport", "token")
+            | ("proxy", "http" | "https" | "all" | "pool")
+            | ("search", "searxng_url")
+            | ("browser", "cdp_url")
     )
+}
+
+/// Mask embedded userinfo (`scheme://user:pass@host` -> `scheme://***@host`)
+/// and sensitive query parameters (`token`, `api_key`, `key`, `password`,
+/// `secret`, `auth`) in a URL before displaying it in `config show`, `doctor`,
+/// `status`, or error messages.
+pub(crate) fn mask_url_credentials(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let masked = mask_url_secret(trimmed);
+    let Ok(mut parsed) = url::Url::parse(&masked) else {
+        return masked;
+    };
+    if parsed.query().is_none() {
+        return masked;
+    }
+    let mut changed = false;
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| {
+            let kl = k.to_ascii_lowercase();
+            if matches!(
+                kl.as_str(),
+                "token" | "api_key" | "apikey" | "key" | "password" | "passwd" | "secret" | "auth"
+            ) && !v.is_empty()
+            {
+                changed = true;
+                (k.into_owned(), "***".to_string())
+            } else {
+                (k.into_owned(), v.into_owned())
+            }
+        })
+        .collect();
+    if !changed {
+        return masked;
+    }
+    let q = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    parsed.set_query(Some(&q));
+    // Re-apply mask_url_secret in case Url re-encoded `***` in userinfo.
+    mask_url_secret(parsed.as_str())
 }
 
 /// Mask the userinfo of a URL credential: scheme://user:pass@host
@@ -2418,6 +2493,12 @@ fn masked_value(c: &DonsetchConfig, section: &str, key: &str, shown: String) -> 
             .collect::<Vec<_>>()
             .join(", ");
         return format!("[{masked}]");
+    }
+    if section == "search" && key == "searxng_url" {
+        return format!("\"{}\"", mask_url_credentials(&c.search.searxng_url));
+    }
+    if section == "browser" && key == "cdp_url" {
+        return format!("\"{}\"", mask_url_credentials(&c.browser.cdp_url));
     }
     let raw = match key {
         "http" => c.proxy.http.as_str(),

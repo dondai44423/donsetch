@@ -107,23 +107,10 @@ pub(crate) fn load_cache_disk() -> CacheMap {
     };
     let now_wall = now_unix();
     for (key, written, results, total, reports, quality) in entries {
-        // TTL is intent + recency keyed (the query text
-        // is the key's first segment). Keys carry a stable u8
-        // intent code; pre-code entries carry the Debug string and
-        // remap by name for one TTL generation.
-        let (qpart, ipart) = key.rsplit_once('|').unwrap_or((key.as_str(), ""));
-        let intent = if let Ok(code) = ipart.parse::<u8>() {
-            Intent::from_code(code)
-        } else {
-            match ipart {
-                "News" => Intent::News,
-                "Code" => Intent::Code,
-                "Paper" => Intent::Paper,
-                "Entity" => Intent::Entity,
-                "Image" => Intent::Image,
-                _ => Intent::Web,
-            }
-        };
+        // TTL is intent + recency keyed. Handles both modern keys
+        // (`{query}|{intent}|lang={tag}` / `byok|{query}|{intent}|lang={tag}`)
+        // and legacy two-part keys (`{query}|{intent}` / `byok|{query}|{intent}`).
+        let (qpart, intent) = super::parse_cache_key(&key);
         if !key.starts_with("byok|") && quality.confidence != super::quality::Confidence::High {
             continue;
         }

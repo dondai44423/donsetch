@@ -544,6 +544,30 @@ fn cmd_list() {
     render_list(&cfg);
 
     let pc = PluginConfig::load();
+    if let Some(sx_url) = crate::search::byok::searxng::configured_url() {
+        let masked = crate::config::mask_url_credentials(&sx_url);
+        let is_default = cfg.default == "searxng"
+            || (cfg.default.is_empty() && !cfg.has_search_providers() && !pc.is_configured());
+        println!("  {} {}", dim(""), bold("Direct HTTP Search (SearXNG)"));
+        println!();
+        let marker = if is_default {
+            green("\u{25C6}")
+        } else {
+            dim("\u{25C7}")
+        };
+        let label = if is_default {
+            format!("{marker} {} {}", bold("searxng"), dim("(default)"))
+        } else {
+            format!("{marker} searxng")
+        };
+        println!("  {label}");
+        println!(
+            "    {} {}  (search.searxng_url)",
+            green("\u{2713}"),
+            dim(&masked)
+        );
+        println!();
+    }
     if !pc.is_configured() {
         return;
     }
@@ -622,10 +646,13 @@ fn cmd_default(args: &[String]) {
         std::process::exit(1);
     }
 
+    let searxng_configured = crate::search::byok::searxng::configured_url().is_some();
+
     // "local" bypasses the is_configured() check : you can set
     // local as default even with keys configured (to test local
     // search without removing keys), or with no keys (no-op).
     if provider != "local"
+        && !(provider == "searxng" && searxng_configured)
         && !cfg.is_configured()
         && !PROVIDERS.contains(&provider.as_str())
         && !PluginConfig::load().is_registered(&provider)
@@ -637,9 +664,12 @@ fn cmd_default(args: &[String]) {
     if cfg.set_default(&provider) {
         cfg.save();
         if provider == "local" {
-            if cfg.is_configured() {
+            if cfg.has_search_providers()
+                || PluginConfig::load().is_configured()
+                || searxng_configured
+            {
                 println!(
-                    "  {} default set to {} : local search first, BYOK fallback",
+                    "  {} default set to {} : local search first, configured provider fallback",
                     green("\u{2713}"),
                     bold("local")
                 );
@@ -657,6 +687,14 @@ fn cmd_default(args: &[String]) {
                 bold(&provider)
             );
         }
+    } else if provider == "searxng" && searxng_configured {
+        cfg.default = "searxng".to_string();
+        cfg.save();
+        println!(
+            "  {} default search provider set to {} (search.searxng_url)",
+            green("\u{2713}"),
+            bold("searxng")
+        );
     } else if PluginConfig::load().is_registered(&provider) {
         // Plugin default: plugins live in a separate store, so
         // set the shared default field directly.

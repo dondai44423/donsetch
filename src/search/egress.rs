@@ -471,7 +471,7 @@ impl EgressPool {
     pub fn report_ok(&self, engine: &str, egress_id: &str) {
         let engine = health_key(engine);
         self.stress_record(true);
-        {
+        let transitioned = {
             let mut pairs = self
                 .pairs
                 .lock()
@@ -482,11 +482,15 @@ impl EgressPool {
                     health: Health::Suspect,
                     burned_until: None,
                 });
+            let changed = s.health != Health::Healthy || s.burned_until.is_some();
             s.health = Health::Healthy;
             s.burned_until = None;
+            changed
+        };
+        if transitioned {
+            self.mark_dirty();
+            self.save_health_disk_if_dirty();
         }
-        self.mark_dirty();
-        self.save_health_disk_if_dirty();
     }
 
     /// Engine rejected us (429 / challenge / empty parse):

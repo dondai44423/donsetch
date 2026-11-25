@@ -608,6 +608,7 @@ fn parse_envelope(
             url,
             snippet,
             score,
+            published: None,
         });
     }
     if results.len() > MAX_RESULTS && crate::config::cfg().debug.search {
