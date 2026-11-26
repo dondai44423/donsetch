@@ -71,6 +71,8 @@ mcp_servers:
 
 Choose `must_contain` for phrase checks, `focus` for relevant passages, or `toc` then `section` for one part of a long page. These views work on PDFs too. Login gates, bot walls, and incomplete sources remain explicit outcomes.
 
+> **What to expect from keyless local search:** Public search engines rate-limit aggressively, so individual engines will periodically go into cooldown or fail after use and need time to recover. Don't expect every engine to stay healthy all the time—DonSeTch routes around cooled-down engines and still produces usable results most of the time, enough for nearly all everyday work. Heavy, sustained research sessions can put every local engine into cooldown at once; for that workload, add a [search provider / self-hosted SearXNG](https://github.com/dondai44423/donsetch#optional-keys) or a proxy pool in `donsetch settings`.
+
 **DonSeTch vs. paid Firecrawl Cloud:** in my agent-run field test, DonSeTch came out ahead on fetching and focused crawling—faster reads, better topic selection, and much smaller responses with handles to read more. Firecrawl had better search relevance. I chose cloud after internal self-hosted testing favored DonSeTch; those earlier runs aren't published. [Full results, specific issues, environment and settings](https://github.com/dondai44423/donsetch/blob/master/docs/firecrawl-comparison.md).
 
 ## Use the terminal

@@ -127,6 +127,9 @@ The CLI and MCP tools use the same engine. No account setup sits between install
 
 Your agent chooses what to read next. DonSeTch supplies the tools.
 
+> [!NOTE]
+> **What to expect from keyless local search:** Public search engines rate-limit aggressively, so some engines will go into cooldown or fail temporarily after use and need time to recover. Don't expect every engine to work without issues on every run—that's normal. Because DonSeTch spreads queries across multiple engines and routes around cooled-down ones, local search still produces usable results most of the time, which is enough for nearly all day-to-day work. If you run heavy, continuous research sessions, every local engine can end up rate-limited or in cooldown at once; for that workload, configure an [optional search provider / self-hosted SearXNG](#optional-keys) or a [proxy pool](#proxies-without-the-guesswork) (both available in `donsetch settings`).
+
 ### Read less. Keep the evidence.
 
 Every view works over the extracted source, including PDFs and site adapters. You choose what comes back:
@@ -256,7 +259,7 @@ Unlocker runs after a local wall, only with a configured key. Attempts can cost 
 | A human challenge remains | A named wall. No local hCaptcha, reCAPTCHA, Turnstile, or press-and-hold solver. An optional Unlocker may help. |
 | Content needs layout or canvas | The fetch stays a declared shell if the program cannot produce readable content. Use a screenshot for pixels. |
 | A read hits its size or time limit | Partial content or a named failure, with continuation information when available. |
-| Search sources refuse the request | Source status and an empty or degraded answer. No invented results. |
+| Local search engines rate-limit or cool down | Remaining healthy engines still cover most everyday queries; heavy research bursts can cool down every local engine at once, requiring an [optional search provider](#optional-keys) or [proxy pool](#proxies-without-the-guesswork). No invented results. |
 | You repeatedly harvest a defended site | Pacing helps; IP bans can still happen. This tool is for research, not bulk collection. |
 
 For signed-in browsing or long, human-paced sessions, use a real browser driver such as [Bladebro](https://github.com/dondai44423/bladebro).
