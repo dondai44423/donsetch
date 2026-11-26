@@ -862,6 +862,10 @@ pub fn print_top_help() {
     cli::print_section("Configuration & Upkeep");
     let mgmt: &[(&str, &str)] = &[
         (
+            "settings",
+            "Interactive Control Center TUI & editor (toggles, keys, proxies, rules)",
+        ),
+        (
             "mcp",
             "Start MCP server on stdio (--supervised) or HTTP (--http)",
         ),

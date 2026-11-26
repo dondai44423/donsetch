@@ -153,6 +153,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "screenshot",
     "tools",
     "mcp",
+    "settings",
     "keys",
     "proxy",
     "rules",
@@ -238,7 +239,16 @@ async fn run() {
     // version read no config at all.
     if !matches!(
         cmd,
-        "config" | "help" | "--help" | "-h" | "version" | "-v" | "-V" | "--version"
+        "config"
+            | "settings"
+            | "setting"
+            | "help"
+            | "--help"
+            | "-h"
+            | "version"
+            | "-v"
+            | "-V"
+            | "--version"
     ) {
         load_and_install_config(&args);
     }
@@ -352,6 +362,7 @@ async fn run() {
                 std::process::exit(1);
             }
         }
+        "settings" | "setting" => cli::settings::run(&args).await,
         "keys" => cli::keys::run(&args).await,
         "rules" => cli::rules::run(&args),
 
@@ -398,6 +409,7 @@ async fn route_help(cmd: &str) {
             let _ = cli::tool::run(cmd, &help_args).await;
         }
         "keys" => cli::keys::help(),
+        "settings" | "setting" => cli::settings::help(),
         "adapters" => cli::adapters::help(),
         "rules" => cli::rules::help(),
         "status" => cli::status::help(),

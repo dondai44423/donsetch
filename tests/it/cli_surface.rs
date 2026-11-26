@@ -209,6 +209,7 @@ fn status_browser_warning_names_only_what_uses_the_browser() {
 fn the_two_help_routes_cannot_drift() {
     let sb = Sandbox::new("help-routes");
     for cmd in [
+        "settings",
         "proxy",
         "keys",
         "status",
@@ -376,4 +377,171 @@ fn mcp_response_mode_reports_the_installed_source() {
     assert!(stdout(&cfg).contains("| `text_only` | bool | true |"));
     let legacy = sb.run(&["config", "show", "--legacy"]);
     assert!(!stdout(&legacy).contains("cut at v4"));
+}
+
+#[test]
+fn settings_cli_set_get_reset_preset_list_and_alias_work_end_to_end() {
+    let sb = Sandbox::new("settings-cli");
+
+    // Non-TTY `donsetch settings` and `donsetch setting` print a clean summary.
+    let summary = sb.run(&["settings"]);
+    assert!(summary.status.success(), "{}", stderr(&summary));
+    assert!(
+        stdout(&summary).contains("Settings"),
+        "{}",
+        stdout(&summary)
+    );
+
+    let alias = sb.run(&["setting", "path"]);
+    assert!(alias.status.success(), "{}", stderr(&alias));
+    assert_eq!(
+        stdout(&alias).trim(),
+        sb.root.join("donsetch.toml").display().to_string()
+    );
+
+    // `settings set` / `settings get` / `settings reset` roundtrip on #478 knobs.
+    let set_seq = sb.run(&["settings", "set", "search.sequential", "true"]);
+    assert!(set_seq.status.success(), "{}", stderr(&set_seq));
+    let set_wave = sb.run(&["settings", "set", "search.wave_size", "1"]);
+    assert!(set_wave.status.success(), "{}", stderr(&set_wave));
+
+    let got = sb.run(&["settings", "get", "search.sequential", "--json"]);
+    assert!(got.status.success(), "{}", stderr(&got));
+    let doc: serde_json::Value = serde_json::from_str(stdout(&got).trim()).unwrap();
+    assert_eq!(doc["key"], "search.sequential");
+    assert_eq!(doc["value"], "on");
+    assert!(doc["origin"].as_str().unwrap().starts_with("file:"));
+
+    // Invalid range is refused cleanly.
+    let bad = sb.run(&["settings", "set", "search.wave_size", "99"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(stderr(&bad).contains("out of range"), "{}", stderr(&bad));
+
+    // `settings list --modified --json` returns the modified knobs without ANSI.
+    let list = sb.run(&["settings", "list", "--modified", "--json"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert!(!stdout(&list).contains('\u{1b}'));
+    let ldoc: serde_json::Value = serde_json::from_str(stdout(&list).trim()).unwrap();
+    let keys: Vec<&str> = ldoc["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["key"].as_str())
+        .collect();
+    assert!(keys.contains(&"search.sequential"), "{keys:?}");
+    assert!(keys.contains(&"search.wave_size"), "{keys:?}");
+
+    // `settings preset slow-network` writes sequential + wave_size=1 + timeout_ms=15000.
+    let preset = sb.run(&["settings", "preset", "slow-network", "--json"]);
+    assert!(preset.status.success(), "{}", stderr(&preset));
+    let got_t = sb.run(&["settings", "get", "search.timeout_ms", "--json"]);
+    let tdoc: serde_json::Value = serde_json::from_str(stdout(&got_t).trim()).unwrap();
+    assert_eq!(tdoc["value"], "15000 ms");
+
+    // `settings reset` restores default.
+    let reset = sb.run(&["settings", "reset", "search.sequential"]);
+    assert!(reset.status.success(), "{}", stderr(&reset));
+    let after = sb.run(&["settings", "get", "search.sequential", "--json"]);
+    let adoc: serde_json::Value = serde_json::from_str(stdout(&after).trim()).unwrap();
+    assert_eq!(adoc["value"], "off");
+    assert_eq!(adoc["origin"], "default");
+
+    // Unknown subcommand & unknown flag are refused.
+    let unk_sub = sb.run(&["settings", "frobnicate"]);
+    assert_eq!(unk_sub.status.code(), Some(1));
+    let unk_flag = sb.run(&["settings", "list", "--bogus"]);
+    assert_eq!(unk_flag.status.code(), Some(1));
+}
+
+#[test]
+fn issue_477_search_failure_receipt_reports_byok_census_on_cli() {
+    // Reproduces Cases A, B, C, E from #477 deterministically using a dead
+    // loopback proxy port so no live network traffic is needed.
+    let dead_env: &[(&str, &str)] = &[
+        ("HTTPS_PROXY", "http://127.0.0.1:9"),
+        ("HTTP_PROXY", "http://127.0.0.1:9"),
+        ("ALL_PROXY", "http://127.0.0.1:9"),
+        ("DONSETCH_SEARCH__TIMEOUT_MS", "1000"),
+    ];
+
+    // Case B: BYOK-first configured (`parallel` default, `tavily` key), explicit `--lang fr`.
+    let sb_b = Sandbox::new("i477-case-b");
+    std::fs::write(
+        sb_b.root.join("cache").join("byok-keys.json"),
+        r#"{"default":"parallel","providers":[{"name":"tavily","keys":[{"key":"tvly-dev-dummy0000000000000000000000","state":"active","ts":0}]}]}"#,
+    )
+    .unwrap();
+    let out_b = sb_b.run_with(
+        &["search", "rapport cuir France", "--lang", "fr", "--json"],
+        dead_env,
+    );
+    assert_eq!(out_b.status.code(), Some(2), "{}", stderr(&out_b));
+    let doc_b: serde_json::Value = serde_json::from_str(stdout(&out_b).trim())
+        .unwrap_or_else(|e| panic!("invalid json ({e}): {}", stdout(&out_b)));
+    assert_eq!(doc_b["meta"]["sources"][0]["id"], "byok", "{doc_b}");
+    assert_eq!(
+        doc_b["meta"]["sources"][0]["status"], "skipped: explicit lang",
+        "{doc_b}"
+    );
+    assert_eq!(doc_b["meta"]["sources"][0]["state"], "not asked", "{doc_b}");
+    assert!(
+        !doc_b["meta"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("donsetch keys add"),
+        "Case B must not tell caller to add a key: {doc_b}"
+    );
+    assert!(
+        doc_b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("byok skipped: explicit lang"),
+        "{doc_b}"
+    );
+
+    // Case E: BYOK-first configured, no `--lang` (provider attempted and failed).
+    let sb_e = Sandbox::new("i477-case-e");
+    std::fs::write(
+        sb_e.root.join("cache").join("byok-keys.json"),
+        r#"{"default":"parallel","providers":[{"name":"tavily","keys":[{"key":"tvly-dev-dummy0000000000000000000000","state":"active","ts":0}]}]}"#,
+    )
+    .unwrap();
+    let out_e = sb_e.run_with(&["search", "rapport cuir France", "--json"], dead_env);
+    assert_eq!(out_e.status.code(), Some(2), "{}", stderr(&out_e));
+    let doc_e: serde_json::Value = serde_json::from_str(stdout(&out_e).trim())
+        .unwrap_or_else(|e| panic!("invalid json ({e}): {}", stdout(&out_e)));
+    assert_eq!(doc_e["meta"]["sources"][0]["id"], "byok", "{doc_e}");
+    assert_eq!(doc_e["meta"]["sources"][0]["state"], "failed", "{doc_e}");
+    assert!(
+        doc_e["meta"]["sources"][0]["status"]
+            .as_str()
+            .unwrap()
+            .contains("tavily"),
+        "{doc_e}"
+    );
+    assert_eq!(doc_e["meta"]["escalation"][0]["stage"], "byok", "{doc_e}");
+    assert!(
+        !doc_e["meta"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("donsetch keys add"),
+        "Case E must not tell caller to add a key: {doc_e}"
+    );
+
+    // Case A: no key configured keeps the clean unconfigured envelope.
+    let sb_a = Sandbox::new("i477-case-a");
+    let out_a = sb_a.run_with(
+        &["search", "rapport cuir France", "--lang", "fr", "--json"],
+        dead_env,
+    );
+    assert_eq!(out_a.status.code(), Some(2), "{}", stderr(&out_a));
+    let doc_a: serde_json::Value = serde_json::from_str(stdout(&out_a).trim()).unwrap();
+    assert!(doc_a["meta"].get("sources").is_none(), "{doc_a}");
+    assert!(
+        doc_a["meta"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("donsetch keys add"),
+        "Case A should still recommend adding a key: {doc_a}"
+    );
 }

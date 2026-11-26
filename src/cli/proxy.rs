@@ -752,7 +752,7 @@ async fn cmd_export(args: &[String]) {
 /// Connect through the proxy to api.ipify.org:80 via HTTP/1.0.
 /// No TLS : we're testing the tunnel, not the TLS stack. The
 /// response body is the exit IP address.
-async fn probe_proxy(px: &Proxy) -> ProbeResult {
+pub(crate) async fn probe_proxy(px: &Proxy) -> ProbeResult {
     let t0 = Instant::now();
 
     // Step 1: tunnel through the proxy to the probe endpoint.
