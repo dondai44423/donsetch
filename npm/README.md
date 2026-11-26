@@ -21,11 +21,19 @@ donsetch doctor
 
 The first `donsetch` command downloads a SHA256-verified release binary. There are no install scripts to approve, including with npm, pnpm, or bun. No Rust build tools needed. Linux, macOS, and Windows are supported; [the setup guide](https://github.com/dondai44423/donsetch/blob/master/docs/setup.md) lists platform requirements and OCR availability.
 
-For Pi, run `pi install npm:donsetch`; the extension prepares the binary when the session starts. A read-only global package uses your user cache automatically. Windows releases include the Visual C++ runtime beside the binary; no administrator runtime setup is required.
+| Platform / Agent | Install or connect |
+|---|---|
+| **Pi** *(native extension)* | `pi install npm:donsetch` |
+| **DeepSeek Harness** *(native plugin)* | `dsh plugin --profile web add github:dondai44423/donsetch-dsh` |
+| **Hermes** *(`~/.hermes/config.yaml`)* | Add `donsetch` under `mcp_servers` below (or run `donsetch doctor --mcp`) |
+| **Homebrew** *(macOS / Linux)* | `brew tap dondai44423/donsetch && brew install donsetch` |
+| **Docker** *(GHCR, amd64/arm64)* | `docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest` |
+
+A read-only global package uses your user cache automatically. Windows releases include the Visual C++ runtime beside the binary; no administrator runtime setup is required.
 
 ## Connect your agent
 
-Add this to your MCP client's server configuration, then restart the client:
+Add this to your MCP client's server configuration (Claude Code, Cursor, OpenCode, `.mcp.json`), then restart the client:
 
 ```json
 {
@@ -38,7 +46,17 @@ Add this to your MCP client's server configuration, then restart the client:
 }
 ```
 
-`donsetch doctor --mcp` prints absolute-path registration examples. The stdio supervisor restarts the daemon after a crash. HTTP transport is available with `donsetch mcp --http --port 8765` on supported builds.
+For **Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  donsetch:
+    command: donsetch
+    args: ["mcp", "--supervised"]
+    transport: stdio
+```
+
+`donsetch doctor --mcp` detects installed clients and prints absolute-path registration examples. The stdio supervisor restarts the daemon after a crash. HTTP transport is available with `donsetch mcp --http --port 8765` on supported builds.
 
 ## Four tools
 
@@ -62,6 +80,8 @@ donsetch search "rust async cancellation" --intent code
 donsetch fetch https://docs.python.org/3/library/asyncio-task.html --focus "cancel a task"
 donsetch crawl https://docs.python.org/3/ --mode map --topic asyncio
 donsetch screenshot https://example.com --out page.png
+donsetch settings                                  # Interactive Control Center TUI (keys, proxies, rules, presets)
+donsetch settings preset slow-network              # Sequential search + 15s timeout for slow links
 ```
 
 CLI and MCP share the same engine. All four tool schemas fit in about 2,000 tokens.

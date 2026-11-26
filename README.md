@@ -24,6 +24,7 @@
   <a href="#see-it-in-action">Demo</a> ·
   <a href="#start-here">Install</a> ·
   <a href="#four-tools-one-process">Tools</a> ·
+  <a href="#configuration-and-upkeep">Settings</a> ·
   <a href="#under-the-hood">Design</a> ·
   <a href="#donsetch-vs-firecrawl-cloud">Comparison</a> ·
   <a href="#proxies-without-the-guesswork">Proxies</a> ·
@@ -53,23 +54,19 @@ donsetch doctor
 
 The first `donsetch` command downloads a SHA256-verified release binary. No install scripts to approve and no Rust toolchain needed. Linux, macOS, and Windows are supported.
 
-<details>
-<summary>Homebrew, Pi, DeepSeek Harness, or build from source</summary>
-
-| Install | Command |
+| Platform / Agent | Install or connect |
 |---|---|
-| Homebrew · macOS/Linux | `brew tap dondai44423/donsetch && brew install donsetch` |
-| Docker · GHCR | `docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest` |
-| Pi native extension | `pi install npm:donsetch` |
-| DeepSeek Harness plugin | `dsh plugin --profile web add github:dondai44423/donsetch-dsh` |
+| **Pi** *(native extension)* | `pi install npm:donsetch` |
+| **DeepSeek Harness** *(native plugin)* | `dsh plugin --profile web add github:dondai44423/donsetch-dsh` |
+| **Hermes** *(`~/.hermes/config.yaml`)* | Add `donsetch` under `mcp_servers` below (or run `donsetch doctor --mcp`) |
+| **Homebrew** *(macOS / Linux)* | `brew tap dondai44423/donsetch && brew install donsetch` |
+| **Docker** *(GHCR, amd64/arm64)* | `docker run -i --rm --init ghcr.io/dondai44423/donsetch:latest` |
 
-Pi and dsh register native tools. For source builds, platform requirements, Docker, or installer troubleshooting, see the [setup guide](docs/setup.md).
-
-</details>
+Pi and DeepSeek Harness register native tools directly. For source builds, platform matrix, Docker HTTP mode, or installer troubleshooting, see the [setup guide](docs/setup.md).
 
 ### 2. Connect your agent
 
-Add this to your MCP client's server configuration, then restart the client:
+Add this to your MCP client's server configuration (Claude Code, Cursor, OpenCode, `.mcp.json`), then restart the client:
 
 ```json
 {
@@ -82,7 +79,17 @@ Add this to your MCP client's server configuration, then restart the client:
 }
 ```
 
-Works with Claude Code, Cursor, OpenCode, and other MCP clients. Configuration formats vary; `donsetch doctor --mcp` prints registration examples using the binary's absolute path. `--supervised` restarts the stdio daemon after a crash.
+For **Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  donsetch:
+    command: donsetch
+    args: ["mcp", "--supervised"]
+    transport: stdio
+```
+
+Configuration formats vary; `donsetch doctor --mcp` detects installed clients (including Claude Desktop, OpenCode, and Hermes) and prints ready-to-paste blocks using the binary's absolute path. `--supervised` restarts the stdio daemon after a crash.
 
 Need an HTTP endpoint? Run `donsetch mcp --http --port 8765` and connect to `http://localhost:8765/mcp`. [HTTP setup and authentication →](docs/setup.md#http-transport)
 
@@ -98,6 +105,9 @@ donsetch fetch https://docs.python.org/3/library/asyncio-task.html \
 
 # Map a documentation site.
 donsetch crawl https://docs.python.org/3/ --mode map --topic asyncio
+
+# Configure everything interactively (toggles, sliders, keys, proxies, rules).
+donsetch settings
 ```
 
 The CLI and MCP tools use the same engine. No account setup sits between install and first use.
@@ -255,13 +265,23 @@ Local processing still makes requests to the sites you ask for. Optional provide
 
 ## Configuration and upkeep
 
+### Interactive Settings Control Center
+
+Run **`donsetch settings`** (alias `donsetch setting`) to configure every part of DonSeTch in an interactive terminal UI — no memorizing CLI flags or TOML keys:
+
+- **8 tabbed views** (`1`–`8` / `Tab`) with live cross-tab search (`/`): **Search** (including slow-network sequential mode, wave size, timeouts, keyless sources, SearXNG), **Fetch** (PDF, OCR threads/idle unload, DNS), **Providers** (add/remove/reset BYOK keys, switch default provider, register custom search plugins), **Proxies** (routing toggles, add/remove pool proxies, live latency/exit-IP probe), **Browser** (Chromium, external CDP, Unlocker bypass, TLS), **Server** (MCP/HTTP/auth), **Rules** (add/toggle/delete host rules + live URL tester), and **Presets** (one-click `Slow / High-RTT Network`, `Low-Memory MCP`, `Classic Web Engines Only`, `Balanced Default`).
+- Every write validates against the full config schema before atomically updating `donsetch.toml` (preserving your comments) with `0600` permissions.
+
 ```bash
-donsetch config show                  # Values and where they came from.
-donsetch config show --markdown       # Every supported setting.
-donsetch doctor --deep                # Live network and provider checks.
-donsetch status                       # Version, keys, proxies, and cache.
-donsetch update                       # Update from GitHub Releases.
-donsetch rollback                     # Restore the previous version.
+donsetch settings                            # Open the interactive terminal Settings UI.
+donsetch settings preset slow-network        # One-command slow-link preset (sequential + 15s timeout).
+donsetch settings set search.sequential true # Scriptable update for agents & automation.
+donsetch settings list --modified            # Inspect non-default settings (--json supported).
+donsetch config show                         # Values and where each layer came from.
+donsetch doctor --deep                       # Live network, browser, and provider checks.
+donsetch status                              # Version, keys, proxies, and cache.
+donsetch update                              # Update from GitHub Releases.
+donsetch rollback                            # Restore the previous version.
 ```
 
 Settings live in `donsetch.toml`. Precedence: defaults → legacy environment → config file → `DONSETCH_<SECTION>__<KEY>`. Unknown keys and invalid values fail clearly.

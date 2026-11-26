@@ -1,5 +1,27 @@
 # Changelog
 
+## [5.5.13] - 2026-11-26
+
+### Added
+
+- **Interactive `donsetch settings` Control Center TUI & scriptable CLI (`donsetch settings`, alias `donsetch setting`).** Configure every part of DonSeTch in an animated, cross-platform (Linux, macOS, Windows) Crimson-Noir terminal UI with zero extra runtime dependencies:
+  - 8 category tabs (**Search**, **Fetch**, **Providers**, **Proxies**, **Browser**, **Server**, **Rules**, **Presets**) with tactile toggle pills, fine/coarse numeric sliders, enum selectors, masked secret/URL editors, live cross-tab search (`/`), and a live inspector showing origins, TOML previews, env vars, and equivalent CLI commands.
+  - Full interactive management of BYOK search & Unlocker keys (add with format validation, remove, reset, switch default provider), custom executable search plugins, SOCKS5/HTTP proxy pool (add, remove, clear, and async live exit-IP/latency probing), per-host `[rules.url]` policies (add, toggle enabled, delete, and live offline URL tester), and one-click curated presets (`slow-network`, `balanced`, `low-memory`, `no-third-party-mcp`).
+  - Scriptable subcommands for agents and automation: `donsetch settings list [--section S] [--modified] [--json]`, `get <section.key> [--json]`, `set <section.key> <value>`, `reset <section.key>`, `preset [name] [--json]`, and `path`, all validated against the full config schema before atomic `0600` line-level writes that preserve comments.
+- **Sequential search mode and configurable initial wave size for slow links (#478).** Added `[search] sequential` (`DONSETCH_SEARCH__SEQUENTIAL`, default `false`) and `[search] wave_size` (`DONSETCH_SEARCH__WAVE_SIZE`, `1..=8`, default `3`):
+  - `sequential = true` runs every planned search lane (general engines, verticals, news, image sources, and `query_variants`) strictly one at a time with no early stop until every engine has had its full per-lane timeout turn (while strictly obeying explicit caller `deadline_ms`), and scales `single_flight_wait` and `docs`/`registry` lookup budgets accordingly.
+  - `wave_size` bounds the initial parallel wave strictly (including capping `priority_sources`) and advances cleanly through reserve waves as active lanes finish.
+- **Complete search config exposure & `search --explain --lang`.** Added `search.request_budget`, `search.tie_window`, and `search.enrich` to the typed config fieldbook (`donsetch config show` and `DONSETCH_SEARCH__*` env vars), and added `--lang <TAG>` support to `donsetch search --explain`.
+
+### Fixed
+
+- **Search failure receipts now preserve the BYOK census across every mode (#477).** On total search failure, configured BYOK providers skipped due to an explicit `lang` (in both BYOK-first and local-first modes) or attempted and failed in BYOK-first mode now emit the documented `sources` census record (`{"id": "byok", ...}`), name BYOK in `cause` and chronological `escalation` steps, propagate BYOK sources into batch search errors, and stop advising callers to run `donsetch keys add` when a provider is already configured.
+- **Prevented proxy HTTP client cache collisions and hardened SearXNG redirects & TOML edits.** Keyed in-memory `reqwest::Client` caches in `keenable`, `exa-mcp`, `parallel-mcp`, `searxng`, `byok`, and `images` by `Proxy::connection_key()` instead of `host:port` so distinct schemes or sticky proxy credentials on shared provider ports cannot collide or bypass SOCKS5 checks; scaled BYOK HTTP client connect/request timeouts with `[search] timeout_ms`; blocked cross-port redirects and preserved password-only Basic Auth in `searxng::same_host_redirect`; and hardened line-level TOML editing for multi-line array values and commented/spaced section headers.
+
+### Docs
+
+- Made Pi, DeepSeek Harness, Hermes, Homebrew, and Docker install/setup instructions directly visible at the top of `README.md` (uncollapsed), highlighted `donsetch settings` across `README.md` and `docs/setup.md`, documented slow-network knobs and BYOK failure receipts in `docs/tools.md`, and codified Settings Control Center parity in `AGENTS.md` and `docs/project.md`.
+
 ## [5.5.12] - 2026-11-25
 
 ### Added

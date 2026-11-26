@@ -63,7 +63,17 @@ Restart the client after editing its configuration. The supervised daemon restar
 donsetch doctor --mcp
 ```
 
-This prints absolute-path registration examples. Use an absolute binary path if a desktop client cannot find the command on its own `PATH`.
+This prints absolute-path registration examples (including Claude Desktop, OpenCode, and Hermes `~/.hermes/config.yaml`). Use an absolute binary path if a desktop client cannot find the command on its own `PATH`.
+
+For **Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  donsetch:
+    command: donsetch
+    args: ["mcp", "--supervised"]
+    transport: stdio
+```
 
 Without a global install, an npm launcher entry can use `"command": "npx"` and `"args": ["-y", "donsetch", "mcp", "--supervised"]`.
 
@@ -140,6 +150,8 @@ For example, `DONSETCH_FETCH__PDF_MAX_MB=25` overrides `fetch.pdf_max_mb`. Unkno
 
 | Command | Purpose |
 |---|---|
+| `donsetch settings` | Interactive Control Center TUI for every setting, BYOK keys/plugins, proxy pool, rules, and presets |
+| `donsetch settings set <section.key> <val>` | Validate and persist one setting to `donsetch.toml` (`get`, `reset`, `list`, `preset`, `path` also supported) |
 | `donsetch config show` | Current values and their origin |
 | `donsetch config show --markdown` | Full settings reference |
 | `donsetch config show --legacy` | Old environment names and their replacements |
