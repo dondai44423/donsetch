@@ -12,7 +12,8 @@ use super::ltr::{FEATURES, NAMES};
 use super::rank::{self, Explained};
 use super::{Searcher, doctor};
 
-const USAGE: &str = "usage: donsetch search --explain <query> [--max-results N] [--json]";
+const USAGE: &str =
+    "usage: donsetch search --explain <query> [--lang TAG] [--max-results N] [--json]";
 
 /// True when `search`'s arguments ask for an explanation rather than a search.
 pub fn wants(args: &[String]) -> bool {
@@ -21,12 +22,14 @@ pub fn wants(args: &[String]) -> bool {
 
 struct Args {
     query: String,
+    lang: Option<super::Lang>,
     max: usize,
     json: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut words = Vec::new();
+    let mut lang: Option<super::Lang> = None;
     let mut max = 10;
     let mut json = false;
     let mut i = 0;
@@ -34,11 +37,30 @@ fn parse(args: &[String]) -> Result<Args, String> {
         match args[i].as_str() {
             "--explain" => {}
             "--json" => json = true,
+            "--lang" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| format!("--lang requires a BCP-47 tag\n{USAGE}"))?;
+                lang = Some(super::Lang::parse(raw).map_err(|e| format!("{e}\n{USAGE}"))?);
+            }
+            flag if flag.starts_with("--lang=") => {
+                let raw = flag.trim_start_matches("--lang=");
+                lang = Some(super::Lang::parse(raw).map_err(|e| format!("{e}\n{USAGE}"))?);
+            }
             "--max-results" => {
                 i += 1;
                 max = args
                     .get(i)
                     .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| (1..=12).contains(n))
+                    .ok_or_else(|| format!("--max-results is 1..=12\n{USAGE}"))?;
+            }
+            flag if flag.starts_with("--max-results=") => {
+                let raw = flag.trim_start_matches("--max-results=");
+                max = raw
+                    .parse::<usize>()
+                    .ok()
                     .filter(|n| (1..=12).contains(n))
                     .ok_or_else(|| format!("--max-results is 1..=12\n{USAGE}"))?;
             }
@@ -55,6 +77,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     }
     Ok(Args {
         query: words.join(" "),
+        lang,
         max,
         json,
     })
@@ -110,7 +133,10 @@ pub async fn run(args: &[String]) -> i32 {
         }
     };
     searcher.forget(&a.query);
-    let outcome = match searcher.search(&a.query, a.max, None, None).await {
+    let outcome = match searcher
+        .search(&a.query, a.max, None, a.lang.as_ref())
+        .await
+    {
         Ok(o) => o,
         Err(e) => {
             crate::diag!("search: {e}");
@@ -147,6 +173,7 @@ pub async fn run(args: &[String]) -> i32 {
     if a.json {
         let doc = serde_json::json!({
             "query": input.query,
+            "lang": a.lang.as_ref().map(|l| l.tag()),
             "shape": facts.shape().label(),
             "ranker": ranker,
             "features": NAMES,
@@ -155,8 +182,13 @@ pub async fn run(args: &[String]) -> i32 {
         });
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
     } else {
+        let lang_note = a
+            .lang
+            .as_ref()
+            .map(|l| format!("  lang {}", l.tag()))
+            .unwrap_or_default();
         println!(
-            "explain  {:?}  shape {}  ranker {ranker}",
+            "explain  {:?}{lang_note}  shape {}  ranker {ranker}",
             input.query,
             facts.shape().label()
         );
@@ -199,6 +231,31 @@ mod tests {
         let a = parse(&args).unwrap();
         assert_eq!(a.query, "rust serde json");
         assert!(a.json);
+        assert!(a.lang.is_none());
         assert!(parse(&["--explain".to_string()]).is_err());
+
+        let with_lang: Vec<String> = [
+            "--explain",
+            "cuir france",
+            "--lang",
+            "fr",
+            "--max-results=5",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse(&with_lang).unwrap();
+        assert_eq!(parsed.query, "cuir france");
+        assert_eq!(
+            parsed.lang.as_ref().map(|l| l.tag()),
+            Some("fr".to_string())
+        );
+        assert_eq!(parsed.max, 5);
+
+        let bad_lang: Vec<String> = ["--explain", "cuir", "--lang", "not a tag!"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse(&bad_lang).is_err());
     }
 }

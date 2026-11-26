@@ -170,7 +170,14 @@ pub(super) fn search_batch_deadline_error(queries: &[String]) -> Value {
     )
 }
 
-pub(super) fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &str) -> Value {
+pub(super) fn search_error(
+    query: &str,
+    cause: &str,
+    byok: &super::search_tool::ByokFailureState,
+    kind: &str,
+) -> Value {
+    use super::search_tool::{ByokFailureState, byok_failure_source};
+
     if kind == "permanent" {
         // validate_query rejected the query before any engine or
         // provider was ever contacted : no escalation trace to show,
@@ -186,27 +193,52 @@ pub(super) fn search_error(query: &str, cause: &str, byok_tried: bool, kind: &st
         );
     }
     let mut trace = Trace::default();
-    trace.step("search", "engines", "error", 0);
-    if byok_tried {
-        trace.step("byok", "providers", "error", 0);
+    match byok {
+        ByokFailureState::Unconfigured => {
+            trace.step("search", "engines", "error", 0);
+        }
+        ByokFailureState::SkippedExplicitLang => {
+            trace.step("search", "engines", "error", 0);
+            trace.step("byok", "providers", "skipped", 0);
+        }
+        ByokFailureState::Failed {
+            tried_first: true, ..
+        } => {
+            trace.step("byok", "providers", "error", 0);
+            trace.step("search", "engines", "error", 0);
+        }
+        ByokFailureState::Failed {
+            tried_first: false, ..
+        } => {
+            trace.step("search", "engines", "error", 0);
+            trace.step("byok", "providers", "error", 0);
+        }
     }
     let mut hint = String::from(
         "all engines failed : transient in most cases: retry once, then simplify the query",
     );
-    if !byok_tried {
-        hint.push_str(
-            "; if repeated, add an API key provider (donsetch keys add) for a fallback path",
-        );
+    match byok {
+        ByokFailureState::Unconfigured => {
+            hint.push_str(
+                "; if repeated, add an API key provider (donsetch keys add) for a fallback path",
+            );
+        }
+        ByokFailureState::SkippedExplicitLang => {
+            hint.push_str(
+                " (configured BYOK provider was skipped due to explicit lang; omit lang or configure search.searxng_url to use a provider)",
+            );
+        }
+        ByokFailureState::Failed { .. } => {}
     }
-    tool_error_structured(
-        format!("search: {cause}"),
-        "transient",
-        Some(json!({
-            "query": query,
-            "escalation": trace.value(),
-            "next_action": hint,
-        })),
-    )
+    let mut structured = json!({
+        "query": query,
+        "escalation": trace.value(),
+        "next_action": hint,
+    });
+    if let Some(src) = byok_failure_source(byok) {
+        structured["sources"] = json!([src]);
+    }
+    tool_error_structured(format!("search: {cause}"), "transient", Some(structured))
 }
 
 pub(super) fn tool_error(message: impl Into<String>) -> Value {
@@ -941,10 +973,11 @@ mod stitch_tests {
     // exit code for a non-retryable input error.
     #[test]
     pub(super) fn search_error_permanent_has_no_false_escalation_trace() {
+        use super::super::search_tool::ByokFailureState;
         let v = search_error(
             "",
             "empty query : pass a non-empty query string",
-            false,
+            &ByokFailureState::Unconfigured,
             "permanent",
         );
         assert_eq!(v["errorKind"], "permanent");
@@ -956,7 +989,13 @@ mod stitch_tests {
 
     #[test]
     pub(super) fn search_error_transient_keeps_engine_escalation_trace() {
-        let v = search_error("q", "all engines timed out", false, "transient");
+        use super::super::search_tool::ByokFailureState;
+        let v = search_error(
+            "q",
+            "all engines timed out",
+            &ByokFailureState::Unconfigured,
+            "transient",
+        );
         assert_eq!(v["errorKind"], "transient");
         assert!(v["structuredContent"].get("escalation").is_some());
     }

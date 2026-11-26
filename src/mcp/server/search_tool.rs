@@ -239,10 +239,25 @@ pub(super) fn parse_search_queries(args: &Value) -> Result<Vec<String>, String> 
     Ok(queries)
 }
 
+/// What happened to a configured BYOK provider during a failed search (#477).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ByokFailureState {
+    /// No BYOK search provider is configured.
+    Unconfigured,
+    /// A BYOK search provider is configured, was bypassed because an explicit
+    /// `lang` was requested and no language-aware provider (such as SearXNG)
+    /// is configured (#472, #477).
+    SkippedExplicitLang,
+    /// A BYOK search provider was attempted and failed (`tried_first` records
+    /// whether BYOK ran before local in BYOK-first mode or after local in
+    /// local-first fallback mode).
+    Failed { detail: String, tried_first: bool },
+}
+
 #[derive(Debug)]
 pub(super) struct SearchFailure {
     pub(super) cause: String,
-    pub(super) byok_tried: bool,
+    pub(super) byok: ByokFailureState,
     /// "permanent" for bad input that no retry or fallback fixes
     /// (validate_query rejected it before any engine was contacted);
     /// "transient" for exhausted engines/providers.
@@ -262,7 +277,7 @@ pub(super) async fn search_inner(
 ) -> Value {
     match search_read(daemon, query, max, intent, read, lang).await {
         Ok(out) => render_search_outcome(daemon, &out, max).await,
-        Err(failure) => search_error(query, &failure.cause, failure.byok_tried, failure.kind),
+        Err(failure) => search_error(query, &failure.cause, &failure.byok, failure.kind),
     }
 }
 
@@ -408,10 +423,18 @@ pub(super) async fn search_batch_inner(
     lang: Option<&crate::search::Lang>,
 ) -> Value {
     let started = std::time::Instant::now();
-    let futures = queries
-        .iter()
-        .map(|query| search_read(daemon, query, max, intent, read, lang));
-    let outcomes = futures_util::future::join_all(futures).await;
+    let outcomes = if crate::config::cfg().search.sequential {
+        let mut out = Vec::with_capacity(queries.len());
+        for query in queries {
+            out.push(search_read(daemon, query, max, intent, read, lang).await);
+        }
+        out
+    } else {
+        let futures = queries
+            .iter()
+            .map(|query| search_read(daemon, query, max, intent, read, lang));
+        futures_util::future::join_all(futures).await
+    };
     let ok = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
     if ok == 0 {
         let errors = queries
@@ -419,7 +442,13 @@ pub(super) async fn search_batch_inner(
             .zip(outcomes.iter())
             .filter_map(|(query, outcome)| match outcome {
                 Ok(_) => None,
-                Err(failure) => Some(json!({"query": query, "error": failure.cause})),
+                Err(failure) => {
+                    let mut entry = json!({"query": query, "error": failure.cause});
+                    if let Some(src) = byok_failure_source(&failure.byok) {
+                        entry["sources"] = json!([src]);
+                    }
+                    Some(entry)
+                }
             })
             .collect::<Vec<_>>();
         let kind = batch_failure_kind(outcomes.iter().filter_map(|outcome| match outcome {
@@ -489,12 +518,16 @@ pub(super) async fn search_batch_inner(
             }
             Err(failure) => {
                 markdown.push_str(&format!("{heading}\nFailed : {}", failure.cause));
-                searches.push(json!({
+                let mut entry = json!({
                     "ok": false,
                     "query": query,
                     "error": failure.cause,
                     "results": [],
-                }));
+                });
+                if let Some(src) = byok_failure_source(&failure.byok) {
+                    entry["sources"] = json!([src]);
+                }
+                searches.push(entry);
                 diagnostics.push(json!({"query": query, "error": failure.cause}));
             }
         }
@@ -562,7 +595,7 @@ pub(super) async fn search_outcome(
     if let Some(problem) = search::validate_query(query) {
         return Err(SearchFailure {
             cause: problem,
-            byok_tried: false,
+            byok: ByokFailureState::Unconfigured,
             kind: "permanent",
         });
     }
@@ -572,23 +605,24 @@ pub(super) async fn search_outcome(
     let byok_configured = daemon.byok.is_configured();
     let local_first = daemon.byok.is_local_default();
     let can_handle_lang = daemon.byok.can_handle_explicit_lang();
+    let lang_blocks_byok = lang.is_some() && !can_handle_lang;
 
     // BYOK-first mode: try providers, fall back to local. An explicit `lang`
     // keeps the local language-aware path unless a language-aware provider
     // (such as SearXNG via `[search] searxng_url`) is configured.
-    let byok_skipped_lang = byok_configured && !local_first && lang.is_some() && !can_handle_lang;
+    let byok_skipped_lang = byok_configured && !local_first && lang_blocks_byok;
     let mut byok_fail: Option<String> = None;
-    if byok_configured && !local_first && (lang.is_none() || can_handle_lang) {
+    if byok_configured && !local_first && !lang_blocks_byok {
         match byok_search_cached(daemon, query, max, intent, lang).await {
             Ok(out) => return Ok(out),
             Err(e) => {
                 if crate::config::cfg().debug.search {
                     crate::diag!("[byok] all providers exhausted, falling back to local: {e}");
                 }
-                // #285: keep the failure so the fallback result can
-                // say a provider was tried and why it failed; the
-                // result was otherwise indistinguishable from a run
-                // with no BYOK keys at all.
+                // #285: keep the failure so the fallback result (or total
+                // failure receipt, #477) says a provider was tried and why it
+                // failed; the result was otherwise indistinguishable from a
+                // run with no BYOK keys at all.
                 byok_fail = Some(e);
             }
         }
@@ -611,11 +645,7 @@ pub(super) async fn search_outcome(
             // Local failed : if BYOK is configured and we're in local-first
             // mode, try BYOK as a last resort — unless an explicit `lang` was
             // requested and no language-aware provider is configured (#472).
-            if byok_fallback_allowed(
-                byok_configured,
-                local_first,
-                lang.is_some() && !can_handle_lang,
-            ) {
+            if byok_fallback_allowed(byok_configured, local_first, lang_blocks_byok) {
                 if crate::config::cfg().debug.search {
                     crate::diag!("[byok] local search failed, trying BYOK fallback: {e}");
                 }
@@ -623,25 +653,78 @@ pub(super) async fn search_outcome(
                     Ok(out) => Ok(out),
                     Err(e2) => Err(SearchFailure {
                         cause: format!("local ({e}); byok ({e2})"),
-                        byok_tried: true,
+                        byok: ByokFailureState::Failed {
+                            detail: e2,
+                            tried_first: false,
+                        },
                         kind: "transient",
                     }),
                 }
             } else {
-                let cause = if byok_configured && local_first && lang.is_some() && !can_handle_lang
-                {
-                    format!("{e}; byok skipped: explicit lang")
-                } else {
-                    e.to_string()
-                };
-                Err(SearchFailure {
-                    cause,
-                    byok_tried: false,
-                    kind: "transient",
-                })
+                Err(finalize_local_search_failure(
+                    &e.to_string(),
+                    byok_configured,
+                    lang_blocks_byok,
+                    byok_fail,
+                ))
             }
         }
     }
+}
+
+/// Fold a pre-local BYOK attempt failure (#285/#477) or explicit-lang bypass
+/// (#472/#477) into the `SearchFailure` produced when the local search fan-out
+/// fails completely and no post-local BYOK fallback runs.
+fn finalize_local_search_failure(
+    local_err: &str,
+    byok_configured: bool,
+    lang_blocks_byok: bool,
+    byok_fail: Option<String>,
+) -> SearchFailure {
+    if let Some(detail) = byok_fail {
+        SearchFailure {
+            cause: format!("byok ({detail}); local ({local_err})"),
+            byok: ByokFailureState::Failed {
+                detail,
+                tried_first: true,
+            },
+            kind: "transient",
+        }
+    } else if byok_configured && lang_blocks_byok {
+        SearchFailure {
+            cause: format!("{local_err}; byok skipped: explicit lang"),
+            byok: ByokFailureState::SkippedExplicitLang,
+            kind: "transient",
+        }
+    } else {
+        SearchFailure {
+            cause: local_err.to_string(),
+            byok: ByokFailureState::Unconfigured,
+            kind: "transient",
+        }
+    }
+}
+
+/// Produce the documented `sources` census record for a configured BYOK
+/// provider on the search failure path (#477), reusing [`fold_byok_census`]
+/// and [`crate::search::source_states`] so success and failure schemas stay
+/// identical. Returns `None` when no BYOK search provider is configured.
+pub(super) fn byok_failure_source(state: &ByokFailureState) -> Option<Value> {
+    let mut report = Vec::new();
+    match state {
+        ByokFailureState::Unconfigured => return None,
+        ByokFailureState::SkippedExplicitLang => fold_byok_census(&mut report, None, true),
+        ByokFailureState::Failed { detail, .. } => {
+            fold_byok_census(&mut report, Some(detail.as_str()), false);
+        }
+    }
+    let line = crate::search::source_states(&report).into_iter().next()?;
+    Some(json!({
+        "id": line.id,
+        "items": line.items,
+        "status": line.status,
+        "state": line.state,
+    }))
 }
 
 /// Record a configured BYOK provider that did not answer — either because it
@@ -1063,5 +1146,114 @@ mod search_output_contract_tests {
         assert!(!byok_fallback_allowed(true, true, true));
         assert!(!byok_fallback_allowed(false, true, false));
         assert!(!byok_fallback_allowed(true, false, false));
+    }
+
+    #[test]
+    fn issue_477_search_failure_receipt_preserves_byok_census_across_all_modes() {
+        use super::{ByokFailureState, finalize_local_search_failure};
+        use crate::mcp::server::errors::search_error;
+
+        let local_err = "http: search: all engines failed : bing:net, ddg:net";
+
+        // Case A/D: unconfigured BYOK keeps the clean unconfigured envelope and
+        // recommends `donsetch keys add`.
+        let uncfg = finalize_local_search_failure(local_err, false, true, None);
+        assert_eq!(uncfg.byok, ByokFailureState::Unconfigured);
+        let uncfg_v = search_error("q", &uncfg.cause, &uncfg.byok, uncfg.kind);
+        let uncfg_sc = &uncfg_v["structuredContent"];
+        assert!(uncfg_sc.get("sources").is_none());
+        assert_eq!(uncfg_sc["escalation"].as_array().unwrap().len(), 1);
+        assert!(
+            uncfg_sc["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("donsetch keys add")
+        );
+
+        // Cases B & C: configured BYOK (both BYOK-first and local-first) skipped
+        // by explicit `lang` emits the documented `sources` census record,
+        // names the skip in `cause` and `escalation`, and NEVER asks to add a key.
+        let skipped = finalize_local_search_failure(local_err, true, true, None);
+        assert_eq!(skipped.byok, ByokFailureState::SkippedExplicitLang);
+        assert!(skipped.cause.contains("byok skipped: explicit lang"));
+        let skip_v = search_error("q", &skipped.cause, &skipped.byok, skipped.kind);
+        let skip_sc = &skip_v["structuredContent"];
+        assert_eq!(skip_sc["sources"][0]["id"], "byok");
+        assert_eq!(skip_sc["sources"][0]["status"], "skipped: explicit lang");
+        assert_eq!(skip_sc["sources"][0]["state"], "not asked");
+        assert_eq!(skip_sc["escalation"].as_array().unwrap().len(), 2);
+        assert_eq!(skip_sc["escalation"][1]["stage"], "byok");
+        assert_eq!(skip_sc["escalation"][1]["outcome"], "skipped");
+        assert!(
+            !skip_sc["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("donsetch keys add"),
+            "configured key must not tell caller to add a key: {}",
+            skip_sc["next_action"]
+        );
+
+        // Case E: BYOK-first provider attempted and failed, then local failed.
+        let byok_err = "all keys exhausted: tavily: network: error sending request".to_string();
+        let failed_first =
+            finalize_local_search_failure(local_err, true, false, Some(byok_err.clone()));
+        assert_eq!(
+            failed_first.byok,
+            ByokFailureState::Failed {
+                detail: byok_err.clone(),
+                tried_first: true,
+            }
+        );
+        assert!(
+            failed_first
+                .cause
+                .contains("byok (all keys exhausted: tavily")
+        );
+        assert!(failed_first.cause.contains("local ("));
+        let fail_e = search_error(
+            "q",
+            &failed_first.cause,
+            &failed_first.byok,
+            failed_first.kind,
+        );
+        let sc_e = &fail_e["structuredContent"];
+        assert_eq!(sc_e["sources"][0]["id"], "byok");
+        assert_eq!(sc_e["sources"][0]["state"], "failed");
+        assert!(
+            sc_e["sources"][0]["status"]
+                .as_str()
+                .unwrap()
+                .contains("tavily")
+        );
+        assert_eq!(sc_e["escalation"][0]["stage"], "byok");
+        assert_eq!(sc_e["escalation"][1]["stage"], "search");
+        assert!(
+            !sc_e["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("donsetch keys add")
+        );
+
+        // Case F: local-first failed, then BYOK fallback attempted and failed.
+        let fail_f = search_error(
+            "q",
+            &format!("local ({local_err}); byok ({byok_err})"),
+            &ByokFailureState::Failed {
+                detail: byok_err,
+                tried_first: false,
+            },
+            "transient",
+        );
+        let sc_f = &fail_f["structuredContent"];
+        assert_eq!(sc_f["sources"][0]["id"], "byok");
+        assert_eq!(sc_f["sources"][0]["state"], "failed");
+        assert_eq!(sc_f["escalation"][0]["stage"], "search");
+        assert_eq!(sc_f["escalation"][1]["stage"], "byok");
+        assert!(
+            !sc_f["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("donsetch keys add")
+        );
     }
 }

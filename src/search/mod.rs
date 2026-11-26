@@ -418,10 +418,18 @@ pub(super) fn parse_cache_key(key: &str) -> (&str, Intent) {
 }
 
 /// How long a single-flight follower waits for the leader before timing out.
-/// Scales with `[search] timeout_ms` so high-RTT configurations are never cut
+/// Scales with `[search] timeout_ms` (and planned sequential turns when
+/// `[search] sequential = true`) so slow-link configurations are never cut
 /// off prematurely at a hardcoded 12 s ceiling.
 fn single_flight_wait() -> Duration {
-    fanout_hard_mark()
+    let base = fanout_hard_mark();
+    let cfg = &crate::config::cfg().search;
+    let total = if cfg.sequential {
+        base.saturating_mul(cfg.request_budget.clamp(1, 8) as u32)
+    } else {
+        base
+    };
+    total
         .saturating_add(Duration::from_secs(8))
         .max(Duration::from_secs(12))
 }
@@ -1790,11 +1798,13 @@ impl Searcher {
             .iter()
             .map(|e| (e.to_string(), query::for_engine(&compiled, e)))
             .collect();
-        // Only mark the initial active wave (first 3 lanes) as priority so
-        // additional healthy Tier-1 engines stay eligible for the reserve queue.
+        // Only mark the initial active wave (first `wave_size` lanes) as
+        // priority so additional healthy Tier-1 engines stay eligible for the
+        // reserve queue and smaller wave sizes are respected (#478).
+        let wave_size = crate::config::cfg().search.wave_size.clamp(1, 8);
         let mut priority_sources: Vec<String> = live
             .iter()
-            .take(3)
+            .take(wave_size)
             .copied()
             .filter(|e| {
                 matches!(
@@ -1973,6 +1983,7 @@ impl Searcher {
         // parallel with the fan-out and with no ambiguity to rank around. The
         // href is read from that page, never guessed, so an item that does not
         // exist produces nothing rather than a 404 dressed as an answer.
+        let fast_lookup_budget = (fanout_soft_mark() * 3 / 4).max(Duration::from_millis(900));
         if let Some(item) = resolve::item(&query::QueryFacts::new(query))
             && let Some(pace) = self.plan_lane("docs", &mut skipped)
         {
@@ -1984,7 +1995,7 @@ impl Searcher {
                         item,
                         query.to_string(),
                         &self.fetcher,
-                        Duration::from_millis(900),
+                        fast_lookup_budget,
                     )),
                 ),
             ));
@@ -2005,7 +2016,7 @@ impl Searcher {
                     Box::pin(tasks::registry_task(
                         plan,
                         &self.fetcher,
-                        Duration::from_millis(900),
+                        fast_lookup_budget,
                     )),
                 ),
             ));
@@ -2178,15 +2189,20 @@ impl Searcher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let search_cfg = &crate::config::cfg().search;
         let (outcomes, late) = EARLY_ALLOWANCE
             .scope(
                 Arc::clone(&engine_allowance),
-                schedule::run(
+                schedule::run_with_opts(
                     futures,
                     skipped,
                     &known_families,
-                    crate::config::cfg().search.search_early,
-                    news::wants_news(query, intent),
+                    schedule::ScheduleOpts {
+                        early: search_cfg.search_early,
+                        news: news::wants_news(query, intent),
+                        sequential: search_cfg.sequential,
+                        wave_size: search_cfg.wave_size,
+                    },
                     &priority_sources,
                 ),
             )

@@ -183,6 +183,12 @@ section!(SearchSection {
     /// 4000). Soft/late marks, per-lane budgets, and engine connect timeouts
     /// scale coherently from this value for high-RTT or proxied links (#470).
     timeout_ms: u64 = 4000,
+    /// Run search lanes one at a time instead of in parallel waves, giving
+    /// every planned engine a turn with no early stop (for slow links, #478).
+    sequential: bool = false,
+    /// Number of general search engines launched in the initial wave (1..=8,
+    /// default 3; `sequential = true` runs strictly one lane at a time, #478).
+    wave_size: usize = 3,
     /// How much of the top family vote the lexical evidence may move a result
     /// by, 0..=1. **0 ships**: a hand-set share was measured against the vote and
     /// lost (`entity` −0.12, `paper` −0.12 hit@1 over 86 rows), because BM25
@@ -327,6 +333,7 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+#[derive(Clone)]
 pub struct Loaded {
     pub config: DonsetchConfig,
     /// Non-fatal notes: ignored legacy values, unknown DONSETCH_* vars.
@@ -387,6 +394,17 @@ impl Loaded {
 
 /// Load the layered config from defaults + env + TOML file and validate it.
 pub fn load() -> Result<Loaded, ConfigError> {
+    load_inner(false)
+}
+
+/// Load config for `donsetch settings`: behaves identically to [`load`], except
+/// an explicit `DONSETCH_CONFIG` path that does not exist yet starts from
+/// defaults/env so `settings` can bootstrap that file on first save.
+pub fn load_for_editor() -> Result<Loaded, ConfigError> {
+    load_inner(true)
+}
+
+fn load_inner(allow_missing_explicit: bool) -> Result<Loaded, ConfigError> {
     let mut warnings = Vec::new();
 
     let mut file_layer: Option<config::Map<String, config::Value>> = None;
@@ -410,24 +428,31 @@ pub fn load() -> Result<Loaded, ConfigError> {
     };
     if !skip_file {
         match toml_path() {
-            Some(path) => {
-                let text = std::fs::read_to_string(&path).map_err(|e| ConfigError::File {
-                    path: path.display().to_string(),
-                    message: format!("unreadable ({e})"),
-                })?;
-                let source = config::File::from_str(&text, config::FileFormat::Toml);
-                let mut map = source.collect().map_err(|e| ConfigError::File {
-                    path: path.display().to_string(),
-                    message: e.to_string(),
-                })?;
-                // from_str leaves origins unstamped: stamp every leaf
-                // with the file label so the display can name it.
-                restamp_origins(&mut map, &Some(format!("file:{}", path.display())));
-                file_layer = Some(map);
-                file_path = Some(path);
-            }
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let source = config::File::from_str(&text, config::FileFormat::Toml);
+                    let mut map = source.collect().map_err(|e| ConfigError::File {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
+                    })?;
+                    // from_str leaves origins unstamped: stamp every leaf
+                    // with the file label so the display can name it.
+                    restamp_origins(&mut map, &Some(format!("file:{}", path.display())));
+                    file_layer = Some(map);
+                    file_path = Some(path);
+                }
+                Err(e) if allow_missing_explicit && e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(ConfigError::File {
+                        path: path.display().to_string(),
+                        message: format!("unreadable ({e})"),
+                    });
+                }
+            },
             None => {
-                if let Some(explicit) = std::env::var_os("DONSETCH_CONFIG") {
+                if !allow_missing_explicit
+                    && let Some(explicit) = std::env::var_os("DONSETCH_CONFIG")
+                {
                     return Err(ConfigError::File {
                         path: explicit.to_string_lossy().into_owned(),
                         message: "not found".into(),
@@ -570,6 +595,135 @@ fn toml_path() -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Typed TOML value for line-level writes into `donsetch.toml`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TomlEditValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    List(Vec<String>),
+    /// Remove the key assignment from `[section]` so the setting falls back to
+    /// its compiled default (or lower env layer).
+    Unset,
+}
+
+impl TomlEditValue {
+    fn to_toml_literal(&self) -> Option<String> {
+        match self {
+            Self::Bool(b) => Some(b.to_string()),
+            Self::Int(n) => Some(n.to_string()),
+            Self::Float(f) => {
+                if !f.is_finite() {
+                    return None;
+                }
+                let s = format!("{f}");
+                if s.contains('.') || s.contains('e') || s.contains('E') {
+                    Some(s)
+                } else {
+                    Some(format!("{s}.0"))
+                }
+            }
+            Self::Str(s) => Some(toml_quote(s)),
+            Self::List(items) => {
+                let parts: Vec<String> = items.iter().map(|s| toml_quote(s)).collect();
+                Some(format!("[{}]", parts.join(", ")))
+            }
+            Self::Unset => None,
+        }
+    }
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Resolve the writable `donsetch.toml` path (`DONSETCH_CONFIG` when set, else
+/// `<config-dir>/donsetch/donsetch.toml`). Refuses when `DONSETCH_NO_CONFIG_FILE`
+/// disables the file layer.
+pub fn config_file_target() -> Result<std::path::PathBuf, String> {
+    if legacy_flag("DONSETCH_NO_CONFIG_FILE") {
+        return Err(
+            "the file layer is disabled by DONSETCH_NO_CONFIG_FILE; unset it to persist settings"
+                .into(),
+        );
+    }
+    match std::env::var_os("DONSETCH_CONFIG") {
+        Some(v) if !v.is_empty() => Ok(std::path::PathBuf::from(v)),
+        _ => Ok(dirs::config_dir()
+            .ok_or("no config directory on this platform")?
+            .join("donsetch")
+            .join("donsetch.toml")),
+    }
+}
+
+/// Validate a candidate `donsetch.toml` document with the exact same parser and
+/// schema rules `load()` enforces, before it ever touches disk.
+fn validate_toml_document(text: &str) -> Result<DonsetchConfig, String> {
+    let source = config::File::from_str(text, config::FileFormat::Toml);
+    let map = source.collect().map_err(|e| e.to_string())?;
+    let parsed = deserialize_layer_table(&map)?;
+    validate(&parsed).map_err(|e| e.to_string())?;
+    validate_modern_http_token(&parsed.transport.token).map_err(str::to_string)?;
+    Ok(parsed)
+}
+
+fn write_validated_toml(path: &std::path::Path, updated: &str) -> Result<(), String> {
+    validate_toml_document(updated)?;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("donsetch.toml");
+    let tmp = parent.join(format!(".{file_name}.{}.{nanos}.tmp", std::process::id()));
+    write_private(&tmp, updated.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot replace {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Persist one or more typed settings into `donsetch.toml` in a single atomic,
+/// validated write. Line-level edits preserve comments, formatting, and
+/// unrelated tables verbatim.
+pub fn set_file_values(
+    updates: &[(&str, &str, TomlEditValue)],
+) -> Result<std::path::PathBuf, String> {
+    let path = config_file_target()?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let updated = apply_toml_edits(&existing, updates);
+    write_validated_toml(&path, &updated)?;
+    Ok(path)
+}
+
 /// Persist one boolean knob into the TOML file layer: the machinery
 /// behind `donsetch proxy fetch|crawl on|off`. Resolution follows the
 /// loader (`DONSETCH_CONFIG` when set, else the default location);
@@ -578,85 +732,264 @@ fn toml_path() -> Option<std::path::PathBuf> {
 /// write is atomic with owner-only permissions: the file can carry
 /// proxy credentials.
 pub fn set_file_bool(section: &str, key: &str, value: bool) -> Result<std::path::PathBuf, String> {
-    if legacy_flag("DONSETCH_NO_CONFIG_FILE") {
-        return Err(
-            "the file layer is disabled by DONSETCH_NO_CONFIG_FILE; unset it to persist settings"
-                .into(),
-        );
-    }
-    let path = match std::env::var_os("DONSETCH_CONFIG") {
-        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
-        _ => dirs::config_dir()
-            .ok_or("no config directory on this platform")?
-            .join("donsetch")
-            .join("donsetch.toml"),
-    };
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    set_file_values(&[(section, key, TomlEditValue::Bool(value))])
+}
+
+/// Insert or replace one `[rules.url."<pattern>"]` table in `donsetch.toml`
+/// after validating the full resulting document (including `RuleSet::compile`).
+pub fn upsert_file_rule(
+    pattern: &str,
+    rule: &crate::rules::UrlRule,
+) -> Result<std::path::PathBuf, String> {
+    let path = config_file_target()?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let updated = set_toml_bool(&existing, section, key, value);
-    let tmp = path.with_extension("toml.tmp");
-    write_private(&tmp, updated.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
+    let updated = upsert_toml_rule(&existing, pattern, rule);
+    write_validated_toml(&path, &updated)?;
     Ok(path)
+}
+
+/// Remove one `[rules.url."<pattern>"]` table from `donsetch.toml`.
+pub fn remove_file_rule(pattern: &str) -> Result<std::path::PathBuf, String> {
+    let path = config_file_target()?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let updated = remove_toml_rule(&existing, pattern);
+    write_validated_toml(&path, &updated)?;
+    Ok(path)
+}
+
+/// Line-level TOML edits: replace existing keys in place, insert missing keys
+/// under their `[section]` header, append new sections when absent, or remove
+/// keys on [`TomlEditValue::Unset`]. User comments and layout survive.
+pub(crate) fn apply_toml_edits(text: &str, updates: &[(&str, &str, TomlEditValue)]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for (section, key, value) in updates {
+        let mut header_at: Option<usize> = None;
+        let mut key_at: Option<usize> = None;
+        let mut in_target = false;
+        for (i, line) in lines.iter().enumerate() {
+            match section_in_header(line) {
+                Some(name) => {
+                    in_target = name == *section;
+                    if in_target && header_at.is_none() {
+                        header_at = Some(i);
+                    }
+                }
+                None => {
+                    if in_target && key_at.is_none() && is_assignment(line, key) {
+                        key_at = Some(i);
+                    }
+                }
+            }
+        }
+        match value.to_toml_literal() {
+            Some(lit) => {
+                let canonical = format!("{key} = {lit}");
+                match (key_at, header_at) {
+                    (Some(k), _) => {
+                        let end = assignment_end_line(&lines, k);
+                        lines.splice(k..=end, [canonical]);
+                    }
+                    (None, Some(h)) => lines.insert(h + 1, canonical),
+                    (None, None) => {
+                        if lines.iter().any(|l| !l.trim().is_empty()) {
+                            lines.push(String::new());
+                        }
+                        lines.push(format!("[{section}]"));
+                        lines.push(canonical);
+                    }
+                }
+            }
+            None => {
+                if let Some(k) = key_at {
+                    let end = assignment_end_line(&lines, k);
+                    lines.drain(k..=end);
+                }
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Find the inclusive last line index belonging to a TOML assignment starting
+/// at `start_idx` (handles multi-line array values like `pool = [\n ...\n]`).
+fn assignment_end_line(lines: &[String], start_idx: usize) -> usize {
+    let mut depth = 0i32;
+    for (offset, line) in lines[start_idx..].iter().enumerate() {
+        let mut in_double = false;
+        let mut in_single = false;
+        let mut escaped = false;
+        for ch in line.chars() {
+            if in_double {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_double = false;
+                }
+                continue;
+            }
+            if in_single {
+                if ch == '\'' {
+                    in_single = false;
+                }
+                continue;
+            }
+            match ch {
+                '#' => break,
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            return start_idx + offset;
+        }
+    }
+    lines.len().saturating_sub(1)
+}
+
+fn rule_header_matches(line: &str, pattern: &str) -> bool {
+    let Some(name) = section_in_header(line) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix("rules.url.") else {
+        return false;
+    };
+    let rest = rest.trim();
+    if rest == toml_quote(pattern) {
+        return true;
+    }
+    if let Some(inner) = rest.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return inner == pattern;
+    }
+    rest == pattern
+}
+
+fn remove_toml_rule(text: &str, pattern: &str) -> String {
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut skipping = false;
+    for line in lines {
+        if section_in_header(&line).is_some() {
+            if rule_header_matches(&line, pattern) {
+                skipping = true;
+                continue;
+            }
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    let mut res = out.join("\n");
+    if !res.is_empty() {
+        res.push('\n');
+    }
+    res
+}
+
+fn upsert_toml_rule(text: &str, pattern: &str, rule: &crate::rules::UrlRule) -> String {
+    let mut base = remove_toml_rule(text, pattern);
+    if !base.is_empty() && !base.ends_with("\n\n") {
+        base.push('\n');
+    }
+    base.push_str(&format!("[rules.url.{}]\n", toml_quote(pattern)));
+    base.push_str(&format!("enabled = {}\n", rule.enabled));
+    let action = match rule.action {
+        crate::rules::RuleAction::Allow => "allow",
+        crate::rules::RuleAction::Deny => "deny",
+    };
+    base.push_str(&format!("action = \"{action}\"\n"));
+    if let Some(msg) = &rule.message
+        && !msg.trim().is_empty()
+    {
+        base.push_str(&format!("message = {}\n", toml_quote(msg)));
+    }
+    if rule.action == crate::rules::RuleAction::Deny {
+        base.push_str(&format!("kind = \"{}\"\n", rule.kind.as_str()));
+    }
+    if let Some(reason) = &rule.reason
+        && !reason.trim().is_empty()
+    {
+        base.push_str(&format!("reason = {}\n", toml_quote(reason)));
+    }
+    base
 }
 
 /// The line-level TOML edit behind [`set_file_bool`]: replace the
 /// key inside its section when present, else insert under the section
 /// header, else append the section. Pure text in, text out; no TOML
 /// re-serialization, so user comments and layout survive.
+#[cfg(test)]
 fn set_toml_bool(text: &str, section: &str, key: &str, value: bool) -> String {
-    let canonical = format!("{key} = {value}");
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-
-    // First `[section]` header wins; the key's line is only looked
-    // for while inside that section.
-    let mut header_at: Option<usize> = None;
-    let mut key_at: Option<usize> = None;
-    let mut in_target = false;
-    for (i, line) in lines.iter().enumerate() {
-        match section_in_header(line) {
-            Some(name) => {
-                in_target = name == section;
-                if in_target && header_at.is_none() {
-                    header_at = Some(i);
-                }
-            }
-            None => {
-                if in_target && key_at.is_none() && is_assignment(line, key) {
-                    key_at = Some(i);
-                }
-            }
-        }
-    }
-    match (key_at, header_at) {
-        (Some(k), _) => lines[k] = canonical,
-        (None, Some(h)) => lines.insert(h + 1, canonical),
-        (None, None) => {
-            if lines.iter().any(|l| !l.trim().is_empty()) {
-                lines.push(String::new());
-            }
-            lines.push(format!("[{section}]"));
-            lines.push(canonical);
-        }
-    }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
+    apply_toml_edits(text, &[(section, key, TomlEditValue::Bool(value))])
 }
 
-/// `[name]` header -> `Some(name)`; table-array headers `[[name]]`
-/// and non-headers -> `None`.
+/// `[name]` header -> `Some(name)`; table-array headers `[[name]]`,
+/// quoted array elements `["item"]`, and non-headers -> `None`.
 fn section_in_header(line: &str) -> Option<&str> {
-    let rest = line.trim().strip_prefix('[')?;
-    let name = &rest[..rest.find(']')?];
-    if name.is_empty() || name.starts_with('[') {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    if rest.starts_with('[') {
+        return None;
+    }
+    // Find closing `]` outside quotes so `[rules.url."a]b"]` parses cleanly.
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut close_at = None;
+    for (idx, ch) in rest.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_double = true,
+            '\'' => in_single = true,
+            ']' => {
+                close_at = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close = close_at?;
+    let tail = rest[close + 1..].trim();
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return None;
+    }
+    let name = rest[..close].trim();
+    if name.is_empty() || name.starts_with('"') || name.starts_with('\'') {
         return None;
     }
     Some(name)
@@ -1353,6 +1686,7 @@ pub(crate) enum FieldKind {
     Str,
     Bool,
     Int,
+    Float,
     List,
 }
 
@@ -1833,10 +2167,45 @@ pub(crate) fn fieldbook() -> &'static Fieldbook {
         ),
         (
             "search",
+            "sequential",
+            FieldKind::Bool,
+            "false",
+            "run search lanes one at a time with no early stop until every planned engine gets a turn (for slow links)",
+        ),
+        (
+            "search",
+            "wave_size",
+            FieldKind::Int,
+            "3",
+            "general search engines launched in the initial parallel wave (1..=8; 1 runs one engine at a time)",
+        ),
+        (
+            "search",
+            "request_budget",
+            FieldKind::Int,
+            "6",
+            "maximum search lanes asked per query (1..=20); extra lanes report not-asked",
+        ),
+        (
+            "search",
+            "tie_window",
+            FieldKind::Float,
+            "0.0",
+            "lexical tie-break share (0.0..=1.0) where the compiled linear model does not rank",
+        ),
+        (
+            "search",
             "serp_instant",
             FieldKind::Bool,
             "false",
             "extract byte-derived featured/instant/knowledge answers from SERP HTML",
+        ),
+        (
+            "search",
+            "enrich",
+            FieldKind::Bool,
+            "false",
+            "fetch top search result pages to replace SERP snippets with page title and description",
         ),
         // browser
         (
@@ -2205,6 +2574,13 @@ fn new_env_layer_from(
                     continue;
                 }
             },
+            FieldKind::Float => match value.trim().parse::<f64>() {
+                Ok(n) if n.is_finite() => n.into(),
+                _ => {
+                    errors.push(format!("{name} is not a finite number"));
+                    continue;
+                }
+            },
             FieldKind::List => value
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -2261,6 +2637,15 @@ fn validate(c: &DonsetchConfig) -> Result<(), ConfigError> {
     }
     if !(1_000..=120_000).contains(&c.search.timeout_ms) {
         return err("search.timeout_ms must be 1000..=120000".into());
+    }
+    if !(1..=8).contains(&c.search.wave_size) {
+        return err("search.wave_size must be 1..=8".into());
+    }
+    if !(1..=20).contains(&c.search.request_budget) {
+        return err("search.request_budget must be 1..=20".into());
+    }
+    if !c.search.tie_window.is_finite() || !(0.0..=1.0).contains(&c.search.tie_window) {
+        return err("search.tie_window must be 0.0..=1.0".into());
     }
     let searxng = c.search.searxng_url.trim();
     if !searxng.is_empty() {
@@ -2553,6 +2938,7 @@ pub fn show_markdown() -> String {
             FieldKind::Str => "string",
             FieldKind::Bool => "bool",
             FieldKind::Int => "integer",
+            FieldKind::Float => "float",
             FieldKind::List => "list",
         };
         if section != last_section {
@@ -4497,5 +4883,161 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(map.contains_key("search"));
+    }
+
+    #[test]
+    fn issue_478_search_sequential_and_wave_size_defaults_load_and_validate() {
+        let def = DonsetchConfig::default();
+        assert!(!def.search.sequential);
+        assert_eq!(def.search.wave_size, 3);
+        assert!(validate(&def).is_ok());
+
+        let mut seq = def.clone();
+        seq.search.sequential = true;
+        seq.search.wave_size = 1;
+        assert!(validate(&seq).is_ok());
+
+        let mut zero_wave = def.clone();
+        zero_wave.search.wave_size = 0;
+        assert!(validate(&zero_wave).is_err());
+
+        let mut huge_wave = def.clone();
+        huge_wave.search.wave_size = 9;
+        assert!(validate(&huge_wave).is_err());
+
+        let (map, warnings, errors) = new_env_layer_from(vec![
+            (
+                std::ffi::OsString::from("DONSETCH_SEARCH__SEQUENTIAL"),
+                std::ffi::OsString::from("true"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_SEARCH__WAVE_SIZE"),
+                std::ffi::OsString::from("1"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_SEARCH__REQUEST_BUDGET"),
+                std::ffi::OsString::from("8"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_SEARCH__TIE_WINDOW"),
+                std::ffi::OsString::from("0.25"),
+            ),
+            (
+                std::ffi::OsString::from("DONSETCH_SEARCH__ENRICH"),
+                std::ffi::OsString::from("true"),
+            ),
+        ]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(errors.is_empty(), "{errors:?}");
+        let config::ValueKind::Table(search) = &map.get("search").expect("search section").kind
+        else {
+            panic!("search table expected");
+        };
+        assert!(search["sequential"].clone().into_bool().unwrap());
+        assert_eq!(search["wave_size"].clone().into_int().unwrap(), 1);
+        assert_eq!(search["request_budget"].clone().into_int().unwrap(), 8);
+        assert!((search["tie_window"].clone().into_float().unwrap() - 0.25).abs() < 1e-9);
+        assert!(search["enrich"].clone().into_bool().unwrap());
+    }
+
+    #[test]
+    fn set_file_values_preserves_comments_validates_and_unsets() {
+        let _guard = clean_env();
+        let initial = "# operator note\n[search]\n# keep me\ntimeout_ms = 4000\n";
+        let path = write_cfg(&std::env::temp_dir(), initial);
+        set_env("DONSETCH_CONFIG", &path);
+
+        set_file_values(&[
+            ("search", "sequential", TomlEditValue::Bool(true)),
+            ("search", "wave_size", TomlEditValue::Int(1)),
+            ("search", "timeout_ms", TomlEditValue::Int(15_000)),
+            (
+                "search",
+                "searxng_url",
+                TomlEditValue::Str("http://127.0.0.1:8080".into()),
+            ),
+        ])
+        .expect("valid write succeeds");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# operator note"));
+        assert!(text.contains("# keep me"));
+        let loaded = load().expect("written file loads cleanly");
+        assert!(loaded.config.search.sequential);
+        assert_eq!(loaded.config.search.wave_size, 1);
+        assert_eq!(loaded.config.search.timeout_ms, 15_000);
+        assert_eq!(loaded.config.search.searxng_url, "http://127.0.0.1:8080");
+
+        // Invalid value is rejected before touching disk.
+        let bad = set_file_values(&[("search", "wave_size", TomlEditValue::Int(0))]);
+        assert!(bad.is_err());
+        let after_bad = load().expect("file remains valid");
+        assert_eq!(after_bad.config.search.wave_size, 1);
+
+        // Unset removes the key so it returns to default.
+        set_file_values(&[
+            ("search", "sequential", TomlEditValue::Unset),
+            ("search", "wave_size", TomlEditValue::Unset),
+        ])
+        .expect("unset succeeds");
+        let reset = load().expect("loads after unset");
+        assert!(!reset.config.search.sequential);
+        assert_eq!(reset.config.search.wave_size, 3);
+
+        // Rule upsert and remove roundtrip cleanly.
+        let rule = crate::rules::UrlRule {
+            enabled: true,
+            action: crate::rules::RuleAction::Deny,
+            message: Some("Blocked by policy".into()),
+            kind: crate::rules::DenyKind::Permanent,
+            reason: Some("policy_test".into()),
+        };
+        upsert_file_rule("blocked.example", &rule).expect("rule upsert succeeds");
+        let with_rule = load().expect("loads with rule");
+        assert_eq!(with_rule.config.rules.url.len(), 1);
+        assert_eq!(
+            with_rule.config.rules.url["blocked.example"]
+                .message
+                .as_deref(),
+            Some("Blocked by policy")
+        );
+        remove_file_rule("blocked.example").expect("rule remove succeeds");
+        let without_rule = load().expect("loads after rule remove");
+        assert!(without_rule.config.rules.url.is_empty());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn apply_toml_edits_handles_multiline_arrays_and_commented_headers() {
+        let initial = "\
+[ search ] # slow-link overrides
+timeout_ms = 4000
+
+[proxy]
+pool = [
+  \"http://127.0.0.1:8080\",
+  \"http://127.0.0.1:8081\",
+]
+crawl_rotate = true
+";
+        let updated = apply_toml_edits(
+            initial,
+            &[
+                ("search", "sequential", TomlEditValue::Bool(true)),
+                (
+                    "proxy",
+                    "pool",
+                    TomlEditValue::List(vec!["http://127.0.0.1:9090".into()]),
+                ),
+            ],
+        );
+        let parsed = validate_toml_document(&updated)
+            .unwrap_or_else(|e| panic!("updated TOML must remain valid ({e}):\n{updated}"));
+        assert!(parsed.search.sequential);
+        assert_eq!(parsed.proxy.pool, vec!["http://127.0.0.1:9090"]);
+        assert!(parsed.proxy.crawl_rotate);
+        // Existing commented section header is reused, not duplicated.
+        assert_eq!(updated.matches("search").count(), 1, "{updated}");
     }
 }

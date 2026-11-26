@@ -79,7 +79,9 @@ fn request_proxy(
 }
 
 fn http_client(proxy: Option<&crate::egress::proxy::Proxy>) -> Result<HttpClient, String> {
-    let route_key = proxy.map(|p| p.id()).unwrap_or_else(|| "direct".into());
+    let route_key = proxy
+        .map(|p| p.connection_key())
+        .unwrap_or_else(|| "direct".into());
     if let Some(existing) = HTTP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -732,5 +734,21 @@ mod tests {
         *LOW_QUOTA_UNTIL.lock().unwrap() = Some(Instant::now() - Duration::from_secs(1));
         assert!(!is_cooling());
         assert!(LOW_QUOTA_UNTIL.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn http_client_cache_keys_distinguish_scheme_and_credentials_on_same_host_port() {
+        let http_px = crate::egress::proxy::Proxy::parse("http://user1:pass1@127.0.0.1:18080")
+            .expect("http proxy");
+        let socks_px = crate::egress::proxy::Proxy::parse("socks5://user1:pass1@127.0.0.1:18080")
+            .expect("socks5 proxy");
+        assert_eq!(http_px.id(), socks_px.id());
+        assert_ne!(http_px.connection_key(), socks_px.connection_key());
+
+        // Caching the HTTP proxy must not allow a SOCKS5 proxy on the same
+        // host:port to bypass SOCKS5 rejection via an id()-only cache hit.
+        assert!(http_client(Some(&http_px)).is_ok());
+        let err = http_client(Some(&socks_px)).unwrap_err();
+        assert!(err.contains("HTTP proxy"), "{err}");
     }
 }

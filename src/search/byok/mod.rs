@@ -336,7 +336,7 @@ impl ByokSearcher {
             .map_err(|e| KeyError::UnknownError(format!("proxy config: {e}")))?;
         let route_key = proxy
             .as_ref()
-            .map(|p| p.id())
+            .map(|p| p.connection_key())
             .unwrap_or_else(|| "direct".into());
         if let Some(existing) = self
             .clients
@@ -348,8 +348,8 @@ impl ByokSearcher {
             return Ok(existing);
         }
         let mut builder = crate::egress::trust::with_trusted_roots(reqwest::Client::builder())
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(5))
+            .timeout(crate::search::fanout_hard_mark().max(Duration::from_secs(30)))
+            .connect_timeout(crate::search::search_connect_timeout().max(Duration::from_secs(5)))
             .pool_max_idle_per_host(2)
             .no_proxy();
         if let Some(proxy) = proxy {

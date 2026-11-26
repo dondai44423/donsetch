@@ -127,7 +127,7 @@ fn http_client_for(url: &str) -> Result<HttpClient, String> {
     let proxy = crate::egress::proxy::from_env_for(url).map_err(|e| e.to_string())?;
     let route_key = proxy
         .as_ref()
-        .map(|p| p.id())
+        .map(|p| p.connection_key())
         .unwrap_or_else(|| "direct".into());
     if let Some(existing) = HTTP
         .lock()
@@ -165,9 +165,9 @@ fn http_client_for(url: &str) -> Result<HttpClient, String> {
     Ok(built)
 }
 
-/// Only follow redirects that stay on the exact same host (e.g. `http -> https`
-/// upgrade or `/search` -> `/search/` behind Caddy/Traefik/Nginx), blocking
-/// cross-host redirect pivots.
+/// Only follow redirects that stay on the exact same host (and port, unless
+/// upgrading `http` to `https` on default ports), blocking cross-host,
+/// cross-port, and scheme-downgrade redirect pivots.
 fn same_host_redirect(from: &url::Url, to: &url::Url) -> bool {
     if !matches!(to.scheme(), "http" | "https") {
         return false;
@@ -176,9 +176,19 @@ fn same_host_redirect(from: &url::Url, to: &url::Url) -> bool {
     if from.scheme() == "https" && to.scheme() != "https" {
         return false;
     }
-    match (from.host_str(), to.host_str()) {
+    let host_match = match (from.host_str(), to.host_str()) {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
         _ => false,
+    };
+    if !host_match {
+        return false;
+    }
+    let scheme_upgrade = from.scheme() == "http" && to.scheme() == "https";
+    if scheme_upgrade {
+        // Allow http:80 -> https:443 (default port upgrade) or identical port.
+        (from.port().is_none() && to.port().is_none()) || from.port() == to.port()
+    } else {
+        from.port_or_known_default() == to.port_or_known_default()
     }
 }
 
@@ -257,7 +267,10 @@ async fn fetch_json(initial: &url::Url, timeout: Duration) -> Result<Value, Prov
                     "searxng: refused cross-host or scheme-downgrade redirect".into(),
                 )));
             }
-            if !current.username().is_empty() && next.username().is_empty() {
+            if (!current.username().is_empty() || current.password().is_some())
+                && next.username().is_empty()
+                && next.password().is_none()
+            {
                 let _ = next.set_username(current.username());
                 let _ = next.set_password(current.password());
             }
@@ -868,5 +881,22 @@ mod tests {
         server.await.unwrap();
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].url, "https://news.example/a");
+    }
+
+    #[test]
+    fn same_host_redirect_blocks_cross_port_and_scheme_downgrade() {
+        let base_https = url::Url::parse("https://search.example:8443/search?q=a").unwrap();
+        let same_port = url::Url::parse("https://search.example:8443/search/?q=a").unwrap();
+        let diff_port = url::Url::parse("https://search.example:9999/search?q=a").unwrap();
+        let downgrade = url::Url::parse("http://search.example:8443/search?q=a").unwrap();
+        assert!(same_host_redirect(&base_https, &same_port));
+        assert!(!same_host_redirect(&base_https, &diff_port));
+        assert!(!same_host_redirect(&base_https, &downgrade));
+
+        let http_default = url::Url::parse("http://search.example/search?q=a").unwrap();
+        let https_default = url::Url::parse("https://search.example/search?q=a").unwrap();
+        let https_odd = url::Url::parse("https://search.example:9443/search?q=a").unwrap();
+        assert!(same_host_redirect(&http_default, &https_default));
+        assert!(!same_host_redirect(&http_default, &https_odd));
     }
 }

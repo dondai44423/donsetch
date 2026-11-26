@@ -150,7 +150,9 @@ impl Client {
         &self,
         proxy: Option<&crate::egress::proxy::Proxy>,
     ) -> Result<HttpClient, String> {
-        let route_key = proxy.map(|p| p.id()).unwrap_or_else(|| "direct".into());
+        let route_key = proxy
+            .map(|p| p.connection_key())
+            .unwrap_or_else(|| "direct".into());
         if let Some(existing) = self
             .http
             .lock()

@@ -53,7 +53,9 @@ fn request_proxy(
 }
 
 fn http_client(proxy: Option<&crate::egress::proxy::Proxy>) -> Result<HttpClient, String> {
-    let route_key = proxy.map(|p| p.id()).unwrap_or_else(|| "direct".into());
+    let route_key = proxy
+        .map(|p| p.connection_key())
+        .unwrap_or_else(|| "direct".into());
     if let Some(existing) = HTTP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

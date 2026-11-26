@@ -629,7 +629,9 @@ fn image_source_timeout() -> Duration {
 fn cached_http_client(
     proxy: Option<&crate::egress::proxy::Proxy>,
 ) -> Result<reqwest::Client, String> {
-    let route_key = proxy.map(|p| p.id()).unwrap_or_else(|| "direct".into());
+    let route_key = proxy
+        .map(|p| p.connection_key())
+        .unwrap_or_else(|| "direct".into());
     if let Some(existing) = IMAGE_HTTP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1207,9 +1209,19 @@ pub async fn search_images_multi_with_searxng(
     let mut merged_reports: Vec<ImageSourceReport> = Vec::new();
     let mut searxng_answered = false;
 
+    let sequential = crate::config::cfg().search.sequential;
+
     if prefer_searxng && let Some(base_url) = super::byok::searxng::configured_url() {
         let sx_timeout = timeout.max(Duration::from_secs(6));
-        let per_query =
+        let per_query = if sequential {
+            let mut out = Vec::with_capacity(queries.len());
+            for q in queries {
+                out.push(
+                    super::byok::searxng::search_images(&base_url, q, max, lang, sx_timeout).await,
+                );
+            }
+            out
+        } else {
             join_all(
                 queries.iter().map(|q| {
                     let base = base_url.clone();
@@ -1218,7 +1230,8 @@ pub async fn search_images_multi_with_searxng(
                     }
                 }),
             )
-            .await;
+            .await
+        };
         for (hits, rep) in per_query {
             if !hits.is_empty() {
                 searxng_answered = true;
@@ -1277,22 +1290,40 @@ pub async fn search_images_multi_with_searxng(
         };
         cached_search_client = Some(search_client.clone());
 
-        // Query all formulations concurrently across all three keyless sources.
-        let per_query = join_all(queries.iter().map(|q| {
-            let client = search_client.clone();
-            async move {
-                let ((bing_hits, bing_rep), (ddg_hits, ddg_rep), (wiki_hits, wiki_rep)) = tokio::join!(
-                    fetch_bing_images(&client, q, max, lang, timeout),
-                    fetch_ddg_images(&client, q, max, lang, timeout),
-                    fetch_wikimedia_images(&client, q, max, timeout),
-                );
-                (
+        // Query all formulations across the three keyless sources (sequentially
+        // when `[search] sequential = true` to avoid saturating slow links).
+        let per_query = if sequential {
+            let mut out = Vec::with_capacity(queries.len());
+            for q in queries {
+                let (bing_hits, bing_rep) =
+                    fetch_bing_images(&search_client, q, max, lang, timeout).await;
+                let (ddg_hits, ddg_rep) =
+                    fetch_ddg_images(&search_client, q, max, lang, timeout).await;
+                let (wiki_hits, wiki_rep) =
+                    fetch_wikimedia_images(&search_client, q, max, timeout).await;
+                out.push((
                     vec![bing_hits, ddg_hits, wiki_hits],
                     vec![bing_rep, ddg_rep, wiki_rep],
-                )
+                ));
             }
-        }))
-        .await;
+            out
+        } else {
+            join_all(queries.iter().map(|q| {
+                let client = search_client.clone();
+                async move {
+                    let ((bing_hits, bing_rep), (ddg_hits, ddg_rep), (wiki_hits, wiki_rep)) = tokio::join!(
+                        fetch_bing_images(&client, q, max, lang, timeout),
+                        fetch_ddg_images(&client, q, max, lang, timeout),
+                        fetch_wikimedia_images(&client, q, max, timeout),
+                    );
+                    (
+                        vec![bing_hits, ddg_hits, wiki_hits],
+                        vec![bing_rep, ddg_rep, wiki_rep],
+                    )
+                }
+            }))
+            .await
+        };
 
         for (lists, reps) in per_query {
             all_lists.extend(lists);
