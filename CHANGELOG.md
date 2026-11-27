@@ -1,5 +1,27 @@
 # Changelog
 
+## [5.6.0] - 2026-11-27
+
+### Added
+
+- **Content-bearing page contract.** The generic contract now requires content, not characters: `min_content_chars` measures body text outside frame chrome (`nav`/`header`/`footer`/`aside`), with `alt`/`aria-label` labels counted, because a navigation frame passes any total-text floor. Instagram's profile, Target's search page and Best Buy's skeleton page all passed the old floor and extracted as nothing; they now fail the document route and take the lane, a public interface, or an honest wall. Outage notices ("this page is currently unavailable") are refused as pages, and image-card `alt` text is emitted as a readable line by the extractor and counted as a content unit by the substance verdict, so a launch calendar or product grid reads instead of scoring as furniture.
+- **First contact is the local browser.** An unseen origin is met as the client this machine is — `chrome-local` on Linux, `chrome-win` on Windows, `safari` on macOS — instead of a self-identifying `donsetch/5.0`. The first request is the one a bot wall judges, and every origin used to be introduced to its wall by the client walls block. The transparent client is still offered, second, and returns to the front on any origin that has earned it through a learned score. Measured on forty vendor-heavy sites with a fresh state: content 25/40 → 31/40, p50 1893 → 1871 ms, no site lost.
+- **The cookies a response hands back are kept.** DataDome hands `datadome` to the 403 that refuses the page and Cloudflare hands `__cf_bm` to its challenge; the jar stored response cookies only when the session persisted, so the one thing the origin offered was dropped and every request looked like a browser that had never been here. Cookies are now stored whether or not the session writes state to disk, and a wall that changed the cookie header is answered once more by the same identity with what it was given — before any other identity and before any program runs.
+- **Akamai Bot Manager behavioral challenges and DataDome interstitials.** Akamai's `sec-if-cpt` page is recognised as a program rather than only a contract wall and its sensor mints the `_abck`/`bm_sz`/`bm_s`/`bm_so` cookie set (measured 1.5 s); DataDome's `var dd=…` interstitial is executed as the class that received it. The challenge host also builds the page's id-named elements, so a vendor program that touches the markup (`document.getElementById('noiframe').parentNode`) runs instead of throwing.
+- **Market splashes and stale search routes.** A store that answers with a geolocated chooser (Best Buy's "Select your Country") is asked with the query pair its own splash links carry (`intl=nosplash`) on the first request, and a 404 that carries a search query is retried once at the origin's own search route (`/search?…`), which is how Sephora's retired `/shop?keyword=` URL reads its results.
+- **Client-rendered shells, deepened.** Inline state now unwraps one-key rows (`{"node": …}`, `{"attributes": …}`), walks Relay's `require…__bbox.result.data.<entity>.<connection>.edges` depth, reads a caption object as the row's text, and refuses a collection of bare labels as navigation; Instagram's profile reads its posts with no V8 in 1.3 s. A shell served to a plain client is retried as the browser class first (a shell is not the same shell to every client), and the lane's ceiling rises to 12 s only when the caller's deadline allows it.
+
+### Fixed
+
+- **A wall is named only where it is real.** A human widget counts only where it is mounted: Pinterest's 1.2 MB bundle loads `gstatic.com/recaptcha` while showing pins, and a string in a program was deciding the whole encounter. Kasada's `kpsdk` and Cloudflare's passive JS detections load on ordinary pages of the sites that use them, so they are a wall only on a small challenge page or a refusal carrying the vendor's request header.
+- **Fusion no longer dresses a side panel as the answer.** A fused payload must carry a sentence, a description or a link, and on a query URL only a collection is eligible, preferring the request whose own URL carries the query — Target's search page was being filled by its satisfaction survey and its store list.
+- **Cloudflare mints last again.** Identity first, always: a 10 s mint fired on the second attempt cost Glassdoor 1.2 s → 9.1 s, where Cloudflare lets a plain or app client through.
+- **A site that says it has nothing is not asked four more times.** When the lane's own document is refused because it is the site's outage notice or a locale gate, the encounter ends there instead of spending three more identities and the caller's deadline on the same notice.
+
+### Performance
+
+- **No regression at the median.** Forty-site median 1893 → 1871 ms and hard-corpus p50 1479 → 1237 ms at 24/28 standing (23/28 before); warm origins stay on the browser class and stay sub-second (iHerb 0.76 s, Ticketmaster 0.65 s). The lane's 12 s ceiling applies only to a shell on a deadline that allows it; an 8 s ceiling and a 3 s bench are unchanged.
+
 ## [5.5.13] - 2026-11-26
 
 ### Added

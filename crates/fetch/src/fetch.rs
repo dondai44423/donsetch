@@ -2253,6 +2253,9 @@ impl Worker {
         // has spent its one cookie retry.
         let mut cookie_retried: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // Identities that have answered once. A reorder for another client class
+        // must not hand the same one a second look.
+        let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut last_wall: Option<crate::classify::Wall> = None;
         // The previous attempt's answer: class, status and body hash.
         let mut last_answer: Option<(Class, u16, u64)> = None;
@@ -2267,6 +2270,7 @@ impl Worker {
             let index = tries;
             tries += 1;
             let name = &name;
+            tried.insert(name.to_string());
             let Some(identity) = identity::lookup(name) else {
                 continue;
             };
@@ -2633,6 +2637,33 @@ impl Worker {
                     spent_state,
                 ) {
                     return outcome;
+                }
+                // The lane's own document was refused because the site says it
+                // has nothing (Target answers its search with "this page is
+                // currently unavailable") or because what it serves is a locale
+                // gate. Every further client is shown the same notice, so the
+                // encounter ends here: four identities and eleven seconds for one
+                // notice is the slowest way to say the site has nothing.
+                let nothing_to_give = attempts.last().is_some_and(|attempt| {
+                    attempt.note.as_deref().is_some_and(|note| {
+                        note.contains("outage notice") || note.contains("gate page")
+                    })
+                });
+                if nothing_to_give {
+                    return answer(
+                        url,
+                        host.clone(),
+                        &response,
+                        Class::Incomplete,
+                        identity.name,
+                        Ended {
+                            started,
+                            first_ms,
+                            attempts,
+                            spent_state,
+                            capture: options.capture_body,
+                        },
+                    );
                 }
             }
 
@@ -3496,7 +3527,8 @@ impl Worker {
             // one more identity — the browser class first — is asked.
             if verdict.class == Class::Shell && !shell_extra && content_tried {
                 if let Some(at) = queue.iter().position(|name| {
-                    identity::lookup(name).is_some_and(|next| next.wire_class() == "chrome")
+                    !tried.contains(name)
+                        && identity::lookup(name).is_some_and(|next| next.wire_class() == "chrome")
                 }) {
                     shell_extra = true;
                     if let Some(moved) = queue.remove(at) {
