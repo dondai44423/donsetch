@@ -507,6 +507,27 @@ fn subtree_visible_non_ws(node: ego_tree::NodeRef<'_, Node>) -> usize {
     count
 }
 
+/// Visible, non-whitespace characters of a document's *content*: its body text
+/// outside frame chrome (nav/header/footer/aside and their roles), with
+/// `<main>`/`<article>`/`role=main` always content and script/style/hidden
+/// subtrees skipped. The measure that separates a page from a navigation frame.
+///
+/// A page whose text is only its chrome (a header, a footer, legal lines) is
+/// what a client-rendered shell looks like before its program runs, and what a
+/// false "content" verdict looks like after it: both are `main_text_chars` here.
+pub fn content_text_chars(doc: &Html) -> usize {
+    let mut out = ShellAssessment::default();
+    match doc.select(&SEL_BODY).next().map(|el| el.id()) {
+        Some(body_id) => {
+            if let Some(body_node) = doc.tree.get(body_id) {
+                walk_body(body_node, false, &mut out);
+            }
+        }
+        None => walk_body(doc.tree.root(), false, &mut out),
+    }
+    out.main_text_chars
+}
+
 fn walk_body(node: ego_tree::NodeRef<'_, Node>, in_chrome: bool, out: &mut ShellAssessment) {
     for child in node.children() {
         match child.value() {
@@ -540,6 +561,18 @@ fn walk_body(node: ego_tree::NodeRef<'_, Node>, in_chrome: bool, out: &mut Shell
                     in_chrome || is_chrome_element(el)
                 };
                 if !child_chrome {
+                    // An image grid's content is its labels: a launch calendar
+                    // or a gallery is pictures with `alt`/`aria-label` text and
+                    // almost no text nodes. Those attributes are what a reader
+                    // (and a screen reader) gets from the page.
+                    for attr in ["alt", "aria-label"] {
+                        if let Some(text) = el.attr(attr) {
+                            let chars = text.trim().chars().filter(|c| !c.is_whitespace()).count();
+                            if chars >= 6 {
+                                out.main_text_chars += chars.min(200);
+                            }
+                        }
+                    }
                     if matches!(tag, "p" | "pre" | "blockquote" | "dd") {
                         let chars = subtree_visible_non_ws(child);
                         if chars >= 70 {
@@ -861,6 +894,16 @@ const NOISE_COLLECTION_KEYS: &[&str] = &[
     "timezones",
     "icons",
     "themes",
+    "breadcrumbs",
+    "breadcrumb",
+    "breadcrumblist",
+    "nav",
+    "navbar",
+    "navigation",
+    "menu",
+    "megamenu",
+    "sitemap",
+    "sitelinks",
 ];
 
 fn is_noise_path(path: &[String]) -> bool {
@@ -903,6 +946,16 @@ fn render_inline_candidate(
         }
         let rows = extract_collection_rows(elements, page_url);
         if rows.len() < 3 {
+            continue;
+        }
+        // A menu is a list of labels; a page's rows point somewhere or say
+        // something. A collection whose rows are bare names is the site's
+        // navigation shipped as JSON, and materializing it hides the page.
+        let informative = rows
+            .iter()
+            .filter(|(_, detail, url)| url.is_some() || !detail.is_empty())
+            .count();
+        if informative * 2 < rows.len() {
             continue;
         }
         let total_chars: usize = rows
@@ -1054,7 +1107,11 @@ fn collect_object_arrays(
     path: &mut Vec<String>,
     out: &mut Vec<(Vec<String>, Vec<Value>)>,
 ) {
-    if path.len() > 8 {
+    // Relay and Apollo deliver a page's rows behind a wrapper chain
+    // (`require…__bbox.result.data.<entity>.<connection>.edges`), which runs
+    // deeper than a plain application's payload. The cap is a guard against
+    // pathological nesting, not a statement about how sites shape their JSON.
+    if path.len() > 24 {
         return;
     }
     match value {
@@ -1141,6 +1198,37 @@ fn collect_normalized_entity_maps(
     }
 }
 
+/// A row's text field: a string, or the `text` of an object (GraphQL shipping a
+/// caption or a description as `{text: "…"}` is the same fact in another shape).
+fn row_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Object(map) => ["text", "title", "name", "content"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            .map(|text| text.trim().to_string()),
+        _ => None,
+    }
+    .filter(|text: &String| !text.is_empty())
+}
+
+/// The object a collection row really is. A row is often wrapped in exactly one
+/// object-valued key (`node`, `data`, `attributes`, `fields`); the row is inside
+/// it. Only a wrapper with no title/detail key of its own is unwrapped, so a
+/// real row that happens to carry a `data` field keeps its own fields.
+fn unwrap_row<'a>(obj: &'a serde_json::Map<String, Value>) -> &'a serde_json::Map<String, Value> {
+    const WRAPPERS: &[&str] = &["node", "item", "attributes", "fields", "entity", "record"];
+    for key in WRAPPERS {
+        let Some(inner) = obj.get(*key).and_then(Value::as_object) else {
+            continue;
+        };
+        if inner.get("title").is_some() || inner.get("name").is_some() {
+            return inner;
+        }
+    }
+    obj
+}
+
 fn extract_collection_rows(elements: &[Value], page_url: &str) -> Vec<CollectionRow> {
     const TITLE_KEYS: &[&str] = &[
         "title",
@@ -1151,6 +1239,10 @@ fn extract_collection_rows(elements: &[Value], page_url: &str) -> Vec<Collection
         "display_name",
         "subject",
         "question",
+        // A post's own words are its title when it has none: Instagram and
+        // Mastodon ship `caption`/`content` and nothing else.
+        "caption",
+        "content",
     ];
     const DETAIL_KEYS: &[&str] = &[
         "departmentName",
@@ -1168,6 +1260,7 @@ fn extract_collection_rows(elements: &[Value], page_url: &str) -> Vec<Collection
         "department",
         "author",
         "version",
+        "accessibility_caption",
     ];
     const URL_KEYS: &[&str] = &[
         "url",
@@ -1181,6 +1274,9 @@ fn extract_collection_rows(elements: &[Value], page_url: &str) -> Vec<Collection
         "link",
         "path",
         "slug",
+        "seo_canonical_url",
+        "canonical_url",
+        "permalink_url",
     ];
 
     let mut seen_urls = BTreeSet::new();
@@ -1189,11 +1285,16 @@ fn extract_collection_rows(elements: &[Value], page_url: &str) -> Vec<Collection
         let Some(obj) = el.as_object() else {
             continue;
         };
+        // GraphQL, Relay and JSON:API wrap each row in one object-valued key
+        // (`{"edges":[{"node":{…}}]}`, `{"data":[{…}]}`, `{"attributes":{…}}`).
+        // The row is what is inside the wrapper; unwrapping it is what lets a
+        // profile's posts be read from the app's own inline state.
+        let obj = unwrap_row(obj);
         let title = TITLE_KEYS
             .iter()
-            .find_map(|k| obj.get(*k).and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|s| s.len() >= 2 && s.len() <= 240 && !s.starts_with("http"));
+            .find_map(|k| obj.get(*k).and_then(row_text))
+            .map(|s| s.chars().take(240).collect::<String>())
+            .filter(|s: &String| s.len() >= 2 && !s.starts_with("http"));
         let Some(title) = title else {
             continue;
         };

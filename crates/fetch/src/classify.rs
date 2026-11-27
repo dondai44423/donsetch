@@ -230,6 +230,29 @@ const REFUSALS: &[&str] = &[
     "too many requests",
 ];
 
+/// A page of at most this much markup is an interstitial: a challenge page
+/// carries its widget and almost nothing else.
+const INTERSTITIAL_MAX_BYTES: usize = 64 * 1024;
+
+/// Is a human-widget vendor's widget actually placed on this page? The element
+/// a site embeds (`g-recaptcha`, `h-captcha`, `cf-turnstile` on a tag, or a
+/// `data-sitekey` beside one) is proof; a challenge page's own small size is
+/// the other. A vendor script referenced by a large application bundle is
+/// neither: those bundles load every widget they might ever show.
+fn widget_mounted(body: &str, lower: &str) -> bool {
+    let element = ["g-recaptcha", "h-captcha", "cf-turnstile", "data-sitekey"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    if element {
+        return true;
+    }
+    if body.len() > INTERSTITIAL_MAX_BYTES {
+        return false;
+    }
+    // A small page that names the widget's script is the widget's own page.
+    lower.contains("<script") && text_chars(lower) < 1_500
+}
+
 pub struct Evidence<'a> {
     pub status: u16,
     pub body: &'a str,
@@ -392,6 +415,31 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
         if let Some(marker) = signature.markers.iter().find(|marker| {
             let m_low = marker.to_ascii_lowercase();
             if !lower.contains(&m_low) {
+                return false;
+            }
+            // A human widget decides a page only where the widget is *on* the
+            // page. Pinterest's search application is 1.2 MB of bundle that
+            // loads `gstatic.com/recaptcha` from its own loader while showing
+            // pins: a string in a program is not a check. The widget counts
+            // when its element is in the markup, or when the page is small
+            // enough to be the interstitial the widget sits in.
+            if matches!(signature.vendor, "turnstile" | "recaptcha" | "hcaptcha")
+                && !widget_mounted(&evidence.body, &lower)
+            {
+                return false;
+            }
+            // Kasada's sensor loads on every page of the sites that use it, the
+            // way Cloudflare's passive detections do: a 2xx application page
+            // that ships `kpsdk` is serving its content, not asking for a
+            // program. The vendor's challenge is a small page of its own (or a
+            // refusal carrying its request header).
+            if signature.vendor == "kasada"
+                && !evidence
+                    .headers
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case("x-kpsdk-ct"))
+                && evidence.body.len() > INTERSTITIAL_MAX_BYTES
+            {
                 return false;
             }
             // Cloudflare injects passive JS Detections (`/cdn-cgi/challenge-platform/scripts/jsd/`)

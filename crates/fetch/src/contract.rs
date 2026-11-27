@@ -26,6 +26,13 @@ pub struct Contract {
     pub text_contains: Option<Vec<String>>,
     #[serde(default)]
     pub min_text_chars: Option<usize>,
+    /// The floor on *content* text: visible characters of the body outside
+    /// frame chrome (nav/header/footer/aside). A page whose characters are all
+    /// its navigation, legal lines and footer passes any total-text floor while
+    /// carrying nothing a reader came for — the shape of a client-rendered
+    /// shell and of a mis-served refusal. Set by the generic contract.
+    #[serde(default)]
+    pub min_content_chars: Option<usize>,
     #[serde(default)]
     pub selectors: Option<Vec<SelectorRule>>,
     #[serde(default)]
@@ -164,6 +171,17 @@ const GATE_TEXT: &[&str] = &[
     "enablejs",
 ];
 
+/// The site's own outage apology, standing where the document should be. A page
+/// that says it has nothing is not content, whatever its length.
+const OUTAGE_PHRASES: &[&str] = &[
+    "this page is currently unavailable",
+    "this page is temporarily unavailable",
+    "we're sorry! this page",
+    "this page isn't available",
+    "this page is not available",
+    "the page you requested is unavailable",
+];
+
 /// Currency names a locale picker prints beside its countries. Word matches
 /// only: `sol` is not `solution`.
 const CURRENCY_NAMES: &[&str] = &[
@@ -294,6 +312,11 @@ impl Contract {
             title_contains: None,
             text_contains: None,
             min_text_chars: Some(200),
+            // The total-text floor is not enough: Instagram's profile page and
+            // Target's search page carry a thousand characters of navigation and
+            // legal lines around an empty content area, and pass any floor that
+            // counts them. The content floor is what makes the page honest.
+            min_content_chars: Some(200),
             selectors: None,
             allowed_origins: None,
             refuse_human_asks: true,
@@ -407,6 +430,15 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
             failures.push(format!("text {} < {minimum}", text.chars().count()));
         }
     }
+    if let Some(minimum) = contract.min_content_chars {
+        // The content measure walks the parsed tree once, counting only text a
+        // reader came for. It is asked for by contracts that need it (the
+        // generic one), never computed for every verification.
+        let content = crate::hydrate::content_text_chars(&document);
+        if content < minimum {
+            failures.push(format!("content text {content} < {minimum}"));
+        }
+    }
     if contract.refuse_human_asks && text.chars().count() <= HUMAN_ASK_TEXT_MAX {
         let seen = fold_quotes(&format!("{title} {text}").to_lowercase());
         if let Some(phrase) = crate::classify::ASKS_HUMAN
@@ -434,6 +466,20 @@ pub fn verify(body: &str, final_url: &str, contract: &Contract) -> Content {
     // any contract, so the gate check is unconditional.
     if let Some(gate) = gate_page(&title, &text) {
         failures.push(format!("gate page: {gate}"));
+    }
+    // The site's own outage apology standing where the document should be
+    // (Target's search grid answering "We're sorry! This page is currently
+    // unavailable"): an outage served as a 200 is not the content the caller
+    // asked for, and a scripted application that renders it has not succeeded.
+    // Short pages only: an article may quote the sentence.
+    if text.chars().count() <= HUMAN_ASK_TEXT_MAX {
+        let folded = fold_quotes(&text.to_lowercase());
+        if let Some(phrase) = OUTAGE_PHRASES
+            .iter()
+            .find(|phrase| folded.contains(**phrase))
+        {
+            failures.push(format!("outage notice: {phrase:?}"));
+        }
     }
     if let Some(rules) = &contract.selectors {
         for rule in rules {

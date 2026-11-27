@@ -635,9 +635,19 @@ static SCRIPTS_REQUIRED: LazyLock<Regex> = LazyLock::new(|| {
 /// Error, region-block and challenge notices.
 static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\btry again\b|\b(resource|page|file) not found\b|something went wrong|an error (has )?occurred|error occurred|isn.t available|is not available|could not be (found|loaded)|couldn.t (be )?(found|load)|no longer available|\boops\b|checking your browser|verify you are (a )?human|verifying you are (a )?human|are you a robot|unusual traffic|access denied|press (&|and) hold|complete the security check|attention required|one more step|this process is automatic|redirect to your requested content",
+        r"(?i)\btry again\b|\b(resource|page|file) not found\b|something went wrong|an error (has )?occurred|error occurred|isn.t available|is not available|(currently|temporarily) unavailable|could not be (found|loaded)|couldn.t (be )?(found|load)|no longer available|\boops\b|checking your browser|verify you are (a )?human|verifying you are (a )?human|are you a robot|unusual traffic|access denied|press (&|and) hold|complete the security check|attention required|one more step|this process is automatic|redirect to your requested content",
     )
     .expect("notice pattern")
+});
+
+/// A headline that is the site's own outage notice ("We're sorry! This page is
+/// currently unavailable", an apology over a 2xx). The page under it is the
+/// notice: an outage served as a 200 is not the content the caller asked for.
+static OUTAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(page|site|service|content|product)s? (is |are )?(currently|temporarily) unavailable|we.re sorry|couldn.t load|can.t load|can not load|isn.t loading",
+    )
+    .expect("outage pattern")
 });
 
 /// A headline that refuses the reader's browser: it addresses that browser
@@ -1055,6 +1065,18 @@ fn walk(doc: &Html) -> Walk {
                     }
                     if name == "pre" {
                         ctx.pre = true;
+                    }
+                    // An image's label is text a reader gets from the page: a
+                    // launch calendar, a gallery or a product grid is pictures
+                    // with `alt` text and no prose. Without it such a page reads
+                    // as a navigation frame and its content is thrown away.
+                    if name == "img"
+                        && let Some(alt) = el
+                            .attr("alt")
+                            .map(str::trim)
+                            .filter(|alt| alt.chars().count() >= 8)
+                    {
+                        b.push(alt, ctx);
                     }
                     if name == "tr" {
                         ctx.row = next_id;
@@ -1595,7 +1617,12 @@ pub fn assess(doc: &Html, url: &str) -> Page {
             }
             refusal = !past_headline
                 && headline.as_ref().is_some_and(|(_, t)| {
-                    REFUSAL.is_match(t) || AGE_GATE.is_match(t) || CHECK.is_match(t)
+                    REFUSAL.is_match(t)
+                        || AGE_GATE.is_match(t)
+                        || CHECK.is_match(t)
+                        // The site's own outage apology standing where the
+                        // content should be.
+                        || OUTAGE.is_match(t)
                 });
             if !past_headline {
                 headline_units.push(kinds.len());
@@ -1705,6 +1732,13 @@ pub fn assess(doc: &Html, url: &str) -> Page {
         || w.script_chars >= text_chars.max(1) * 5
         || (w.bundle_scripts && text_chars == 0);
     let authform = w.units.iter().any(|u| u.ctx.authform);
+    // An outage apology near the top of the page is the page, even when it is
+    // not set as a heading: the site is telling the reader it has nothing.
+    let outage = w
+        .units
+        .iter()
+        .take(3)
+        .any(|unit| OUTAGE.is_match(&unit.text));
 
     let notice = refusal_headline
         .as_deref()
@@ -1719,7 +1753,7 @@ pub fn assess(doc: &Html, url: &str) -> Page {
 
     let verdict = if w.units.is_empty() && noscript_text.is_empty() {
         Verdict::Empty
-    } else if refusal_headline.is_some() && substance == 0 {
+    } else if (refusal_headline.is_some() && substance == 0) || (outage && sentences + data < 6) {
         // The headline says what the page is (a bot check, an access or
         // browser refusal, an age gate), whatever sign-in links its frame
         // carries.

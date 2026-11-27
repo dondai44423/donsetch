@@ -2294,6 +2294,25 @@ pub fn is_reddit_page(html: &str) -> bool {
     html.contains("jsc_token")
 }
 
+/// Akamai Bot Manager's behavioral challenge: a small page whose whole content is
+/// the sensor program (`sec-if-cpt` / `cp_challenge`), served instead of the page
+/// to a browser class Akamai doubts. Running it mints `_abck` (measured: 1.5 s,
+/// Sephora's search page, 2026-11-27).
+pub fn is_akamai_page(html: &str) -> bool {
+    html.contains("sec-if-cpt")
+        || html.contains("/_sec/cp_challenge/")
+        || (html.contains("_abck") && html.contains("bm-verify"))
+}
+
+/// DataDome's interstitial: the page is `var dd = {…}` plus the tag that spends
+/// it. Its slider captcha is a different page (and a human step): only the
+/// interstitial is a program to run.
+pub fn is_datadome_page(html: &str) -> bool {
+    let interstitial = html.contains("captcha-delivery.com/i.js")
+        || (html.contains("var dd=") && html.contains("captcha-delivery.com"));
+    interstitial && !html.contains("px-captcha")
+}
+
 #[cfg(test)]
 mod host_source_tests {
     #[test]

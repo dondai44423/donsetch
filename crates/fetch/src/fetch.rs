@@ -934,10 +934,17 @@ impl Worker {
         }
         let mut limits = options.content.clone();
         // The ceiling is not a delay: a lane that finishes quiescent stops at
-        // once, and a lane that needs a moment past the 5 s default (an app's
-        // last data request) is not cut at the boundary. The encounter's own
-        // budget still wins.
-        limits.wall = limits.wall.max(Duration::from_secs(8)).min(remaining);
+        // once. The default 8 s is a *challenge* page's ceiling; a heavy
+        // application (Best Buy's search grid, a commerce SPA) needs longer to
+        // settle, and a caller that allows 20 s for the read has the time. A
+        // short deadline keeps the short ceiling, so a bench's 3 s still ends at
+        // 3 s and the fast path never pays for this.
+        let heavy = if remaining >= Duration::from_secs(13) {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(8)
+        };
+        limits.wall = limits.wall.max(heavy).min(remaining);
         let cookie = self.state.cookie_header_for(&response.url, identity.name);
         let mut lane = match crate::engine::content_within_via_policy(
             &limits,
@@ -1103,6 +1110,16 @@ impl Worker {
             }
         }
         let lane_ms = lane.ms.max(lane_started.elapsed().as_secs_f64() * 1000.0);
+        if std::env::var("V5_ENGINE_LOG").is_ok() {
+            for entry in &lane.transcript {
+                eprintln!(
+                    "[engine] transcript {} {} {}B",
+                    entry.status,
+                    entry.url,
+                    entry.body.as_deref().map(str::len).unwrap_or(0)
+                );
+            }
+        }
         // What the program stored is the identity's own state, bound to it.
         self.state
             .store_cookies(host, identity.name, lane.cookies.clone());
@@ -1525,6 +1542,37 @@ impl Worker {
             self.guard_key = WireGuardKey::None;
         }
         let outcome = self.through_cache(url, options);
+        // A stale search URL: the site moved its search page and answers the old
+        // one with a 404 (Sephora's `/shop?keyword=…` → `/error/404`). Every
+        // searchable site names its search route the same way, and the query the
+        // caller asked for goes with it; one request to that route is the
+        // caller's question, asked the way the site now spells it. The first
+        // answer stands unless the second is content.
+        let mut outcome = outcome;
+        if let Some(next) = search_route(url, &outcome) {
+            let spent = std::time::Duration::from_secs_f64(outcome.ms_total.max(0.0) / 1000.0);
+            let mut second_options = options.clone();
+            second_options.deadline = options.deadline.saturating_sub(spent);
+            if second_options.deadline.as_millis() >= 800 {
+                let mut second = self.through_cache(&next, &second_options);
+                second.ms_total += outcome.ms_total;
+                second.evidence.insert(
+                    0,
+                    format!(
+                        "search route: the named URL answers {}; the origin's own search route was asked",
+                        outcome.status
+                    ),
+                );
+                if second.class == Class::Content {
+                    outcome = second;
+                } else {
+                    outcome.evidence.insert(
+                        0,
+                        format!("search route: {next} answered {}", second.status),
+                    );
+                }
+            }
+        }
         self.release();
         self.pending = None;
         self.captured = None;
@@ -2087,6 +2135,12 @@ impl Worker {
             }
         };
         let host = parsed.host_str().unwrap_or_default().to_string();
+        // A store that answers with a market chooser instead of the page is
+        // asked the way its own splash page says to stay, from the first
+        // request: the pair costs no hop, and the page it unlocks is the one
+        // the caller asked for.
+        let market = crate::splash::apply(&host, url);
+        let url = market.as_deref().unwrap_or(url);
         let prior = identity::names();
         let order = match &options.identity {
             Some(forced) => vec![forced.clone()],
@@ -2111,13 +2165,19 @@ impl Worker {
             .get(&host)
             .and_then(|state| state.wall_vendor.clone());
         let vendor_passable = remembered_vendor
-            .map(|vendor| !self.state.vendor_order(&vendor).is_empty())
+            .as_ref()
+            .map(|vendor| !self.state.vendor_order(vendor).is_empty())
             .unwrap_or(false);
         // An HTTP error is about the URL that drew it (an agent's guessed path
         // that 404s), not the client: it does not shrink what the next URL on
         // this origin may try. An error answer still ends its own encounter.
         let budget = match remembered.as_deref() {
             Some("wall_interaction") if !vendor_passable => 1,
+            // A Cloudflare program wall is answered by an identity *or* by the
+            // engine's mint, and the mint needs a turn after the classes that
+            // carry its payload were challenged: measured, Crunchbase passes as
+            // firefox and as okhttp while every Chrome class is challenged.
+            Some("wall_program") if remembered_vendor.as_deref() == Some("cloudflare") => 3,
             Some(_) => 2,
             None => options.max_tries,
         };
@@ -2187,6 +2247,8 @@ impl Worker {
         let mut tries = 0usize;
         // One interaction wall is spent before the encounter stops on it.
         let mut interaction_asked = false;
+        // A shell has been retried once as another client class.
+        let mut shell_extra = false;
         let mut last_wall: Option<crate::classify::Wall> = None;
         // The previous attempt's answer: class, status and body hash.
         let mut last_answer: Option<(Class, u16, u64)> = None;
@@ -2361,10 +2423,26 @@ impl Worker {
                             // handshake (badssl.com: 0.3 s RTT, 1.1 s TLS), not a
                             // server that heard the request and went silent.
                             stalled |= error.starts_with("timeout:") && !connect_phase(&error);
-                            let fresh = queue.iter().position(|name| {
-                                identity::lookup(name)
-                                    .is_some_and(|next| !failed_wires.contains(&next.wire_class()))
-                            });
+                            // The next identifier is asked on another wire class.
+                            // Among the classes still left, the reference browser
+                            // goes first: an edge that resets a stream for a plain
+                            // or OkHttp client (Best Buy's Akamai) serves the
+                            // browser class the page it was asked for.
+                            let fresh = queue
+                                .iter()
+                                .position(|name| {
+                                    identity::lookup(name).is_some_and(|next| {
+                                        !failed_wires.contains(&next.wire_class())
+                                            && next.wire_class() == "chrome"
+                                    })
+                                })
+                                .or_else(|| {
+                                    queue.iter().position(|name| {
+                                        identity::lookup(name).is_some_and(|next| {
+                                            !failed_wires.contains(&next.wire_class())
+                                        })
+                                    })
+                                });
                             match fresh {
                                 Some(at) => {
                                     if let Some(moved) = queue.remove(at) {
@@ -2517,6 +2595,26 @@ impl Worker {
                 && !content_tried
                 && (200..300).contains(&response.status)
             {
+                // The lane runs the document's own program as the client it was
+                // served to, and a shell served to a plain client is often a
+                // different shell: Instagram hands a plain client an empty frame
+                // and the browser class the profile with its posts inline. A
+                // browser class still in the queue is asked first, and the lane
+                // then runs on that document, as that identity.
+                if identity.family == identity::Family::Plain
+                    && !shell_extra
+                    && tries < budget.max(1)
+                {
+                    if let Some(at) = queue.iter().position(|name| {
+                        identity::lookup(name).is_some_and(|next| next.wire_class() == "chrome")
+                    }) {
+                        shell_extra = true;
+                        if let Some(moved) = queue.remove(at) {
+                            queue.push_front(moved);
+                        }
+                        continue;
+                    }
+                }
                 content_tried = true;
                 if let Some(outcome) = self.content_lane(
                     url,
@@ -2834,12 +2932,27 @@ impl Worker {
                 }
             }
 
-            // AWS WAF decides on the client class: a plain client is served a
-            // different page than a browser. Ask as the Chrome class first, then
-            // run the site's own program in our process. One mint per encounter;
-            // the credential is bound to the identity that minted it, and only
-            // what the server accepts counts.
-            if (verdict.class == Class::WallProgram || credential_refused) && !engine_tried {
+            // The site's own program, when the wall is one: AWS WAF decides on
+            // the client class (ask as Chrome, then mint), Cloudflare serves its
+            // managed challenge as a page of its own, Reddit ships a token form,
+            // and a DataDome interstitial is a small page whose whole content is
+            // the script that mints its cookie. One mint per encounter; the
+            // credential binds to the identity that minted it, and only what the
+            // server accepts counts.
+            let program_page = verdict.class == Class::WallProgram
+                || credential_refused
+                || (verdict.class == Class::WallInteraction
+                    && crate::engine::is_datadome_page(&response.body))
+                // An Akamai behavioral challenge is served as a *contract* page
+                // (`x-amzn`-less, `sec-if-cpt`): the sensor program is the page's
+                // whole content, and running it mints `_abck`.
+                || (verdict.class == Class::WallContract
+                    && verdict
+                        .wall
+                        .as_ref()
+                        .is_some_and(|wall| wall.vendor == "akamai")
+                    && crate::engine::is_akamai_page(&response.body));
+            if program_page && !engine_tried {
                 engine_tried = true;
                 // Which vendor's program is this? AWS WAF decides by client class;
                 // Cloudflare serves its managed challenge as a page of its own.
@@ -2858,15 +2971,16 @@ impl Worker {
                     .as_ref()
                     .map(|wall| wall.vendor == "cloudflare")
                     .unwrap_or(false)
-                    && tries >= budget
+                    && tries >= budget.min(2)
                     && crate::engine::is_cloudflare_page(&response.body)
                 {
                     // Cloudflare serves the challenge payload only to a client
                     // class it means to challenge: a header alone (`cf-mitigated`
                     // on an empty 403) names the wall but carries no program, and
                     // identity selection is what answers that. The engine runs
-                    // only on a page that holds the program, and only on the last
-                    // attempt the encounter allows — identity first, always.
+                    // only on a page that holds the program, and after the
+                    // classes that were offered it have answered — identity
+                    // first, always.
                     Some("cloudflare")
                 } else if crate::engine::is_reddit_page(&response.body) && response.status != 429 {
                     // Reddit's gate is served to every class that is not a
@@ -2878,6 +2992,20 @@ impl Worker {
                     // A 429 is the origin asking for time, not a program: it is
                     // paced, never minted on.
                     Some("reddit")
+                } else if crate::engine::is_datadome_page(&response.body) && response.status != 429
+                {
+                    // DataDome's interstitial is `var dd = {…}` plus the script
+                    // that spends it: the page's whole content is the program
+                    // that mints the `datadome` cookie. The first wall is the
+                    // right time -- the answer is the client's own fingerprint,
+                    // which the identity that received it already carries.
+                    Some("datadome")
+                } else if crate::engine::is_akamai_page(&response.body) && response.status != 429 {
+                    // Akamai's behavioral challenge: the page is the sensor
+                    // program, and running it is what mints `_abck`. It is run as
+                    // the class that was challenged -- the sensor's verdict is
+                    // about that class's own surfaces.
+                    Some("akamai")
                 } else {
                     None
                 };
@@ -3330,6 +3458,21 @@ impl Worker {
             );
             let identity_blind = verdict.wall.is_none() && last_answer == Some(shown);
             last_answer = Some(shown);
+            // A client-rendered shell is not the same shell to every client:
+            // Instagram serves a plain client an empty frame and the browser
+            // class the profile with its posts inline. Before the shell is final,
+            // one more identity — the browser class first — is asked.
+            if verdict.class == Class::Shell && !shell_extra && content_tried {
+                if let Some(at) = queue.iter().position(|name| {
+                    identity::lookup(name).is_some_and(|next| next.wire_class() == "chrome")
+                }) {
+                    shell_extra = true;
+                    if let Some(moved) = queue.remove(at) {
+                        queue.push_front(moved);
+                    }
+                    continue;
+                }
+            }
             if interaction_final
                 || told_to_wait
                 || identity_blind
@@ -3572,8 +3715,47 @@ fn is_program_page(vendor: &str, body: &str) -> bool {
     match vendor {
         "cloudflare" => crate::engine::is_cloudflare_page(body),
         "reddit" => crate::engine::is_reddit_page(body),
+        "datadome" => crate::engine::is_datadome_page(body),
+        "akamai" => crate::engine::is_akamai_page(body),
         _ => crate::engine::is_aws_waf_page(body),
     }
+}
+
+/// The origin's own search route for a URL that answers 404 while carrying a
+/// search query: `/search`, with the caller's query kept. Every searchable site
+/// spells its search page that way; an origin that does not answer there is
+/// asked nothing more, and the caller keeps the honest 404.
+fn search_route(url: &str, outcome: &Outcome) -> Option<String> {
+    if outcome.status != 404 {
+        return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.path().eq_ignore_ascii_case("/search") {
+        return None;
+    }
+    const SEARCH_KEYS: &[&str] = &[
+        "q",
+        "query",
+        "keyword",
+        "keywords",
+        "search",
+        "searchterm",
+        "term",
+        "terms",
+        "k",
+        "s",
+        "st",
+        "text",
+    ];
+    let asked = parsed
+        .query_pairs()
+        .any(|(name, _)| SEARCH_KEYS.iter().any(|key| name.eq_ignore_ascii_case(key)));
+    if !asked {
+        return None;
+    }
+    let mut target = parsed;
+    target.set_path("/search");
+    Some(target.to_string())
 }
 
 /// Two spellings of one URL (the wire may normalise what it was given).

@@ -51,15 +51,22 @@ pub fn fuse_dom_and_transcript(
 
     // 2. Score individual transcript responses (OpenAPI, HTML fragment, Entity JSON, Collection JSON).
     let mut best: Option<(usize, String, String, String)> = None;
+    // Every usable candidate, so a payload that does not answer the URL's own
+    // question can be passed over for one that does.
+    let mut candidates: Vec<(usize, String, String, String)> = Vec::new();
+    // The request each candidate came from: its own URL says which question it
+    // answered.
+    let mut request_urls: Vec<String> = Vec::new();
     let mut combined_sections: Vec<String> = Vec::new();
     let mut combined_title = String::new();
 
     for entry in &data_entries {
         let body = entry.body.as_deref().unwrap_or_default().trim();
         if let Ok(json) = serde_json::from_str::<Value>(body) {
-            if let Some((score, title, html, note)) = synthesize_openapi(&json, &entry.url)
+            if let Some(scored) = synthesize_openapi(&json, &entry.url)
                 .or_else(|| synthesize_json_payload(&json, &entry.url, page_url))
             {
+                let (score, title, html, note) = scored;
                 if score >= 250 {
                     if combined_title.is_empty() && !title.is_empty() {
                         combined_title = title.clone();
@@ -69,8 +76,10 @@ pub fn fuse_dom_and_transcript(
                     }
                 }
                 if best.as_ref().is_none_or(|(b, _, _, _)| score > *b) {
-                    best = Some((score, title, html, note));
+                    best = Some((score, title.clone(), html.clone(), note.clone()));
                 }
+                candidates.push((score, title, html, note));
+                request_urls.push(entry.url.clone());
             }
         } else if looks_like_html_fragment(body) {
             let text_len = visible_fragment_chars(body);
@@ -79,8 +88,10 @@ pub fn fuse_dom_and_transcript(
                 let title = extract_first_heading(body).unwrap_or_default();
                 let note = "synthesized html fragment from wire transcript".to_string();
                 if best.as_ref().is_none_or(|(b, _, _, _)| score > *b) {
-                    best = Some((score, title, body.to_string(), note));
+                    best = Some((score, title.clone(), body.to_string(), note.clone()));
                 }
+                candidates.push((score, title, body.to_string(), note));
+                request_urls.push(entry.url.clone());
             }
         } else if body.len() >= 250 && (body.starts_with("# ") || body.contains("\n## ")) {
             let rendered = render_markdown_to_html(body, page_url);
@@ -93,8 +104,10 @@ pub fn fuse_dom_and_transcript(
                 .to_string();
             let note = "synthesized markdown document from wire transcript".to_string();
             if best.as_ref().is_none_or(|(b, _, _, _)| score > *b) {
-                best = Some((score, title, rendered, note));
+                best = Some((score, title.clone(), rendered.clone(), note.clone()));
             }
+            candidates.push((score, title, rendered, note));
+            request_urls.push(entry.url.clone());
         }
     }
 
@@ -102,6 +115,65 @@ pub fn fuse_dom_and_transcript(
     if score < 180 {
         return None;
     }
+    // The answer must answer the question. When the caller's URL carries a
+    // query, a fused payload that never mentions it is a different question
+    // answered well — Target's search page fetched its store list and delivery
+    // options alongside the products, and the store list scored higher. If any
+    // candidate mentions a term, only those are eligible.
+    let terms = url_terms(page_url);
+    let primary_html = if terms.is_empty() {
+        primary_html
+    } else {
+        // A search page's answer is a list. A single entity beside it (a survey
+        // panel, a delivery widget) is a different question answered well, and
+        // when no collection answered at all the honest outcome is the page
+        // without a fused section, not the widget dressed as the results.
+        let collections: Vec<&(usize, String, String, String)> = candidates
+            .iter()
+            .filter(|(_, _, _, note)| note.contains(" items from wire transcript"))
+            .collect();
+        if collections.is_empty() {
+            return None;
+        }
+        let mentions = |html: &str| {
+            let lower = html.to_ascii_lowercase();
+            terms.iter().any(|term| lower.contains(term.as_str()))
+        };
+        // The request that asked the question names it too: Target's product
+        // list comes from a request whose own URL carries `keyword=headphones`,
+        // while the side panel's survey does not. Prefer that, then the body.
+        let asked_in_url = collections
+            .iter()
+            .zip(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, _, note))| note.contains(" items from wire transcript"))
+                    .map(|(index, _)| index),
+            )
+            .filter_map(|((score, _, html, _), index)| {
+                let url = request_urls.get(index)?;
+                (*score >= 180
+                    && terms
+                        .iter()
+                        .any(|term| url.to_ascii_lowercase().contains(term)))
+                .then(|| html.clone())
+            })
+            .next();
+        match asked_in_url {
+            Some(html) => html,
+            None => {
+                let asked = collections
+                    .iter()
+                    .filter(|(score, _, html, _)| *score >= 180 && mentions(html))
+                    .max_by_key(|(score, _, _, _)| *score);
+                match asked {
+                    Some((_, _, html, _)) if !mentions(&primary_html) => html.clone(),
+                    _ => primary_html,
+                }
+            }
+        }
+    };
     let section_html = if combined_sections.len() > 1 {
         combined_sections.join("\n")
     } else {
@@ -113,6 +185,27 @@ pub fn fuse_dom_and_transcript(
         combined_title
     };
     build_fused(dom_html, page_url, &final_title, &section_html, note)
+}
+
+/// The words a page URL asks about: the values of its query parameters, split
+/// into words of three characters or more, lowercased. A search URL's terms are
+/// the question the page answers.
+fn url_terms(page_url: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(page_url) else {
+        return Vec::new();
+    };
+    let mut terms: Vec<String> = Vec::new();
+    for (_, value) in parsed.query_pairs() {
+        for word in value.split(|c: char| !c.is_alphanumeric()) {
+            let word = word.trim().to_ascii_lowercase();
+            if word.chars().count() >= 3 {
+                terms.push(word);
+            }
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn build_fused(
@@ -384,6 +477,62 @@ fn synthesize_openapi(json: &Value, source_url: &str) -> Option<(usize, String, 
     ))
 }
 
+/// Do these records carry something a reader reads? A row is information when it
+/// names something *and* says something about it: a sentence, a description, a
+/// link. Form schemas, field enumerations and status lists name their fields and
+/// nothing else — fusing one wraps a page in its own scaffolding, which is how
+/// Target's search page became a list of input types.
+fn records_carry_content(items: &[Value]) -> bool {
+    let mut named = 0usize;
+    let mut substantive = 0usize;
+    for item in items.iter().filter_map(Value::as_object) {
+        // The row inside a one-key wrapper (`{"node": {...}}`).
+        let row = ["node", "item", "attributes", "fields", "entity", "record"]
+            .iter()
+            .find_map(|key| item.get(*key).and_then(Value::as_object))
+            .filter(|inner| {
+                inner.get("title").is_some()
+                    || inner.get("name").is_some()
+                    || inner.get("content").is_some()
+            })
+            .unwrap_or(item);
+        let mut has_name = false;
+        let mut has_substance = false;
+        for value in row.values() {
+            match value {
+                Value::String(text) => {
+                    let text = text.trim();
+                    if text.is_empty() || text.len() > 4_000 {
+                        continue;
+                    }
+                    has_name = true;
+                    // A sentence, a description or a link is content; a bare
+                    // identifier, a colour or a field type is not.
+                    if text.chars().count() >= 24 || text.starts_with("http") {
+                        has_substance = true;
+                    }
+                }
+                Value::Array(inner) => {
+                    if inner.iter().filter_map(Value::as_str).any(|text| {
+                        text.trim().chars().count() >= 24 || text.trim().starts_with("http")
+                    }) {
+                        has_substance = true;
+                        has_name = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_name {
+            named += 1;
+            if has_substance {
+                substantive += 1;
+            }
+        }
+    }
+    named >= 3 && substantive * 2 >= named
+}
+
 /// Whether a JSON object carries a page: a named field, a nested structure, or
 /// enough prose. A flat map of metrics (a WAF quota reply) does not.
 fn page_like_object(map: &serde_json::Map<String, Value>) -> bool {
@@ -434,18 +583,12 @@ pub fn synthesize_json_payload(
             .iter()
             .filter_map(Value::as_object)
             .any(page_like_object);
-        let text_volume: usize = items
-            .iter()
-            .filter_map(Value::as_object)
-            .flat_map(|item| item.values())
-            .filter_map(Value::as_str)
-            .map(|value| value.trim().chars().count())
-            .sum();
-        let _ = text_volume;
         // A collection is a page through its fields (title/name/description/
         // content), never through its size: five WAF quota rows are still five
-        // rows of ids and counters.
-        if !named {
+        // rows of ids and counters. It is also not a page through its field
+        // *names*: a form schema names its inputs (`textArea`, `select`) and
+        // fuses as scaffolding around a page that is already there.
+        if !named || !records_carry_content(items) {
             return None;
         }
         return render_json_array(items, request_url, page_url);
@@ -487,6 +630,7 @@ pub fn synthesize_json_payload(
                     .iter()
                     .filter_map(Value::as_object)
                     .any(page_like_object)
+                && records_carry_content(items)
             {
                 if let Some(built) = render_json_array(items, request_url, page_url) {
                     return Some(built);

@@ -490,6 +490,24 @@ fn walk<'a>(
         // through to the container walk, which emits every child.
         "figure" if !figure_has_content(el) => {
             media_block(el, base, headings, out);
+            // An image card's label is what a reader gets from it: a launch
+            // calendar, a gallery, a product grid is pictures with `alt` text and
+            // no prose. The label is already content for scoring; it must also
+            // survive as a line, or the page extracts as furniture only.
+            for img in el.select(&scraper::Selector::parse("img[alt]").expect("static selector")) {
+                let alt = img.value().attr("alt").unwrap_or_default().trim();
+                if alt.chars().count() < 12 {
+                    continue;
+                }
+                push_block(
+                    Block::Para {
+                        md: alt.to_string(),
+                        link_density: 0.0,
+                        path: current_path(headings),
+                    },
+                    out,
+                );
+            }
         }
         "hr" => {}
         "a" if opts.include_links && contains_block(el) => {

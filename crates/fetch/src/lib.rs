@@ -22,6 +22,7 @@ mod http;
 pub mod hydrate;
 pub mod identity;
 mod mine;
+mod splash;
 pub mod state;
 mod synthesize;
 mod webcrypto;
