@@ -513,9 +513,10 @@ fn records_carry_content(items: &[Value]) -> bool {
                     }
                 }
                 Value::Array(inner) => {
-                    if inner.iter().filter_map(Value::as_str).any(|text| {
+                    let substantial = inner.iter().filter_map(Value::as_str).any(|text| {
                         text.trim().chars().count() >= 24 || text.trim().starts_with("http")
-                    }) {
+                    });
+                    if substantial {
                         has_substance = true;
                         has_name = true;
                     }

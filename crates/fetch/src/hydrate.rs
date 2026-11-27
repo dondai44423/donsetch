@@ -1216,7 +1216,7 @@ fn row_text(value: &Value) -> Option<String> {
 /// object-valued key (`node`, `data`, `attributes`, `fields`); the row is inside
 /// it. Only a wrapper with no title/detail key of its own is unwrapped, so a
 /// real row that happens to carry a `data` field keeps its own fields.
-fn unwrap_row<'a>(obj: &'a serde_json::Map<String, Value>) -> &'a serde_json::Map<String, Value> {
+fn unwrap_row(obj: &serde_json::Map<String, Value>) -> &serde_json::Map<String, Value> {
     const WRAPPERS: &[&str] = &["node", "item", "attributes", "fields", "entity", "record"];
     for key in WRAPPERS {
         let Some(inner) = obj.get(*key).and_then(Value::as_object) else {

@@ -424,7 +424,7 @@ pub fn classify(evidence: Evidence<'_>) -> Verdict {
             // when its element is in the markup, or when the page is small
             // enough to be the interstitial the widget sits in.
             if matches!(signature.vendor, "turnstile" | "recaptcha" | "hcaptcha")
-                && !widget_mounted(&evidence.body, &lower)
+                && !widget_mounted(evidence.body, &lower)
             {
                 return false;
             }
