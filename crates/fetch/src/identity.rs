@@ -537,6 +537,37 @@ pub fn names() -> Vec<&'static str> {
     PORTFOLIO.iter().map(|identity| identity.name).collect()
 }
 
+/// The order a host is met with for the first time, before it has a score.
+///
+/// The first request to an unseen origin is the one its bot wall judges: it has
+/// nothing but the wire and the headers to decide on. It is asked the way the
+/// browser on this machine asks — `chrome-local` on Linux, `chrome-win` on
+/// Windows, `safari` on macOS, `chrome-android` on Android. A client that names
+/// itself `donsetch/5.0` is offered only to an origin that has earned it, by a
+/// learned score or by an explicit identity choice: introducing ourselves as a
+/// bot to a vendor that blocks bots is a self-inflicted challenge.
+pub fn first_contact() -> Vec<&'static str> {
+    let home = if cfg!(windows) {
+        "chrome-win"
+    } else if cfg!(target_os = "macos") {
+        "safari"
+    } else if cfg!(target_os = "android") {
+        "chrome-android"
+    } else {
+        "chrome-local"
+    };
+    let mut names: Vec<&'static str> = Vec::with_capacity(PORTFOLIO.len());
+    if let Some(identity) = PORTFOLIO.iter().find(|identity| identity.name == home) {
+        names.push(identity.name);
+    }
+    for identity in PORTFOLIO {
+        if !names.contains(&identity.name) {
+            names.push(identity.name);
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

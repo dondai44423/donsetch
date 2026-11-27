@@ -1601,7 +1601,7 @@ impl Worker {
             Some(forced) => forced.clone(),
             None => self
                 .state
-                .order(&host, &identity::names())
+                .order(&host, &identity::first_contact())
                 .into_iter()
                 .next()
                 .unwrap_or_default(),
@@ -2141,7 +2141,7 @@ impl Worker {
         // the caller asked for.
         let market = crate::splash::apply(&host, url);
         let url = market.as_deref().unwrap_or(url);
-        let prior = identity::names();
+        let prior = identity::first_contact();
         let order = match &options.identity {
             Some(forced) => vec![forced.clone()],
             None => self.state.order(&host, &prior),
@@ -2249,6 +2249,10 @@ impl Worker {
         let mut interaction_asked = false;
         // A shell has been retried once as another client class.
         let mut shell_extra = false;
+        // An identity that answered a challenge with the cookie it was handed
+        // has spent its one cookie retry.
+        let mut cookie_retried: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         let mut last_wall: Option<crate::classify::Wall> = None;
         // The previous attempt's answer: class, status and body hash.
         let mut last_answer: Option<(Class, u16, u64)> = None;
@@ -2650,7 +2654,14 @@ impl Worker {
                 }
             }
             let cookies: Vec<StoredCookie> = response.cookies.iter().map(stored).collect();
-            if self.persist && !stateless_redirect {
+            // The answer's own cookies are state, whether or not this session
+            // writes state to disk: a challenge hands its cookie to the refusal
+            // (DataDome's `datadome` rides the 403, Cloudflare's `__cf_bm` rides
+            // the challenge) and a first visit's session cookie is what the next
+            // request would carry in a browser. A jar that forgets them makes
+            // every request look like a browser that has never been here, and
+            // loses the one thing the origin just offered.
+            if !stateless_redirect {
                 self.state
                     .store_cookies(&host, identity.name, cookies.clone());
             }
@@ -2695,6 +2706,24 @@ impl Worker {
 
             last_wall = verdict.wall.clone();
             last_evidence = verdict.evidence.clone();
+            // A browser answers a challenge that handed it a cookie with that
+            // cookie. The same client asks once more, before any other identity
+            // and before any program runs: DataDome's refusal sets `datadome`
+            // and the page follows it, Cloudflare's challenge sets `__cf_bm`.
+            // Only a cookie that would actually change the request counts, and
+            // only once per identity, so a wall cannot loop.
+            if verdict.class != Class::Content
+                && !stateless_redirect
+                && !cookie_retried.contains(identity.name)
+            {
+                let handed = self.state.cookie_header_for(url, identity.name);
+                if handed.is_some() && handed != cookie_header {
+                    cookie_retried.insert(identity.name.to_string());
+                    spent_state = true;
+                    queue.push_front(identity.name.to_string());
+                    continue;
+                }
+            }
             // A named vendor reorders what is left: the identities it has let
             // through come next. A forced identity has nothing to reorder.
             let mut escalation: Vec<String> = Vec::new();
@@ -2971,16 +3000,19 @@ impl Worker {
                     .as_ref()
                     .map(|wall| wall.vendor == "cloudflare")
                     .unwrap_or(false)
-                    && tries >= budget.min(2)
+                    && tries >= budget
                     && crate::engine::is_cloudflare_page(&response.body)
                 {
                     // Cloudflare serves the challenge payload only to a client
                     // class it means to challenge: a header alone (`cf-mitigated`
                     // on an empty 403) names the wall but carries no program, and
                     // identity selection is what answers that. The engine runs
-                    // only on a page that holds the program, and after the
-                    // classes that were offered it have answered — identity
-                    // first, always.
+                    // only on a page that holds the program, and only on the last
+                    // attempt the encounter allows — identity first, always:
+                    // Cloudflare lets a plain or app client through where it
+                    // challenges a browser, so the cheap classes answer before a
+                    // 10 s mint is spent (measured: Glassdoor 1.2 s as plain,
+                    // 9.1 s when the mint fired on attempt two).
                     Some("cloudflare")
                 } else if crate::engine::is_reddit_page(&response.body) && response.status != 429 {
                     // Reddit's gate is served to every class that is not a

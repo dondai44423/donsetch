@@ -562,7 +562,7 @@ fn a_named_vendor_sends_the_next_attempt_to_what_passed_it() {
     );
     let outcome = Session::new(false).fetch(&cold(server.url("/")));
     assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
-    assert_eq!(tried(&outcome), ["plain", "okhttp"]);
+    assert_eq!(tried(&outcome), ["chrome-local", "okhttp"]);
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn a_human_check_costs_one_identity_beyond_the_class_that_saw_it() {
     );
     let outcome = Session::new(false).fetch(&cold(server.url("/")));
     assert_eq!(outcome.class, Class::WallInteraction);
-    assert_eq!(tried(&outcome), ["plain", "chrome"]);
+    assert_eq!(tried(&outcome), ["chrome-local", "plain"]);
     assert_eq!(
         server.hit_count(),
         2,
@@ -603,7 +603,10 @@ fn a_wall_that_outlasts_every_attempt_is_still_named_with_its_body() {
     );
     let outcome = Session::new(false).fetch(&cold(server.url("/")));
     assert_eq!(outcome.class, Class::WallInteraction);
-    assert_eq!(tried(&outcome), ["plain", "chrome-android", "chrome-win"]);
+    assert_eq!(
+        tried(&outcome),
+        ["chrome-local", "plain", "chrome-android", "chrome-win"]
+    );
     assert_eq!(
         outcome.wall.as_ref().map(|wall| wall.vendor.as_str()),
         Some("datadome")
@@ -791,7 +794,7 @@ fn a_stored_winner_that_starts_failing_is_replaced_inside_one_encounter() {
         let plain = request
             .header("user-agent")
             .unwrap_or_default()
-            .starts_with("donsetch/");
+            .starts_with("Mozilla");
         if plain && switch.load(std::sync::atomic::Ordering::Relaxed) {
             Reply::ok("<html><head><title>Fixture</title></head><body><p>Thin.</p></body></html>")
         } else {
@@ -806,7 +809,11 @@ fn a_stored_winner_that_starts_failing_is_replaced_inside_one_encounter() {
             ..Request::new(server.url("/"))
         })
     };
-    assert_eq!(tried(&learn()), ["plain"], "plain is the stored winner");
+    assert_eq!(
+        tried(&learn()),
+        ["chrome-local"],
+        "the browser class is the first contact and the stored winner"
+    );
     refuse_plain.store(true, std::sync::atomic::Ordering::Relaxed);
     let replaced = learn();
     assert_eq!(replaced.class, Class::Content, "{:?}", replaced.attempts);
@@ -817,7 +824,7 @@ fn a_stored_winner_that_starts_failing_is_replaced_inside_one_encounter() {
         tried(&replaced)
     );
     let winner = replaced.identity.clone().expect("an identity");
-    assert_ne!(winner, "plain");
+    assert_ne!(winner, "chrome-local");
     assert_eq!(
         tried(&learn()),
         [winner.as_str()],
@@ -884,11 +891,12 @@ fn a_silent_server_is_asked_by_one_other_wire_class_on_a_short_clock() {
 #[test]
 fn a_refusal_served_as_200_to_one_client_moves_to_the_next() {
     // Akamai's shape: "Access Denied" with a 200 and a reference link, to the
-    // transparent client; the page to a browser.
+    // class it doubts (a browser first contact); the page to the transparent
+    // client it lets through.
     let server = Server::start(|request| {
         if request
             .header("user-agent")
-            .is_some_and(|agent| agent.starts_with("donsetch/"))
+            .is_some_and(|agent| agent.starts_with("Mozilla"))
         {
             Reply::ok(
                 "<HTML><HEAD><TITLE>Access Denied</TITLE></HEAD><BODY><H1>Access Denied</H1>\
@@ -903,7 +911,11 @@ fn a_refusal_served_as_200_to_one_client_moves_to_the_next() {
     let outcome = Session::new(false).fetch(&chosen(server.url("/")));
     assert_eq!(outcome.class, Class::Content, "{:?}", outcome.attempts);
     assert_eq!(outcome.attempts[0].class, Class::WallIdentity);
-    assert_ne!(outcome.identity.as_deref(), Some("plain"));
+    assert_eq!(
+        outcome.identity.as_deref(),
+        Some("plain"),
+        "the client the origin let through answered, not the one it refused"
+    );
 }
 
 #[test]

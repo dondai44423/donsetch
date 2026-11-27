@@ -1431,6 +1431,33 @@
       document.forms = formEls;
     }
 
+    // The page's own elements exist for a challenge too. A vendor's program reads
+    // them: DataDome's tag takes `document.getElementById('noiframe').parentNode`
+    // and removes it, and a program that computes a form field needs that form's
+    // element. A document whose body is empty answers `null` there, the program
+    // throws on its first line that touches the page, and the mint sets no cookie
+    // (measured: G2, 203 ms, zero cookies). Elements the served markup names with
+    // an id are created with their tag and attributes and hung off the body;
+    // nothing about the page is invented.
+    {
+      const tagRe = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)>/g;
+      let tagMatch;
+      while ((tagMatch = tagRe.exec(page.html))) {
+        const tag = tagMatch[1].toLowerCase();
+        if (tag === "script" || tag === "style" || tag === "meta" || tag === "link") continue;
+        const attrs = tagMatch[2] || "";
+        const id = (/[\s"']id\s*=\s*["']([^"']+)["']/i.exec(attrs) || [])[1];
+        if (!id || byId.has(id)) continue;
+        const element = new El(tag);
+        for (const attribute of attrs.matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']/g)) {
+          element.setAttribute(attribute[1], attribute[2]);
+        }
+        element.id = id;
+        byId.set(id, element);
+        document.body.appendChild(element);
+      }
+    }
+
     const navigator = {
       userAgent: ident.userAgent, appVersion: ident.appVersion, appName: "Netscape",
       appCodeName: "Mozilla", platform: ident.platform, vendor: ident.vendor, vendorSub: "",
