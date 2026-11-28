@@ -120,7 +120,7 @@ The CLI and MCP tools use the same engine. No account setup sits between install
 
 | Tool | Use it for | Useful controls |
 |---|---|---|
-| `web_fetch` | Pages, PDFs, structured site records, or up to 12 URLs at once | `must_contain`, `focus`, `toc`, `section`, `since_last` |
+| `web_fetch` | Pages, PDFs, YouTube videos, structured site records, or up to 12 URLs at once | `must_contain`, `focus`, `toc`, `section`, `transcript`, `since_last` |
 | `web_search` | Ranked sources and evidence snippets, keyless by default | `intent`, `lang`, `max_results`, `read` |
 | `web_crawl` | A site model, a plan, or a bounded crawl with a digest and resumable job | `mode`, `focus`, `max_pages`, `job`, `handle` |
 | `web_screenshot` | A rendered PNG through an installed Chromium-family browser | `full_page`, `wait_ms`, `deadline_ms` |
@@ -141,6 +141,7 @@ Every view works over the extracted source, including PDFs and site adapters. Yo
 | “What's in this document?” | `toc` | Headings and section IDs, without the body. |
 | “Read that part.” | `section` | One section and its subsections. |
 | “What changed?” | `since_last` | Changes against your stored previous read, or `unchanged`. |
+| “Read the video transcript.” | `transcript` | Opt-in YouTube captions (`true` or lang code); off by default to save tokens, searchable by `focus` and `must_contain`. |
 | “Keep going.” | `offset` | Continue at the returned `next_offset`. |
 
 ```bash

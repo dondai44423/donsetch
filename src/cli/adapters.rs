@@ -68,7 +68,7 @@ pub fn run(args: &[String]) {
     println!(
         "  {}",
         cli::dim(
-            "github issues · stackexchange · wikipedia infoboxes · docs outlines · reddit json · package registries"
+            "youtube (video cards & transcripts) · github issues · stackexchange · wikipedia infoboxes · docs outlines · reddit json · package registries"
         )
     );
     println!();

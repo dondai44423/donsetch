@@ -41,6 +41,10 @@ pub enum ParamKind {
     /// `--flag=<first>` both send `true`, and `--flag=<value>` sends any
     /// other string as itself.
     BoolOr(&'static [&'static str]),
+    /// JSON `true`/`false` or any non-empty string (e.g. a language code).
+    /// On the CLI, bare `--flag` sends `true` and `--flag=<value>` sends
+    /// either a boolean (`true`/`false`) or the string value.
+    BoolOrStr,
     /// JSON array of strings; CLI repeatable + comma-splittable.
     StrList,
     /// Bounded JSON array of strings; CLI repeatable + comma-splittable.
@@ -127,7 +131,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Check that the page says something, without reading it. A phrase matches case-insensitively, whatever the spacing, line breaks, quote style, dash style or markdown emphasis; /regex/ (flags imsx) matches a pattern. Repeat the flag for up to 8 terms. The answer is one line per term: found, how often, in which sections (sN, as toc numbers them) with short excerpts; or not found, with a hint when the phrase's words are on the page apart. The verdict is MATCH, PARTIAL, NO MATCH, or UNVERIFIED when part of the page could not be read (a missing term may be there). Searches the whole page, or only --section. Not with --focus, --toc, --offset or --since-last.",
         mcp_help: Some(
-            "Presence check instead of reading: a phrase (case, spacing, quote/dash style and markdown emphasis ignored), a /regex/ (flags imsx), or a list of up to 8. Returns per term: found ×count, sections (sN) and excerpts; or not found, with a near-miss hint. Verdict match|partial|no_match|unverified (part of the page unread: absence proves nothing). Searches the whole page, or only section. Not with focus, toc, offset or since_last.",
+            "Presence check: phrase (case/spacing/emphasis ignored), /regex/ (imsx), or up to 8. Returns found ×count, sections (sN), excerpts, or near-miss hint. Verdict match|partial|no_match|unverified. Whole page or section; not with focus/toc/offset/since_last.",
         ),
     },
     ParamSpec {
@@ -138,7 +142,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Return only the passages that answer a question or match keywords, best first, grouped under their section path (§sN · Heading › Sub). Paragraphs, list items, table rows (with the table header) and code are ranked separately; a section whose heading names the topic ranks all its passages. The header line counts the passages kept and names query words the page does not contain. No match returns the outline instead of the page. With --section, ranks inside that part.",
         mcp_help: Some(
-            "Question or keywords: returns only matching passages, best first, under their §sN section path, and names query words absent from the page. A miss returns the outline, never the whole page. With section, ranks inside that part.",
+            "Question or keywords: matching passages only, best first, under §sN path, naming absent query words. Miss returns outline. With section, ranks inside that part.",
         ),
     },
     ParamSpec {
@@ -193,7 +197,7 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         required: false,
         help: "Keep the page's links. --links (or --links=urls) gives [text](https://...) with the real address, to cite a source, check where a link goes or follow it. --links=handles gives [text](handle) instead: a short L-handle that fetch accepts as its url, about half the tokens of the address. Off by default: link text only, which saves about a third of the tokens.",
         mcp_help: Some(
-            "Keep links. true or \"urls\": [text](real URL), to cite, check or follow a link. \"handles\": [text](L-handle), about half the tokens; a handle passed as url follows it. Off: link text only (~30% fewer tokens).",
+            "Keep links. true/\"urls\": [text](URL). \"handles\": [text](L-handle) (~50% tokens, usable as url). Off: text only (~30% fewer tokens).",
         ),
     },
     ParamSpec {
@@ -216,6 +220,17 @@ const FETCH_PARAMS: &[ParamSpec] = &[
         help: "Read the words in the page's first 4 content images (OCR) into an 'image text' section, which every view searches: charts, screenshots, scanned notices, comics. Slower; for pages whose evidence is an image.",
         mcp_help: Some(
             "OCR the first 4 content images into an 'image text' section that every view searches. Slower; only when the evidence is in an image.",
+        ),
+    },
+    ParamSpec {
+        name: "transcript",
+        flag: "transcript",
+        kind: ParamKind::BoolOrStr,
+        cli: CliKind::Flag,
+        required: false,
+        help: "For video pages (YouTube), fetch and append the timestamped transcript into a Transcript section (searchable by --focus, --must-contain, --section). Off by default so video cards stay compact; use --transcript for the default/English track or --transcript=<lang> (e.g. --transcript=es) for a specific language.",
+        mcp_help: Some(
+            "YouTube videos: append timestamped transcript (true for default/English, or lang code like \"es\"). Off by default to save tokens; views search it.",
         ),
     },
     ParamSpec {
@@ -638,7 +653,7 @@ pub static TOOLS: &[ToolSpec] = &[
         name: "web_fetch",
         cli_cmd: "fetch",
         summary: "Read a URL as markdown, or only the part you need (in-process JS, PDF, honest failures)",
-        description: "Read one URL, or up to 12 in parallel, as clean markdown: a web page (its scripts run in-process when it needs them), a PDF (scanned pages OCRed), a feed, or a JSON endpoint. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, npm/PyPI/crates.io and other registries, docs sites) come back from that source. Use web_search to find URLs and web_crawl for many pages of one site.\n\nViews, cheapest first. Every view reads the whole document and projects it, the same way for every kind of source:\n- must_contain: is it there? A phrase or /regex/, or up to 8 of them. Per term: found ×count, the sections it is in and excerpts; or not found, with a hint when a phrase's words are on the page apart. Verdict match, partial, no_match, or unverified when part of the page could not be read (a listing that loaded only some items, a document past the read limit), because then absence proves nothing. About 60 tokens instead of the page.\n- focus: where is it? Only the passages that answer the question, best first, grouped under their section path, each table row with its header. The header line names query words the page lacks. A miss returns the outline, never the page.\n- toc, then section: what is here, then one part. The outline numbers headings s1, s2, ... with sizes; section takes an id or heading text, subsections included; a miss returns the outline.\n- No view: the page.\nmax_chars caps the response (default 16000 characters); a cut-off response ends with next_offset, and the same call with offset continues it. For a url array max_chars is the batch total (default 48000). A paginated article names its next part in next_page.\n\nlinks keeps link targets: real URLs, or with \"handles\" short handles fetch accepts. since_last compares with your previous read of the URL and returns only what changed. image_text OCRs the first 4 content images into the document, so every view searches them. deadline_ms bounds the call.\n\nResponse: a leading [meta] JSON line, then the evidence. [meta] holds url (cite it), ok, content_ok, read_status (content, partial, thin, probe, focus, section, outline), content_complete, next_offset, next_page, the view's state (must_contain verdict and counts, focus passages kept of total, section id or not_found), changed, and on failure code, errorKind and next_action. Login walls, paywalls, bot walls and missing pages fail fast and name what stopped them. Transport and timing diagnostics live in _meta.",
+        description: "Read one URL, or up to 12 in parallel, as clean markdown: a web page (its scripts run in-process when it needs them), a PDF (scanned pages OCRed), a feed, or a JSON endpoint. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, npm/PyPI/crates.io and other registries, docs sites) come back from that source. Use web_search to find URLs and web_crawl for many pages of one site.\n\nViews, cheapest first. Every view reads the whole document and projects it, the same way for every kind of source:\n- must_contain: is it there? A phrase or /regex/, or up to 8 of them. Per term: found ×count, the sections it is in and excerpts; or not found, with a hint when a phrase's words are on the page apart. Verdict match, partial, no_match, or unverified when part of the page could not be read (a listing that loaded only some items, a document past the read limit), because then absence proves nothing. About 60 tokens instead of the page.\n- focus: where is it? Only the passages that answer the question, best first, grouped under their section path, each table row with its header. The header line names query words the page lacks. A miss returns the outline, never the page.\n- toc, then section: what is here, then one part. The outline numbers headings s1, s2, ... with sizes; section takes an id or heading text, subsections included; a miss returns the outline.\n- No view: the page.\nmax_chars caps the response (default 16000 characters); a cut-off response ends with next_offset, and the same call with offset continues it. For a url array max_chars is the batch total (default 48000). A paginated article names its next part in next_page.\n\nlinks keeps link targets: real URLs, or with \"handles\" short handles fetch accepts. since_last compares with your previous read of the URL and returns only what changed. image_text OCRs the first 4 content images into the document, so every view searches them. transcript appends a video's timestamped captions (off by default to save tokens). deadline_ms bounds the call.\n\nResponse: a leading [meta] JSON line, then the evidence. [meta] holds url (cite it), ok, content_ok, read_status (content, partial, thin, probe, focus, section, outline), content_complete, next_offset, next_page, the view's state (must_contain verdict and counts, focus passages kept of total, section id or not_found), changed, and on failure code, errorKind and next_action. Login walls, paywalls, bot walls and missing pages fail fast and name what stopped them. Transport and timing diagnostics live in _meta.",
         mcp_description: "Read a page, PDF or feed as markdown, or only the part that answers the question. Text starts with [meta] JSON, then evidence; cite [meta].url. ok:false, content_ok:false or thin:true is unresolved: follow next_action.\nCheapest view first:\n1. Is X there? must_contain: per-term found ×count with sections and excerpts, or not found. unverified = part of the page was unread, so absence proves nothing.\n2. Where is X? focus: matching passages only, best first, under their section path; a miss returns the outline.\n3. Long page: toc (sN ids, sizes), then section=\"sN\".\n4. No view: the page. A cut-off response has next_offset: repeat the call with offset. next_page names a paginated article's next part.\nWalls (login, paywall, bot) fail fast and say which. Sites with a structured source (GitHub, Reddit, Stack Overflow, Wikipedia, registries) come back from it.",
         params: FETCH_PARAMS,
         examples: &[
@@ -763,6 +778,9 @@ pub fn check_args(tool: &ToolSpec, args: &Value) -> Result<(), String> {
             ParamKind::BoolOr(variants) => {
                 value.is_boolean() || value.as_str().is_some_and(|s| variants.contains(&s))
             }
+            ParamKind::BoolOrStr => {
+                value.is_boolean() || value.as_str().is_some_and(|s| !s.trim().is_empty())
+            }
             ParamKind::Enum(_) => unreachable!("enums checked above"),
         };
         if !valid {
@@ -808,6 +826,18 @@ pub fn mcp_schema(tool: &ToolSpec) -> Value {
                     json!([
                         { "type": "boolean" },
                         { "type": "string", "enum": variants }
+                    ]),
+                );
+                schema.insert("description".into(), json!(p.mcp_help.unwrap_or(p.help)));
+                props.insert(p.name.into(), Value::Object(schema));
+                continue;
+            }
+            ParamKind::BoolOrStr => {
+                schema.insert(
+                    "anyOf".into(),
+                    json!([
+                        { "type": "boolean" },
+                        { "type": "string" }
                     ]),
                 );
                 schema.insert("description".into(), json!(p.mcp_help.unwrap_or(p.help)));
@@ -982,6 +1012,11 @@ fn cli_arg(p: &ParamSpec) -> Arg {
                     .value_parser(clap::builder::PossibleValuesParser::new(
                         variants.iter().copied(),
                     )),
+                ParamKind::BoolOrStr => arg
+                    .value_name("LANG")
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .default_missing_value("true"),
             }
         }
     }
@@ -1063,6 +1098,16 @@ pub fn matches_to_json(tool: &ToolSpec, m: &clap::ArgMatches) -> Value {
                         map.insert(p.name.into(), value);
                     }
                 }
+                ParamKind::BoolOrStr => {
+                    if let Some(v) = m.get_one::<String>(p.name) {
+                        let value = match v.to_ascii_lowercase().as_str() {
+                            "true" => json!(true),
+                            "false" => json!(false),
+                            _ => json!(v),
+                        };
+                        map.insert(p.name.into(), value);
+                    }
+                }
             },
         }
     }
@@ -1128,6 +1173,7 @@ mod tests {
                 "section",
                 "since_last",
                 "toc",
+                "transcript",
                 "url",
             ]
         );
@@ -1500,5 +1546,55 @@ mod tests {
             .try_get_matches_from(["search", "armored core", "--intent", "image"])
             .expect("image search without sheet");
         assert!(matches_to_json(tool, &plain).get("contact_sheet").is_none());
+    }
+
+    #[test]
+    fn transcript_takes_bool_or_lang_on_wire_and_cli() {
+        let tool = fetch_tool();
+        for ok in [json!(true), json!(false), json!("en"), json!("pt-BR")] {
+            check_args(
+                tool,
+                &json!({ "url": "https://youtu.be/dQw4w9WgXcQ", "transcript": ok }),
+            )
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [json!(""), json!("   "), json!(1), json!(["en"])] {
+            assert!(
+                check_args(
+                    tool,
+                    &json!({ "url": "https://youtu.be/dQw4w9WgXcQ", "transcript": bad })
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
+        let parse = |argv: &[&str]| {
+            matches_to_json(tool, &cli_command(tool).try_get_matches_from(argv).unwrap())
+        };
+        assert_eq!(
+            parse(&["fetch", "https://youtu.be/dQw4w9WgXcQ", "--transcript"])["transcript"],
+            true
+        );
+        // Bare flag before URL must not swallow the URL.
+        let before = parse(&["fetch", "--transcript", "https://youtu.be/dQw4w9WgXcQ"]);
+        assert_eq!(before["transcript"], true);
+        assert_eq!(before["url"], "https://youtu.be/dQw4w9WgXcQ");
+        assert_eq!(
+            parse(&["fetch", "https://youtu.be/dQw4w9WgXcQ", "--transcript=es"])["transcript"],
+            "es"
+        );
+        assert_eq!(
+            parse(&[
+                "fetch",
+                "https://youtu.be/dQw4w9WgXcQ",
+                "--transcript=false"
+            ])["transcript"],
+            false
+        );
+        assert!(
+            parse(&["fetch", "https://youtu.be/dQw4w9WgXcQ"])
+                .get("transcript")
+                .is_none()
+        );
     }
 }

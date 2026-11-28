@@ -1,5 +1,29 @@
 # Changelog
 
+## [5.6.1] - 2026-11-28
+
+### Added
+
+- **Fast cross-platform YouTube adapter with opt-in transcripts.** `web_fetch` and `donsetch fetch` now acquire YouTube video records directly via parallel `IOS` + `WEB` Innertube player calls (with `ANDROID` and watch-page HTML fallback, zero external `yt-dlp` or Python dependencies) across `/watch`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`, `youtube-nocookie.com`, `m.youtube.com`, and `music.youtube.com`.
+  - **Token-efficient by default:** omits transcripts unless asked, returning a compact video card (title, channel, publish date, duration, views, likes, category, parsed chapters, description), a one-line availability hint, and `meta.transcript_available` (~566 ms cold on a 2-hour video vs >1,030 ms / 1.53 MB watch HTML).
+  - **Opt-in `transcript` control (`--transcript` / `--transcript=<lang>`, MCP `transcript: true | "<lang>"`):** fetches a single compact `srv1` XML caption track (with `srv3`/`json3` parsing, rolling-cue dedup, chapter-aligned timestamped paragraphs, language matching, and `&tlang=` auto-translation) and feeds it into the shared `focus`, `must_contain`, `toc`, `section`, and `offset` views (~917 ms cold for a focused 2-hour lecture transcript; 10-minute bounded in-memory video + transcript cache).
+  - **Honest unavailability:** deleted, private, and members-only videos return immediate 404/403 structured errors (~457 ms) instead of falling through to a generic watch shell.
+
+### Fixed
+
+- **Eliminated v5.6.0 fetch slowdowns and dead-shell stalls without losing stealth.**
+  - Fixed a content-mode performance bug where `navigator.sendBeacon()` called synchronous blocking `netFetch` (freezing V8 for 5–10 s on analytics beacons like `indeed.com`), and added a universal stall/no-progress early exit (`1.5 s` idle / `4.0 s` busy with no text growth or non-telemetry `2xx` data responses) so dead or walled JS shells fail fast instead of burning the 12–20 s wall ceiling.
+  - Narrowed `is_telemetry_url` so first-party APIs (`www.tiktok.com`, `hubspot.com`, `licdn.com`) are no longer short-circuited while actual telemetry hosts (`analytics.tiktok.com`, `*.tiktokv.com` monitor/collector endpoints, `snap.licdn.com`, `track.hubspot.com`) are filtered; restricted cookie-handshake retries to actual challenge wall classes (capped to 2 per encounter with turn refund so remembered hosts never starve fallback identities); prevented duplicate `chrome` retries on Linux; capped WAF reload wall clock to 10 s; and skipped V8 completely when HTML contains no `<script>` tag.
+  - Pooled content-lane asset prefetch onto a single lightweight HTTP/2 runtime reusing the already-parsed DOM instead of spawning 6 OS threads and 6 cold BoringSSL pools.
+- **Fixed v5.6.0 false positives and stealth/synthesis regressions.**
+  - Small, complete static pages with real prose and zero app scripts (e.g. `example.com`, `info.cern.ch`, concise docs/status pages) now pass the generic content contract on attempt 1 with zero retries and zero V8; the final framework-shell gate no longer rejects confirmed `page_content`, PDFs, or JSON payloads; and `OUTAGE` detection no longer triggers on bare `"we're sorry"` outside error/outage context.
+  - `Identity::script_view()` now passes `self.reference()` for every browser identity (`chrome-win`, `chrome`, `chrome-local`) instead of only `chrome-local`; challenge-host HTML `id` hydration strips comments/scripts/styles and parses attributes properly; `walk_body` restricts `alt`/`aria-label` counting to media/card elements; `url_terms` in dual-plane fusion only reads actual search-query parameter names so tracking/market params (`utm_*`, `intl=nosplash`) no longer break entity synthesis or leak side-panel widgets on search URLs; and `search_route` tightens ambiguous single-letter 404 rewrites to search/shop paths.
+- **Dependencies & CI (#479–#487).** Updated `psl` (`2.1.253 → 2.1.262`), `brotli` (`9.1.1 → 9.1.3`), `rustls-pki-types` (`1.15.1 → 1.16.0`), `regex` (`1.13.1 → 1.13.2`), `clap` (`4.6.8 → 4.6.9`), and GitHub Docker publishing actions (`setup-qemu-action@v4`, `setup-buildx-action@v4`, `login-action@v4`, `build-push-action@v7`).
+
+### Performance
+
+- **Universal speedup with equal or better stealth (`dist-thin`, cold):** hard corpus **24/28 standing (86%)** with p50 **1,154 ms** (down from 1,237–1,489 ms) and p95 **2,939 ms** (down from 3,010–3,794 ms); `indeed.com` **1.12 s** content cold / **3.31 s** warm (down from 13.5–14.5 s); `tiktok.com` **2.24 s** cold / **2.87 s** warm honest wall (down from 13.3 s cold / 7.2 s warm empty HTTP 200); `instagram.com/nasa/` **1.13 s** (down from 2.3 s); `nike.com/launch` **1.69 s** (down from 3.6 s); `bestbuy.com` search **12.21 s** (down from 13.5 s).
+
 ## [5.6.0] - 2026-11-27
 
 ### Added

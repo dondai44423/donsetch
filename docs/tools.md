@@ -28,6 +28,7 @@ Returns clean Markdown (or a requested slice) across HTML, PDFs, feeds, JSON, pl
 | `links` | `--links` / `--links=handles` | `urls` (`true`) keeps full URLs; `handles` emits session-local `L-` handles; default keeps anchor text only |
 | `since_last` | `--since-last` | Diff against the previous stored read (standalone view; returns full page on first read) |
 | `image_text` | `--image-text` | OCR up to 4 content images (`ocr` build required) |
+| `transcript` | `--transcript` / `--transcript=<lang>` | YouTube videos: fetch and append timestamped transcript (`true` for default/English, or BCP-47 code like `es`); off by default to save tokens, searchable by `focus`, `must_contain`, and `section` |
 | `deadline_ms` | `--deadline-ms` | Hard call budget: 500–600,000 ms (per URL in batches) |
 
 - **Mutually exclusive views:** `must_contain`, `focus`, `toc`, and `since_last` cannot combine with one another (`section` narrows `must_contain`, `focus`, or full reads; `offset` paginates full/section reads).

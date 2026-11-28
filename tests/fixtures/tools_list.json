@@ -34,11 +34,11 @@
                 "maxItems": 8
               }
             ],
-            "description": "Presence check instead of reading: a phrase (case, spacing, quote/dash style and markdown emphasis ignored), a /regex/ (flags imsx), or a list of up to 8. Returns per term: found ×count, sections (sN) and excerpts; or not found, with a near-miss hint. Verdict match|partial|no_match|unverified (part of the page unread: absence proves nothing). Searches the whole page, or only section. Not with focus, toc, offset or since_last."
+            "description": "Presence check: phrase (case/spacing/emphasis ignored), /regex/ (imsx), or up to 8. Returns found ×count, sections (sN), excerpts, or near-miss hint. Verdict match|partial|no_match|unverified. Whole page or section; not with focus/toc/offset/since_last."
           },
           "focus": {
             "type": "string",
-            "description": "Question or keywords: returns only matching passages, best first, under their §sN section path, and names query words absent from the page. A miss returns the outline, never the whole page. With section, ranks inside that part."
+            "description": "Question or keywords: matching passages only, best first, under §sN path, naming absent query words. Miss returns outline. With section, ranks inside that part."
           },
           "toc": {
             "type": "boolean",
@@ -69,7 +69,7 @@
                 ]
               }
             ],
-            "description": "Keep links. true or \"urls\": [text](real URL), to cite, check or follow a link. \"handles\": [text](L-handle), about half the tokens; a handle passed as url follows it. Off: link text only (~30% fewer tokens)."
+            "description": "Keep links. true/\"urls\": [text](URL). \"handles\": [text](L-handle) (~50% tokens, usable as url). Off: text only (~30% fewer tokens)."
           },
           "since_last": {
             "type": "boolean",
@@ -78,6 +78,17 @@
           "image_text": {
             "type": "boolean",
             "description": "OCR the first 4 content images into an 'image text' section that every view searches. Slower; only when the evidence is in an image."
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "description": "YouTube videos: append timestamped transcript (true for default/English, or lang code like \"es\"). Off by default to save tokens; views search it."
           },
           "deadline_ms": {
             "type": "integer",

@@ -353,7 +353,7 @@ pub(super) fn render_fetch_batch(
                 if state.get("content_ok").and_then(Value::as_bool) == Some(false) {
                     o["content_ok"] = json!(false);
                 }
-                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "must_contain", "focus", "section", "next_page"] {
+                for field in ["budget_scope", "next_offset", "read_status", "content_complete", "partial", "partial_reason", "items_found", "items_total", "must_contain", "focus", "section", "next_page", "transcript", "transcript_available"] {
                     if let Some(value) = state.get(field)
                         && !value.is_null()
                     {
@@ -963,6 +963,11 @@ async fn fetch_single_inner(
         .get("since_last")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let transcript_req =
+        match crate::adapters::youtube::parse_transcript_arg(args.get("transcript")) {
+            Ok(req) => req,
+            Err(error) => return tool_error(format!("fetch: {error}")),
+        };
 
     // v5: `actions` was removed with the browser tier. The spec layer
     // answers it first (like `tier`); this guard is the layer under it.
@@ -1027,6 +1032,77 @@ async fn fetch_single_inner(
     }
     let mut trace = Trace::default();
 
+    // === YouTube Innertube fast-path ===
+    // Fetches structured video metadata (and opt-in timestamped captions) in
+    // one compact API round-trip instead of downloading a 1.5 MB HTML shell.
+    // Falls back to the generic HTML fetch on any unknown error.
+    let mut yt_transcript_meta: Option<Value> = None;
+    let mut yt_available_tracks: Vec<String> = Vec::new();
+    let mut yt_extracted: Option<extract::Extracted> = None;
+    if !no_adapter
+        && crate::config::cfg().fetch.adapters
+        && crate::adapters::youtube::video_id(&parsed_url).is_some()
+        && let Ok(yt_proxy) = call.route.proxy_for(&orig_url)
+    {
+        let yt_timeout = crate::fetch::layer::CALLER_DEADLINE
+            .try_with(|until| until.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(std::time::Duration::from_secs(20)))
+            .unwrap_or(std::time::Duration::from_secs(15));
+        match crate::adapters::youtube::fetch_live(
+            &orig_url,
+            &transcript_req,
+            yt_proxy.as_ref(),
+            yt_timeout,
+        )
+        .await
+        {
+            crate::adapters::youtube::LiveOutcome::Video(video) => {
+                trace.step(
+                    "adapter",
+                    "youtube-api",
+                    if video.cached { "hit" } else { "ok" },
+                    video.elapsed_ms,
+                );
+                yt_transcript_meta = video.transcript_meta;
+                yt_available_tracks = video.available_tracks;
+                yt_extracted = Some(video.extracted);
+            }
+            crate::adapters::youtube::LiveOutcome::Unavailable {
+                status,
+                reason,
+                auth_required,
+            } => {
+                let verdict = if auth_required {
+                    Verdict::AuthWall
+                } else {
+                    Verdict::SoftNotFound
+                };
+                trace.step("adapter", "youtube-api", &reason, t0.elapsed().as_millis());
+                return tool_error_structured(
+                    format!("youtube: {reason} ({orig_url})"),
+                    "permanent",
+                    Some(json!({
+                        "url": orig_url,
+                        "status": status,
+                        "verdict": format!("{verdict:?}"),
+                        "next_action": next_action_for(Some(verdict), status, "permanent"),
+                        "escalation": trace.value(),
+                    })),
+                );
+            }
+            crate::adapters::youtube::LiveOutcome::Fallback => {
+                trace.step(
+                    "adapter",
+                    "youtube-api",
+                    "fallback to watch page",
+                    t0.elapsed().as_millis(),
+                );
+            }
+        }
+    }
+
     // === The local fetch ===
     let mut out: Option<crate::fetch::client::FetchOutcome> = None;
 
@@ -1040,7 +1116,7 @@ async fn fetch_single_inner(
     // Bind the take() result first: a lock guard in the if-let
     // scrutinee would live across the .await below and make the
     // future !Send.
-    let prewarm_entry = if !is_pdf_url {
+    let prewarm_entry = if yt_extracted.is_none() && !is_pdf_url {
         daemon
             .searcher
             .prewarms()
@@ -1059,7 +1135,7 @@ async fn fetch_single_inner(
         out = Some(entry.outcome);
     }
 
-    if !prewarmed {
+    if yt_extracted.is_none() && !prewarmed {
         let t0 = std::time::Instant::now();
         let response = daemon
             .fetcher
@@ -1269,9 +1345,13 @@ async fn fetch_single_inner(
     }
 
     // === Local extraction (when we have a body) ===
-    let mut final_ex: Option<extract::Extracted> = None;
+    let mut final_ex: Option<extract::Extracted> = yt_extracted;
     let final_fetch: &str = "local";
-    let final_status: u16 = out.as_ref().map(|o| o.status).unwrap_or(0);
+    let final_status: u16 = if final_ex.is_some() {
+        200
+    } else {
+        out.as_ref().map(|o| o.status).unwrap_or(0)
+    };
     let mut final_url: String = url.clone();
     let mut final_verdict: String = out
         .as_ref()
@@ -1694,9 +1774,11 @@ async fn fetch_single_inner(
     // Final shell gate: a framework dump (React server renders)
     // must never ship as successful content regardless of what
     // produced it (live case: facebook returned React internals
-    // as markdown with a clean verdict). Honest fail with the
-    // repair hint instead of garbage "success".
-    if is_framework_shell(&ex) {
+    // as markdown with a clean verdict). Never override documents
+    // whose HTML structure already proved real content (`page_content`),
+    // PDFs, or JSON payloads — short code/changelog/contact pages
+    // legitimately carry paths, version numbers, and identifiers.
+    if !is_pdf_content && !page_content && !json_like && is_framework_shell(&ex) {
         return tool_error_structured(
             format!(
                 "blocked at {url} : the site renders an app shell without real content for non-interactive clients"
@@ -1803,6 +1885,11 @@ async fn fetch_single_inner(
         }
         if let Some(state) = ocr_state {
             sc["image_text"] = state;
+        }
+        if let Some(tmeta) = yt_transcript_meta {
+            sc["transcript"] = tmeta;
+        } else if !yt_available_tracks.is_empty() {
+            sc["transcript_available"] = json!(yt_available_tracks);
         }
         if let Some(next) = out
             .as_ref()
