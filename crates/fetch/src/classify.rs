@@ -220,7 +220,7 @@ const UNSUPPORTED_CLIENT: &[&str] = &[
 ];
 
 /// A refusal with no page of its own.
-const REFUSALS: &[&str] = &[
+pub(crate) const REFUSALS: &[&str] = &[
     "access denied",
     "you don't have permission to access",
     "request blocked",

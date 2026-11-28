@@ -913,6 +913,16 @@ impl Worker {
                 }
             }
         }
+        // A static HTML document with no `<script>` tag cannot hydrate via V8:
+        // skip isolate startup completely.
+        if !response
+            .body
+            .as_bytes()
+            .windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"<script"))
+        {
+            return None;
+        }
         let lane_started = Instant::now();
         // The lane spends what the encounter has left, never more: an encounter
         // that gives the lane nothing has already ended, and a bench's 3 s
@@ -1065,7 +1075,7 @@ impl Worker {
                     second_limits.wall = options
                         .deadline
                         .saturating_sub(started.elapsed())
-                        .min(Duration::from_secs(20));
+                        .min(Duration::from_secs(10));
                     if (200..300).contains(&reloaded.status)
                         && second_limits.wall.as_millis() >= 500
                     {
@@ -2696,8 +2706,31 @@ impl Worker {
                 self.state
                     .store_cookies(&host, identity.name, cookies.clone());
             }
+            // A browser answers a challenge that handed it a cookie with that
+            // cookie. The same client asks once more, before any other identity
+            // and before any program runs: DataDome's refusal sets `datadome`
+            // and the page follows it, Cloudflare's challenge sets `__cf_bm`.
+            // Only classes a cookie can clear qualify (never 404/5xx, 429,
+            // login, or paywall), only a cookie that actually changes the
+            // request counts, and only once per identity (max 2 per encounter)
+            // without burning an identity-diversity turn.
+            let cookie_retryable = matches!(
+                verdict.class,
+                Class::WallIdentity
+                    | Class::WallContract
+                    | Class::WallProgram
+                    | Class::WallInteraction
+            );
+            let will_cookie_retry = cookie_retryable
+                && !stateless_redirect
+                && cookie_retried.len() < 2
+                && !cookie_retried.contains(identity.name)
+                && {
+                    let handed = self.state.cookie_header_for(url, identity.name);
+                    handed.is_some() && handed != cookie_header
+                };
             let class_name = class_name(verdict.class);
-            if self.persist && !stateless_redirect {
+            if self.persist && !stateless_redirect && !will_cookie_retry {
                 self.state.record(
                     &host,
                     identity.name,
@@ -2737,23 +2770,14 @@ impl Worker {
 
             last_wall = verdict.wall.clone();
             last_evidence = verdict.evidence.clone();
-            // A browser answers a challenge that handed it a cookie with that
-            // cookie. The same client asks once more, before any other identity
-            // and before any program runs: DataDome's refusal sets `datadome`
-            // and the page follows it, Cloudflare's challenge sets `__cf_bm`.
-            // Only a cookie that would actually change the request counts, and
-            // only once per identity, so a wall cannot loop.
-            if verdict.class != Class::Content
-                && !stateless_redirect
-                && !cookie_retried.contains(identity.name)
-            {
-                let handed = self.state.cookie_header_for(url, identity.name);
-                if handed.is_some() && handed != cookie_header {
-                    cookie_retried.insert(identity.name.to_string());
-                    spent_state = true;
-                    queue.push_front(identity.name.to_string());
-                    continue;
-                }
+            if will_cookie_retry {
+                cookie_retried.insert(identity.name.to_string());
+                spent_state = true;
+                // Refund the diversity turn so a cookie handshake never starves
+                // a fallback identity on remembered hosts with budget = 2.
+                tries = tries.saturating_sub(1);
+                queue.push_front(identity.name.to_string());
+                continue;
             }
             // A named vendor reorders what is left: the identities it has let
             // through come next. A forced identity has nothing to reorder.
@@ -3524,8 +3548,13 @@ impl Worker {
             // A client-rendered shell is not the same shell to every client:
             // Instagram serves a plain client an empty frame and the browser
             // class the profile with its posts inline. Before the shell is final,
-            // one more identity — the browser class first — is asked.
-            if verdict.class == Class::Shell && !shell_extra && content_tried {
+            // one more identity — the browser class first — is asked, unless we
+            // already asked as Chrome.
+            if verdict.class == Class::Shell
+                && !shell_extra
+                && content_tried
+                && identity.wire_class() != "chrome"
+            {
                 if let Some(at) = queue.iter().position(|name| {
                     !tried.contains(name)
                         && identity::lookup(name).is_some_and(|next| next.wire_class() == "chrome")
@@ -3797,23 +3826,36 @@ fn search_route(url: &str, outcome: &Outcome) -> Option<String> {
     if parsed.path().eq_ignore_ascii_case("/search") {
         return None;
     }
-    const SEARCH_KEYS: &[&str] = &[
+    const EXPLICIT_SEARCH_KEYS: &[&str] = &[
         "q",
         "query",
         "keyword",
         "keywords",
         "search",
         "searchterm",
+        "search_query",
         "term",
         "terms",
-        "k",
-        "s",
         "st",
-        "text",
     ];
-    let asked = parsed
-        .query_pairs()
-        .any(|(name, _)| SEARCH_KEYS.iter().any(|key| name.eq_ignore_ascii_case(key)));
+    const SHORT_SEARCH_KEYS: &[&str] = &["k", "s", "text"];
+    let path_lower = parsed.path().to_ascii_lowercase();
+    let search_like_path = path_lower.split('/').any(|seg| {
+        matches!(
+            seg,
+            "shop" | "search" | "browse" | "find" | "catalog" | "products" | "store" | "s"
+        )
+    });
+    let asked = parsed.query_pairs().any(|(name, value)| {
+        !value.trim().is_empty()
+            && (EXPLICIT_SEARCH_KEYS
+                .iter()
+                .any(|key| name.eq_ignore_ascii_case(key))
+                || (search_like_path
+                    && SHORT_SEARCH_KEYS
+                        .iter()
+                        .any(|key| name.eq_ignore_ascii_case(key))))
+    });
     if !asked {
         return None;
     }

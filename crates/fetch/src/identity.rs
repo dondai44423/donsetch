@@ -223,11 +223,7 @@ impl Identity {
         };
         let user_agent = header("user-agent").unwrap_or("donsetch/5.0").to_string();
         let platform = Os::of(&user_agent);
-        let local = if self.name == "chrome-local" {
-            persona()
-        } else {
-            None
-        };
+        let local = self.reference();
         let brands = header("sec-ch-ua").map(parse_brands).unwrap_or_default();
         let languages = header("accept-language")
             .map(|value| {
@@ -560,10 +556,20 @@ pub fn first_contact() -> Vec<&'static str> {
     if let Some(identity) = PORTFOLIO.iter().find(|identity| identity.name == home) {
         names.push(identity.name);
     }
+    let defer_duplicate_chrome = !cfg!(windows)
+        && !cfg!(target_os = "macos")
+        && !cfg!(target_os = "android")
+        && home == "chrome-local";
     for identity in PORTFOLIO {
+        if defer_duplicate_chrome && identity.name == "chrome" {
+            continue;
+        }
         if !names.contains(&identity.name) {
             names.push(identity.name);
         }
+    }
+    if defer_duplicate_chrome && !names.contains(&"chrome") {
+        names.push("chrome");
     }
     names
 }

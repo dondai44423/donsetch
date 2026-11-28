@@ -52,12 +52,21 @@ const TELEMETRY_HOST_SUFFIXES: &[&str] = &[
     "cookiebot.com",
     "hs-scripts.com",
     "hs-analytics.net",
-    "hubspot.com",
+    "track.hubspot.com",
     "facebook.net",
     "connect.facebook.net",
     "ads-twitter.com",
-    "licdn.com",
-    "tiktok.com",
+    "snap.licdn.com",
+    "px.ads.linkedin.com",
+    "analytics.tiktok.com",
+    "mon.tiktokv.com",
+    "mon-sg.tiktokv.com",
+    "mon-va.tiktokv.com",
+    "mcs.tiktokv.com",
+    "mcs-sg.tiktokv.com",
+    "mcs-va.tiktokv.com",
+    "log-sg.tiktokv.com",
+    "log-va.tiktokv.com",
     "optimizely.com",
     "statsigapi.net",
     "rudderlabs.com",
@@ -563,14 +572,20 @@ fn walk_body(node: ego_tree::NodeRef<'_, Node>, in_chrome: bool, out: &mut Shell
                 if !child_chrome {
                     // An image grid's content is its labels: a launch calendar
                     // or a gallery is pictures with `alt`/`aria-label` text and
-                    // almost no text nodes. Those attributes are what a reader
-                    // (and a screen reader) gets from the page.
-                    for attr in ["alt", "aria-label"] {
-                        if let Some(text) = el.attr(attr) {
-                            let chars = text.trim().chars().filter(|c| !c.is_whitespace()).count();
-                            if chars >= 6 {
-                                out.main_text_chars += chars.min(200);
-                            }
+                    // almost no text nodes. Restrict to media/card elements so
+                    // icon buttons and form inputs on empty shells never inflate
+                    // content length or double-count visible button text.
+                    let alt_attr = matches!(tag, "img" | "area" | "input")
+                        .then(|| el.attr("alt"))
+                        .flatten();
+                    let aria_attr = (matches!(tag, "img" | "figure" | "picture" | "article")
+                        || el.attr("role") == Some("img"))
+                    .then(|| el.attr("aria-label"))
+                    .flatten();
+                    for text in [alt_attr, aria_attr].into_iter().flatten() {
+                        let chars = text.trim().chars().filter(|c| !c.is_whitespace()).count();
+                        if chars >= 6 {
+                            out.main_text_chars += chars.min(200);
                         }
                     }
                     if matches!(tag, "p" | "pre" | "blockquote" | "dd") {
@@ -1581,5 +1596,27 @@ mod tests {
         ] {
             scan_global_json_assignments(script, &mut out);
         }
+    }
+
+    #[test]
+    fn telemetry_filter_blocks_pixels_and_beacons_without_blocking_first_party_apis() {
+        assert!(is_telemetry_url(
+            "https://analytics.tiktok.com/i18n/pixel/events.js"
+        ));
+        assert!(is_telemetry_url(
+            "https://mon-sg.tiktokv.com/monitor_web/settings/browser-settings"
+        ));
+        assert!(is_telemetry_url("https://mcs-sg.tiktokv.com/v1/list"));
+        assert!(is_telemetry_url(
+            "https://snap.licdn.com/li.lms-analytics/insight.min.js"
+        ));
+        assert!(is_telemetry_url("https://www.googletagmanager.com/gtm.js"));
+        assert!(!is_telemetry_url(
+            "https://www.tiktok.com/api/recommend/item_list/"
+        ));
+        assert!(!is_telemetry_url("https://www.hubspot.com/pricing"));
+        assert!(!is_telemetry_url(
+            "https://media.licdn.com/dms/image/v2/photo"
+        ));
     }
 }

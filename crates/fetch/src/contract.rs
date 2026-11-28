@@ -378,17 +378,79 @@ pub fn verify_response(
         };
     }
     let mut content = verify(body, final_url, contract);
-    if generic && content.passed && !headers.is_empty() {
+    if generic && !headers.is_empty() {
         let shell = crate::hydrate::assess_html_shell(body, final_url);
-        if shell.is_unhydrated_shell {
-            content.passed = false;
-            content.failures.push(format!(
-                "unhydrated app shell ({})",
-                shell.reason.unwrap_or("hydration deficit")
-            ));
+        if content.passed {
+            if shell.is_unhydrated_shell {
+                content.passed = false;
+                content.failures.push(format!(
+                    "unhydrated app shell ({})",
+                    shell.reason.unwrap_or("hydration deficit")
+                ));
+            }
+        } else if is_complete_small_static_page(body, &content, &shell) {
+            // A small, self-contained static page (e.g. a minimal homepage,
+            // short status notice, or concise documentation stub with real
+            // prose and zero app scripts) is complete content, not a shell or
+            // an incomplete read. Accepting it here avoids a second identity
+            // hop and V8 startup on legitimate short pages.
+            content.passed = true;
+            content.failures.clear();
         }
     }
     content
+}
+
+/// True when a generic-contract failure was *only* the 200-character length
+/// floor on a legitimate small static document (real non-chrome prose, zero
+/// JS app bundles, no empty mount point, no password form, no refusal/gate).
+fn is_complete_small_static_page(
+    body: &str,
+    content: &Content,
+    shell: &crate::hydrate::ShellAssessment,
+) -> bool {
+    if content.failures.is_empty()
+        || !content
+            .failures
+            .iter()
+            .all(|f| f.starts_with("text ") || f.starts_with("content text "))
+    {
+        return false;
+    }
+    if shell.is_unhydrated_shell || shell.app_scripts > 0 || shell.empty_mount_root {
+        return false;
+    }
+    if shell.main_text_chars < 50 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("type=\"password\"") || lower.contains("type=password") {
+        return false;
+    }
+    if crate::classify::REFUSALS
+        .iter()
+        .any(|phrase| lower.contains(*phrase))
+    {
+        return false;
+    }
+    if lower.matches("<script").count() > 2 {
+        return false;
+    }
+    // Require a titled or headed document with genuine multi-word prose rather
+    // than a bare echo or tiny stub (`Brief.`, `Thin.`, `Loading...`).
+    let cleaned = strip_noise(body);
+    let doc = Html::parse_document(&cleaned);
+    let has_title_or_heading =
+        !content.title.trim().is_empty() || doc.select(&SEL_H1).next().is_some();
+    if !has_title_or_heading {
+        return false;
+    }
+    let visible = normalize(&doc.root_element().text().collect::<Vec<_>>().join(" "));
+    let words = visible
+        .split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_alphanumeric()))
+        .count();
+    words >= 10
 }
 
 static SEL_TITLE: std::sync::LazyLock<Selector> =
@@ -822,5 +884,35 @@ mod tests {
             )
             .passed
         );
+    }
+
+    #[test]
+    fn small_complete_static_pages_pass_without_accepting_stubs_or_refusals() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let generic = Contract::generic();
+
+        // A small, self-contained static page (< 200 chars, zero app scripts): real content.
+        let homepage = "<html><head><title>Jane Doe</title></head><body><h1>Jane Doe</h1>\
+            <p>Systems engineer building Rust networking tools and storage engines in Zurich.</p></body></html>";
+        let ok = verify_response(
+            200,
+            &headers,
+            homepage,
+            "https://janedoe.example/",
+            &generic,
+            true,
+        );
+        assert!(ok.passed, "{:?}", ok.failures);
+
+        // Negative cases: tiny stub, bare echo without title/h1, refusal, and password wall must fail.
+        for bad in [
+            "<html><head><title>Short</title></head><body><p>Brief.</p></body></html>",
+            "<html><body><p>Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36</p></body></html>",
+            "<html><head><title>Notice</title></head><body><h1>Blocked</h1><p>Your request has been refused: access denied by edge security policy.</p></body></html>",
+            "<html><head><title>Sign in</title></head><body><h1>Sign in to continue</h1><p>Enter your account credentials below to view this private page.</p><input type=\"password\"></body></html>",
+        ] {
+            let res = verify_response(200, &headers, bad, "https://example.test/", &generic, true);
+            assert!(!res.passed, "should not pass: {bad}");
+        }
     }
 }

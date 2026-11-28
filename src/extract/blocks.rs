@@ -489,12 +489,16 @@ fn walk<'a>(
         // wp-block-pullquote, Jekyll figure.highlight > pre) falls
         // through to the container walk, which emits every child.
         "figure" if !figure_has_content(el) => {
+            static IMG_ALT_SEL: std::sync::LazyLock<scraper::Selector> =
+                std::sync::LazyLock::new(|| {
+                    scraper::Selector::parse("img[alt]").expect("static selector")
+                });
             media_block(el, base, headings, out);
             // An image card's label is what a reader gets from it: a launch
             // calendar, a gallery, a product grid is pictures with `alt` text and
             // no prose. The label is already content for scoring; it must also
             // survive as a line, or the page extracts as furniture only.
-            for img in el.select(&scraper::Selector::parse("img[alt]").expect("static selector")) {
+            for img in el.select(&IMG_ALT_SEL) {
                 let alt = img.value().attr("alt").unwrap_or_default().trim();
                 if alt.chars().count() < 12 {
                     continue;

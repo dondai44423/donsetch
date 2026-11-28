@@ -645,7 +645,7 @@ static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
 /// notice: an outage served as a 200 is not the content the caller asked for.
 static OUTAGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(page|site|service|content|product)s? (is |are )?(currently|temporarily) unavailable|we.re sorry|couldn.t load|can.t load|can not load|isn.t loading",
+        r"(?i)(page|site|service|content|product)s? (is |are )?(currently|temporarily) unavailable|we.re sorry[,!]?\s+(?:this |the )?(?:page|site|service|content|product|item|something|we couldn.t|we can.t)|we.re sorry[^\n]{0,60}(?:unavailable|went wrong|trouble loading)|couldn.t load|can.t load|can not load|isn.t loading",
     )
     .expect("outage pattern")
 });

@@ -1440,17 +1440,35 @@
     // an id are created with their tag and attributes and hung off the body;
     // nothing about the page is invented.
     {
-      const tagRe = /<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)>/g;
+      const stripped = page.html
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "");
+      const skipTags = new Set([
+        "html", "head", "body", "title", "base", "noscript",
+        "script", "style", "meta", "link"
+      ]);
+      const tagRe = /<([a-zA-Z][a-zA-Z0-9-]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
+      const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
       let tagMatch;
-      while ((tagMatch = tagRe.exec(page.html))) {
+      while ((tagMatch = tagRe.exec(stripped))) {
         const tag = tagMatch[1].toLowerCase();
-        if (tag === "script" || tag === "style" || tag === "meta" || tag === "link") continue;
+        if (skipTags.has(tag)) continue;
         const attrs = tagMatch[2] || "";
-        const id = (/[\s"']id\s*=\s*["']([^"']+)["']/i.exec(attrs) || [])[1];
+        const parsedAttrs = [];
+        let id = "";
+        attrRe.lastIndex = 0;
+        let attrMatch;
+        while ((attrMatch = attrRe.exec(attrs))) {
+          const name = attrMatch[1];
+          const val = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? "";
+          parsedAttrs.push([name, val]);
+          if (name.toLowerCase() === "id" && !id) id = val;
+        }
         if (!id || byId.has(id)) continue;
         const element = new El(tag);
-        for (const attribute of attrs.matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']/g)) {
-          element.setAttribute(attribute[1], attribute[2]);
+        for (const [name, val] of parsedAttrs) {
+          element.setAttribute(name, val);
         }
         element.id = id;
         byId.set(id, element);
@@ -5636,7 +5654,10 @@
       product: "Gecko", productSub: "20030107", language: ident.languages[0], languages: ident.languages.slice(),
       hardwareConcurrency: ident.hardwareConcurrency, deviceMemory: 8, maxTouchPoints: ident.maxTouchPoints, cookieEnabled: true,
       geolocation: { getCurrentPosition() {}, watchPosition() { return 1; }, clearWatch() {} },
-      sendBeacon: (url, data) => { try { netFetch(url, { method: "POST", body: data, mode: "no-cors", credentials: "include" }); } catch (error) {} return true; },
+      // Content-mode beacons are fire-and-forget page analytics/telemetry; never
+      // block the V8 event loop with a synchronous network POST (challenge mode
+      // keeps its own sendBeacon above).
+      sendBeacon: () => true,
       onLine: true, webdriver: false, doNotTrack: null,
       // NetworkInformation is part of Chromium's navigator; signature SDKs read
       // connection.effectiveType while fingerprinting the client.
@@ -5812,9 +5833,28 @@
     const target = Math.max(1, Number(effectiveTarget) || Number(M.page.textTarget) || 200);
     const deadline = Math.max(200, Number(M.page.deadlineMs) || 2500);
     const overBudget = () => ops.op_now() - M.started >= deadline;
+    const countDataResponses = () => {
+      let ok = 0;
+      for (const entry of M.transcript) {
+        if (
+          entry &&
+          entry.status >= 200 &&
+          entry.status < 300 &&
+          entry.status !== 204 &&
+          !entry.shortCircuited &&
+          (entry.bytes || 0) >= 128
+        ) {
+          ok++;
+        }
+      }
+      return ok;
+    };
     let quiet = 0;
     let postTargetQuiet = 0;
     let postTargetBusyTicks = 0;
+    let bestTextLen = mainVisibleText(doc).length;
+    let lastDataOk = countDataResponses();
+    let lastProgressAt = ops.op_now();
     while (!overBudget()) {
       const mutationsBefore = doc._mutations;
       const requestsBefore = M.transcript.length;
@@ -5824,9 +5864,16 @@
       flushFrames(env);
       settle();
       await Promise.resolve();
+      const now = ops.op_now();
       const busy = isEngineBusy();
       const mutated = doc._mutations !== mutationsBefore || M.transcript.length !== requestsBefore;
       const textLen = mainVisibleText(doc).length;
+      const dataOk = countDataResponses();
+      if (textLen > bestTextLen || dataOk > lastDataOk) {
+        if (textLen > bestTextLen) bestTextLen = textLen;
+        if (dataOk > lastDataOk) lastDataOk = dataOk;
+        lastProgressAt = now;
+      }
       if (textLen >= target) {
         if (!busy) {
           if (target < 200 || textLen >= 1200) {
@@ -5846,12 +5893,22 @@
         continue;
       }
       postTargetQuiet = 0;
+      const stallMs = now - lastProgressAt;
+      // Fast-fail shells whose scripts only spin repeating timers or hung
+      // beacons without producing visible text or 2xx data payloads: real SPAs
+      // keep advancing `lastProgressAt` as bundles/JSON arrive, while dead or
+      // walled shells stop burning the full 8-12 s ceiling.
+      if (!busy && stallMs >= 1500) {
+        return "stalled";
+      }
+      if (busy && stallMs >= 4000) {
+        return "stalled";
+      }
       if (busy) {
         quiet = 0;
         await ops.op_sleep_async(15);
         continue;
       }
-      const now = ops.op_now();
       let nextDueWait = null;
       for (const timer of env.timers) {
         if (!timer.cancelled && !timer.repeat) {

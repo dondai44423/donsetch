@@ -116,65 +116,73 @@ pub fn fuse_dom_and_transcript(
         return None;
     }
     // The answer must answer the question. When the caller's URL carries a
-    // query, a fused payload that never mentions it is a different question
-    // answered well — Target's search page fetched its store list and delivery
-    // options alongside the products, and the store list scored higher. If any
-    // candidate mentions a term, only those are eligible.
+    // search query, a fused payload that never mentions it is a different
+    // question answered well — Target's search page fetched its store list and
+    // delivery options alongside the products, and the store list scored higher.
+    // Non-search query parameters (utm_*, intl=nosplash, tab, ref) never trigger
+    // this filter, so entity/OpenAPI/fragment pages with tracking params stay intact.
     let terms = url_terms(page_url);
     let primary_html = if terms.is_empty() {
         primary_html
     } else {
-        // A search page's answer is a list. A single entity beside it (a survey
-        // panel, a delivery widget) is a different question answered well, and
-        // when no collection answered at all the honest outcome is the page
-        // without a fused section, not the widget dressed as the results.
-        let collections: Vec<&(usize, String, String, String)> = candidates
-            .iter()
-            .filter(|(_, _, _, note)| note.contains(" items from wire transcript"))
-            .collect();
-        if collections.is_empty() {
-            return None;
-        }
         let mentions = |html: &str| {
             let lower = html.to_ascii_lowercase();
             terms.iter().any(|term| lower.contains(term.as_str()))
         };
-        // The request that asked the question names it too: Target's product
-        // list comes from a request whose own URL carries `keyword=headphones`,
-        // while the side panel's survey does not. Prefer that, then the body.
-        let asked_in_url = collections
+        let collections: Vec<_> = candidates
             .iter()
-            .zip(
-                candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, _, _, note))| note.contains(" items from wire transcript"))
-                    .map(|(index, _)| index),
-            )
-            .filter_map(|((score, _, html, _), index)| {
-                let url = request_urls.get(index)?;
-                (*score >= 180
-                    && terms
+            .enumerate()
+            .filter(|(_, (_, _, _, note))| note.contains(" items from wire transcript"))
+            .collect();
+        if collections.is_empty() {
+            // No JSON collection answered; keep a non-collection candidate only
+            // if its request URL or rendered body actually answers the query.
+            let matched = candidates
+                .iter()
+                .enumerate()
+                .filter(|(index, (score, _, html, _))| {
+                    *score >= 180
+                        && (request_urls.get(*index).is_some_and(|url| {
+                            let low = url.to_ascii_lowercase();
+                            terms.iter().any(|term| low.contains(term.as_str()))
+                        }) || mentions(html))
+                })
+                .max_by_key(|(_, (score, _, _, _))| *score);
+            match matched {
+                Some((_, (_, _, html, _))) => html.clone(),
+                None => return None,
+            }
+        } else {
+            // The request that asked the question names it too: Target's product
+            // list comes from a request whose own URL carries `keyword=headphones`,
+            // while the side panel's survey does not. Prefer that, then the body.
+            let asked_in_url = collections
+                .iter()
+                .filter_map(|(index, (score, _, html, _))| {
+                    let url = request_urls.get(*index)?;
+                    let low = url.to_ascii_lowercase();
+                    (*score >= 180 && terms.iter().any(|term| low.contains(term.as_str())))
+                        .then(|| (*score, html.clone()))
+                })
+                .max_by_key(|(score, _)| *score)
+                .map(|(_, html)| html);
+            match asked_in_url {
+                Some(html) => html,
+                None => {
+                    let asked = collections
                         .iter()
-                        .any(|term| url.to_ascii_lowercase().contains(term)))
-                .then(|| html.clone())
-            })
-            .next();
-        match asked_in_url {
-            Some(html) => html,
-            None => {
-                let asked = collections
-                    .iter()
-                    .filter(|(score, _, html, _)| *score >= 180 && mentions(html))
-                    .max_by_key(|(score, _, _, _)| *score);
-                match asked {
-                    Some((_, _, html, _)) if !mentions(&primary_html) => html.clone(),
-                    _ => primary_html,
+                        .filter(|(_, (score, _, html, _))| *score >= 180 && mentions(html))
+                        .max_by_key(|(_, (score, _, _, _))| *score);
+                    match asked {
+                        Some((_, (_, _, html, _))) => html.clone(),
+                        None if mentions(&primary_html) => primary_html,
+                        None => return None,
+                    }
                 }
             }
         }
     };
-    let section_html = if combined_sections.len() > 1 {
+    let section_html = if terms.is_empty() && combined_sections.len() > 1 {
         combined_sections.join("\n")
     } else {
         primary_html
@@ -187,15 +195,33 @@ pub fn fuse_dom_and_transcript(
     build_fused(dom_html, page_url, &final_title, &section_html, note)
 }
 
-/// The words a page URL asks about: the values of its query parameters, split
-/// into words of three characters or more, lowercased. A search URL's terms are
-/// the question the page answers.
+/// The words a search URL asks about: values of search-query parameters only,
+/// split into words of three characters or more, lowercased. Tracking, paging,
+/// and market parameters (`utm_*`, `intl`, `ref`, `page`, `sort`) are ignored
+/// so non-search SPAs keep entity/OpenAPI/fragment synthesis.
 fn url_terms(page_url: &str) -> Vec<String> {
+    const QUERY_KEYS: &[&str] = &[
+        "q",
+        "query",
+        "keyword",
+        "keywords",
+        "search",
+        "searchterm",
+        "search_query",
+        "term",
+        "terms",
+        "st",
+        "k",
+        "s",
+    ];
     let Ok(parsed) = url::Url::parse(page_url) else {
         return Vec::new();
     };
     let mut terms: Vec<String> = Vec::new();
-    for (_, value) in parsed.query_pairs() {
+    for (name, value) in parsed.query_pairs() {
+        if !QUERY_KEYS.iter().any(|key| name.eq_ignore_ascii_case(key)) {
+            continue;
+        }
         for word in value.split(|c: char| !c.is_alphanumeric()) {
             let word = word.trim().to_ascii_lowercase();
             if word.chars().count() >= 3 {
@@ -1312,5 +1338,56 @@ mod tests {
         assert_eq!(title, "kube-prometheus");
         assert!(chars >= 200);
         assert!(html.contains("93.3.1"));
+    }
+
+    #[test]
+    fn non_search_query_params_preserve_entity_fusion_and_search_urls_drop_unrelated_widgets() {
+        let empty_dom =
+            "<html><head><title>App</title></head><body><div id=\"root\"></div></body></html>";
+        let entity = serde_json::json!({
+            "name": "tokio",
+            "version": "1.50.0",
+            "description": "An event-driven, non-blocking I/O platform for writing asynchronous applications with Rust.",
+            "readme": "Tokio is an asynchronous runtime for the Rust programming language providing building blocks for reliable network apps. ".repeat(3)
+        })
+        .to_string();
+        let entries = vec![transcript_entry(
+            "https://api.example.com/pkg/tokio",
+            &entity,
+        )];
+
+        // Non-search tracking/market query params must NOT break Entity JSON fusion.
+        let fused = fuse_dom_and_transcript(
+            empty_dom,
+            "https://example.com/pkg/tokio?utm_source=hn&intl=nosplash",
+            &entries,
+        )
+        .expect("entity fusion survives tracking params");
+        assert!(fused.html.contains("asynchronous runtime"));
+
+        // On an actual search URL (?q=headphones), unrelated high-scoring side-panel
+        // collections must not be mixed back in via combined_sections.
+        let stores = r#"{"items":[
+            {"title":"Downtown Store Location","description":"Open daily 8am to 10pm with curbside pickup and pharmacy services","url":"/store/1"},
+            {"title":"Northside Store Location","description":"Open daily 8am to 10pm with optical center and bakery department","url":"/store/2"},
+            {"title":"Westside Store Location","description":"Open daily 8am to 10pm with electronics counter and photo center","url":"/store/3"}
+        ]}"#;
+        let products = r#"{"items":[
+            {"title":"Sony Wireless Headphones","description":"Noise cancelling over-ear Bluetooth headphones with 30-hour battery life","url":"/p/1"},
+            {"title":"Bose QuietComfort Headphones","description":"Lightweight wireless headphones with custom sound modes and clear calls","url":"/p/2"},
+            {"title":"Sennheiser Studio Headphones","description":"Open-back audiophile headphones engineered for reference studio monitoring","url":"/p/3"}
+        ]}"#;
+        let search_entries = vec![
+            transcript_entry("https://api.example.com/stores/nearby", stores),
+            transcript_entry("https://api.example.com/search?q=headphones", products),
+        ];
+        let fused_search = fuse_dom_and_transcript(
+            empty_dom,
+            "https://example.com/search?q=headphones&intl=nosplash",
+            &search_entries,
+        )
+        .expect("search fusion picks product list");
+        assert!(fused_search.html.contains("Sony Wireless Headphones"));
+        assert!(!fused_search.html.contains("Downtown Store Location"));
     }
 }

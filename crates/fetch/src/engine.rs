@@ -1511,7 +1511,7 @@ impl PrefetchBoard {
 /// while V8 initializes.
 #[allow(clippy::too_many_arguments)]
 fn start_prefetch(
-    html: &str,
+    document: &scraper::Html,
     base_url: &str,
     page_url: &str,
     identity: &'static Identity,
@@ -1539,7 +1539,6 @@ fn start_prefetch(
         .as_ref()
         .map(|u| u.origin().ascii_serialization())
         .unwrap_or_else(|| base.origin().ascii_serialization());
-    let document = scraper::Html::parse_document(html);
     let mut targets: Vec<(String, &'static str, &'static str)> = Vec::new();
     let mut seen = HashSet::new();
     for node in document.tree.root().descendants() {
@@ -1600,123 +1599,146 @@ fn start_prefetch(
     for (url, _, _) in &targets {
         board.register(url);
     }
-    let page_host = Arc::new(page_host);
-    let origin = Arc::new(origin);
-    let page_url = Arc::new(page_url.to_string());
-    let cookie_header = Arc::new(cookie_header);
-    let proxy = Arc::new(proxy);
-    let targets = Arc::new(targets);
-    let total = Arc::new(AtomicUsize::new(0));
-    let workers = PREFETCH_WORKERS.min(targets.len());
-    for worker in 0..workers {
-        let board = Arc::clone(&board);
-        let guard = Arc::clone(&guard);
-        let targets = Arc::clone(&targets);
-        let page_host = Arc::clone(&page_host);
-        let origin = Arc::clone(&origin);
-        let page_url = Arc::clone(&page_url);
-        let cookie_header = Arc::clone(&cookie_header);
-        let proxy = Arc::clone(&proxy);
-        let total = Arc::clone(&total);
-        std::thread::spawn(move || {
-            let wire = match Wire::guarded(identity, &guard, proxy.as_deref()) {
-                Ok(wire) => wire,
-                Err(_) => {
-                    for index in (worker..targets.len()).step_by(workers) {
-                        board.finish_one(&targets[index].0, None);
-                    }
-                    return;
-                }
-            };
-            for index in (worker..targets.len()).step_by(workers) {
-                let (url, dest, fetch_mode) = &targets[index];
-                if board.is_closed() || !guard.take_op() {
-                    break;
-                }
-                if guard.check_url(url).is_err() {
-                    board.finish_one(url, None);
-                    continue;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining < Duration::from_millis(150) {
-                    break;
-                }
-                let cap = guard.body_allowance();
-                if cap == 0 {
-                    break;
-                }
-                let timeout = PREFETCH_TIMEOUT.min(op_timeout).min(remaining);
-                let same_origin = url::Url::parse(url)
-                    .ok()
-                    .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
-                    .as_deref()
-                    == Some(page_host.as_str());
-                let cookie = if same_origin {
-                    cookie_header.as_deref()
-                } else {
-                    None
-                };
-                let site = if same_origin {
-                    "same-origin"
-                } else {
-                    "cross-site"
-                };
-                let referer = if same_origin {
-                    page_url.as_str().to_string()
-                } else {
-                    format!("{}/", origin.as_str())
-                };
-                let mut extra: Vec<(&str, &str)> = vec![
-                    ("sec-fetch-site", site),
-                    ("sec-fetch-mode", fetch_mode),
-                    ("sec-fetch-dest", dest),
-                    ("referer", &referer),
-                    ("accept", "*/*"),
-                ];
-                if !same_origin && *fetch_mode == "cors" {
-                    extra.push(("origin", origin.as_str()));
-                }
-                let call = Call {
-                    method: "GET",
-                    url,
-                    cookie,
-                    timeout,
-                    extra: &extra,
-                    body: None,
-                    cap: Some(cap),
-                    kind: Kind::Subresource,
-                };
-                match wire.call(identity, call) {
-                    Ok(response) => {
-                        let size = response.raw.as_ref().map_or(response.body.len(), Vec::len);
-                        guard.record_bytes(size);
-                        if size > PREFETCH_BODY_MAX {
-                            board.finish_one(url, None);
-                            continue;
-                        }
-                        if total.fetch_add(size, Ordering::Relaxed) + size > PREFETCH_TOTAL_MAX {
-                            board.finish_one(url, None);
-                            continue;
-                        }
-                        let mut entry = serde_json::json!({
-                            "status": response.status,
-                            "url": response.url,
-                            "headers": response.headers,
-                            "body": response.body,
-                        });
-                        if let Some(raw) = &response.raw {
-                            entry["body_b64"] = serde_json::Value::String(crate::http::base64(raw));
-                        }
-                        board.finish_one(url, Some(entry));
-                    }
-                    Err(_error) => board.finish_one(url, None),
-                }
+    let board_bg = Arc::clone(&board);
+    let page_url = page_url.to_string();
+    // Run all prefetch transfers concurrently over a dedicated pooled HTTP/2
+    // `Wire` on a single lightweight runtime instead of spawning 6 separate OS
+    // threads + 6 cold BoringSSL pools. Keeping a dedicated `Wire` here avoids
+    // tying `run_within`'s pooled HTTP/2 dispatch tasks to this temporary
+    // runtime (which drops as soon as prefetch completes).
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            for (url, _, _) in &targets {
+                board_bg.finish_one(url, None);
             }
-            for index in (worker..targets.len()).step_by(workers) {
-                board.finish_one(&targets[index].0, None);
+            return;
+        };
+        let Ok(wire) = Wire::guarded(identity, &guard, proxy.as_deref()) else {
+            for (url, _, _) in &targets {
+                board_bg.finish_one(url, None);
+            }
+            return;
+        };
+        let wire_handle = wire.handle();
+        let page_host = Arc::new(page_host);
+        let origin = Arc::new(origin);
+        let page_url = Arc::new(page_url);
+        let cookie_header = Arc::new(cookie_header);
+        let total = Arc::new(AtomicUsize::new(0));
+        let sem = Arc::new(tokio::sync::Semaphore::new(PREFETCH_WORKERS));
+        rt.block_on(async move {
+            let mut handles = Vec::with_capacity(targets.len());
+            for (url, dest, fetch_mode) in targets {
+                let board = Arc::clone(&board_bg);
+                let guard = Arc::clone(&guard);
+                let wire = wire_handle.clone();
+                let page_host = Arc::clone(&page_host);
+                let origin = Arc::clone(&origin);
+                let page_url = Arc::clone(&page_url);
+                let cookie_header = Arc::clone(&cookie_header);
+                let total = Arc::clone(&total);
+                let sem = Arc::clone(&sem);
+                handles.push(tokio::spawn(async move {
+                    let Ok(_permit) = sem.acquire_owned().await else {
+                        board.finish_one(&url, None);
+                        return;
+                    };
+                    if board.is_closed() || !guard.take_op() {
+                        board.finish_one(&url, None);
+                        return;
+                    }
+                    if guard.check_url(&url).is_err() {
+                        board.finish_one(&url, None);
+                        return;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining < Duration::from_millis(150) {
+                        board.finish_one(&url, None);
+                        return;
+                    }
+                    let cap = guard.body_allowance();
+                    if cap == 0 {
+                        board.finish_one(&url, None);
+                        return;
+                    }
+                    let timeout = PREFETCH_TIMEOUT.min(op_timeout).min(remaining);
+                    let same_origin = url::Url::parse(&url)
+                        .ok()
+                        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+                        .as_deref()
+                        == Some(page_host.as_str());
+                    let cookie = if same_origin {
+                        cookie_header.as_deref().map(str::to_string)
+                    } else {
+                        None
+                    };
+                    let site = if same_origin {
+                        "same-origin"
+                    } else {
+                        "cross-site"
+                    };
+                    let referer = if same_origin {
+                        page_url.as_str().to_string()
+                    } else {
+                        format!("{}/", origin.as_str())
+                    };
+                    let mut extra: Vec<(String, String)> = vec![
+                        ("sec-fetch-site".into(), site.into()),
+                        ("sec-fetch-mode".into(), fetch_mode.into()),
+                        ("sec-fetch-dest".into(), dest.into()),
+                        ("referer".into(), referer),
+                        ("accept".into(), "*/*".into()),
+                    ];
+                    if !same_origin && fetch_mode == "cors" {
+                        extra.push(("origin".into(), origin.as_str().to_string()));
+                    }
+                    let call = OwnedCall {
+                        method: "GET".into(),
+                        url: url.clone(),
+                        cookie,
+                        timeout,
+                        extra,
+                        body: None,
+                        cap: Some(cap),
+                        kind: Kind::Subresource,
+                    };
+                    match wire.call_async(identity, call).await {
+                        Ok(response) => {
+                            let size = response.raw.as_ref().map_or(response.body.len(), Vec::len);
+                            guard.record_bytes(size);
+                            if size > PREFETCH_BODY_MAX {
+                                board.finish_one(&url, None);
+                                return;
+                            }
+                            if total.fetch_add(size, Ordering::Relaxed) + size > PREFETCH_TOTAL_MAX
+                            {
+                                board.finish_one(&url, None);
+                                return;
+                            }
+                            let mut entry = serde_json::json!({
+                                "status": response.status,
+                                "url": response.url,
+                                "headers": response.headers,
+                                "body": response.body,
+                            });
+                            if let Some(raw) = &response.raw {
+                                entry["body_b64"] =
+                                    serde_json::Value::String(crate::http::base64(raw));
+                            }
+                            board.finish_one(&url, Some(entry));
+                        }
+                        Err(_error) => board.finish_one(&url, None),
+                    }
+                }));
+            }
+            for handle in handles {
+                let _ = handle.await;
             }
         });
-    }
+    });
     Some(board)
 }
 
@@ -1883,17 +1905,19 @@ fn run_within(
     let should_run_content =
         mode == Mode::Content && (is_shell || document_text_len(html) < text_target);
     let prefetch = if should_run_content {
-        start_prefetch(
-            html,
-            &base_url,
-            url,
-            identity,
-            Arc::clone(&guard),
-            proxy.map(str::to_string),
-            limits.op_timeout,
-            cookie_header.map(str::to_string),
-            deadline,
-        )
+        content_doc.as_ref().and_then(|doc| {
+            start_prefetch(
+                doc,
+                &base_url,
+                url,
+                identity,
+                Arc::clone(&guard),
+                proxy.map(str::to_string),
+                limits.op_timeout,
+                cookie_header.map(str::to_string),
+                deadline,
+            )
+        })
     } else {
         None
     };
